@@ -1,0 +1,9 @@
+numpy
+pandas
+geopandas
+matplotlib
+pyproj
+shapely
+pyyaml
+joblib
+pyogrio

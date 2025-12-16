@@ -18,7 +18,13 @@ This tool provides a graphical user interface (GUI) and a headless batch mode fo
     *   `tkinter` (usually included with Python, but may need separate installation on Linux, e.g., `sudo apt-get install python3-tk`)
 
 2.  **Dependencies**:
-    Install the required Python packages:
+    
+    You can automatically set up the environment and install dependencies using the provided script:
+    ```bash
+    ./install.sh
+    ```
+    
+    Alternatively, manually install the required Python packages:
     ```bash
     pip install -r requirements.txt
     ```
