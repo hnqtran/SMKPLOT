@@ -217,11 +217,23 @@ class EmissionGUI:
         self.reimport_requested = bool(getattr(cli_args, 'reimport', False)) if cli_args else self._json_arguments.get('reimport', False)
         if self.reimport_requested:
             cli_imported = getattr(cli_args, 'imported_file', None) if cli_args else None
-            self.imported_path = cli_imported or self._json_arguments.get('imported_file')
-            if not self.imported_path or not os.path.exists(self.imported_path):
-                raise ValueError(f'Reimport specified but could not locate imported_file {self.imported_path}. Aborting.')
+            raw_imported = cli_imported or self._json_arguments.get('imported_file')
             
-            self.inputfile_path = self.imported_path
+            if isinstance(raw_imported, (list, tuple)):
+                self.imported_paths = [str(p) for p in raw_imported if p]
+            elif raw_imported:
+                self.imported_paths = [str(raw_imported)]
+            else:
+                self.imported_paths = []
+
+            if not self.imported_paths:
+                raise ValueError(f'Reimport specified but no imported_file provided. Aborting.')
+
+            for p in self.imported_paths:
+                if not os.path.exists(p):
+                    raise ValueError(f'Reimport specified but could not locate imported_file {p}. Aborting.')
+            
+            self.inputfile_path = self.imported_paths[0]
 
         if self.inputfile_path and os.path.exists(self.inputfile_path):
             try:
@@ -1138,7 +1150,55 @@ class EmissionGUI:
             if self.reimport_requested:
 
                 try:
-                    emis_df = pd.read_csv(self.inputfile_path)
+                    if hasattr(self, 'imported_paths') and self.imported_paths:
+                        dfs = []
+                        for p in self.imported_paths:
+                            dfs.append(pd.read_csv(p))
+                        emis_df = pd.concat(dfs, ignore_index=True)
+
+                        # Apply filtering BEFORE aggregation
+                        if self.filter_col and (self.filter_start is not None or self.filter_end is not None):
+                            try:
+                                emis_df = filter_dataframe_by_range(emis_df, self.filter_col, self.filter_start, self.filter_end)
+                            except Exception:
+                                self.root.after(0, lambda: self._notify('WARNING', 'Filter Range Failed', 'Could not apply range filter from JSON snapshot.', popup=False))
+                        
+                        if self.filter_col and self.filter_values:
+                            try:
+                                emis_df = filter_dataframe_by_values(emis_df, self.filter_col, self.filter_values)
+                            except Exception:
+                                self.root.after(0, lambda: self._notify('WARNING', 'Filter Values Failed', 'Could not apply discrete filter from JSON snapshot.', popup=False))
+
+                        # Ensure FIPS column exists for aggregation
+                        try:
+                            emis_df = get_emis_fips(emis_df)
+                        except Exception:
+                            pass
+
+                        # Aggregation logic
+                        group_keys = []
+                        if 'FIPS' in emis_df.columns:
+                            group_keys.append('FIPS')
+                        elif 'GRID_RC' in emis_df.columns:
+                            group_keys.append('GRID_RC')
+                        
+                        if 'country_cd' in emis_df.columns:
+                            group_keys.append('country_cd')
+                        
+                        if group_keys:
+                            if hasattr(emis_df, 'attrs'):
+                                emis_df.attrs.pop('_detected_pollutants', None)
+                            
+                            pols = detect_pollutants(emis_df)
+                            if pols:
+                                agg_dict = {p: 'sum' for p in pols}
+                                for c in emis_df.columns:
+                                    if c not in group_keys and c not in pols:
+                                        agg_dict[c] = 'first'
+                                
+                                emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
+                    else:
+                        emis_df = pd.read_csv(self.inputfile_path)
                 except Exception as exc:
                     self.root.after(0, lambda: self._notify('ERROR', 'Reimport Load Error', f"Failed to load processed emissions data: {exc}", exc=exc))
                     return
@@ -1155,17 +1215,8 @@ class EmissionGUI:
                 #raw_df = emis_df.copy(deep=True)
 
                 filtered = emis_df
-                if self.filter_col and (self.filter_start is not None or self.filter_end is not None):
-                    try:
-                        filtered = filter_dataframe_by_range(filtered, self.filter_col, self.filter_start, self.filter_end)
-                    except Exception:
-                        self.root.after(0, lambda: self._notify('WARNING', 'Filter Range Failed', 'Could not apply range filter from JSON snapshot.', popup=False))
-                if self.filter_col and self.filter_values:
-                    try:
-                        filtered = filter_dataframe_by_values(filtered, self.filter_col, self.filter_values)
-                    except Exception:
-                        self.root.after(0, lambda: self._notify('WARNING', 'Filter Values Failed', 'Could not apply discrete filter from JSON snapshot.', popup=False))
-
+                # Filtering already applied before aggregation
+                
                 self.emissions_df = filtered
                 self.raw_df = self.emissions_df.copy(deep=True)
                 self._ff10_grid_ready = False

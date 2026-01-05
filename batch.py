@@ -339,7 +339,30 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
 
     ax.set_axis_off()
 
-    stats_source = emis_df[pol] if isinstance(emis_df, pd.DataFrame) and pol in emis_df.columns else data
+
+    stats_source = None
+    if args.zoom_to_data:
+        try:
+            # Re-calculate statistics based on visible extent
+            # Get current axis limits
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            
+            # Use spatial indexing to find features within the plot window
+            # .cx handles intersection with the bounding box
+            visible_data = merged_plot.cx[xlim[0]:xlim[1], ylim[0]:ylim[1]]
+            
+            if not visible_data.empty and pol in visible_data.columns:
+                stats_source = visible_data[pol]
+                logging.debug("Statistics updated for visible region (%d features)", len(visible_data))
+            else:
+                 logging.debug("No features found in visible region for stats calc; falling back to full data")
+        except Exception:
+            logging.exception("Failed to calculate stats for visible region; falling back to full data")
+
+    if stats_source is None:
+        stats_source = emis_df[pol] if isinstance(emis_df, pd.DataFrame) and pol in emis_df.columns else data
+
     numeric_values = pd.to_numeric(stats_source, errors='coerce').dropna()
 
     if numeric_values.empty:
@@ -351,12 +374,19 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         max_val = float(arr.max())
         sum_val = float(arr.sum())
 
-    qa_series = pd.to_numeric(emis_df[pol], errors='coerce').dropna()
-    qa_sum = float(qa_series.sum()) if not qa_series.empty else float('nan')
-    if not np.isclose(sum_val, qa_sum, rtol=1e-6, atol=1e-6):
-        logging.warning(
-            "Sum mismatch for %s: plot sum=%s, emis_df sum=%s", pol, sum_val, qa_sum
-        )
+    qa_series_full = pd.to_numeric(emis_df[pol], errors='coerce').dropna()
+    qa_sum_full = float(qa_series_full.sum()) if not qa_series_full.empty else float('nan')
+    
+    # Only warn about sum mismatch if NOT zooming (or if we expect them to match)
+    # If zooming, sum_val (visible) should typically be <= qa_sum_full (total)
+    if not args.zoom_to_data:
+        if not np.isclose(sum_val, qa_sum_full, rtol=1e-6, atol=1e-6):
+            logging.warning(
+                "Sum mismatch for %s: plot sum=%s, emis_df sum=%s", pol, sum_val, qa_sum_full
+            )
+    else:
+        # Optional debug logging for zoom case
+        logging.debug("Zoom active: Visible Sum=%s, Total Sum=%s", sum_val, qa_sum_full)
 
     def _fmt_stat(value: float) -> str:
         if np.isfinite(value):
@@ -489,29 +519,111 @@ def _batch_mode(args):
         # Locate preprocessed emission file from JSON arguments
         imported_preprocessed_path = json_payload.get('arguments', {}).get('imported_file', None)
         
-        # Check if imported file is absolute or relative to JSON directory
-        if imported_preprocessed_path and not os.path.isabs(imported_preprocessed_path):
-            json_dir = os.path.dirname(args.json) if getattr(args, 'json', None) else None
-            if json_dir:
-                imported_preprocessed_path = os.path.abspath(os.path.join(json_dir, imported_preprocessed_path))
-            else:
-                imported_preprocessed_path = os.path.abspath(imported_preprocessed_path)
-        
-        # Give warning if specified imported file does not exist
-        if imported_preprocessed_path and not os.path.exists(imported_preprocessed_path):
-            logging.error("Specified imported file %s does not exist locally.", imported_preprocessed_path)
-            return 1
+        # Normalize to list
+        if isinstance(imported_preprocessed_path, (str, type(None))):
+             imported_paths = [imported_preprocessed_path] if imported_preprocessed_path else []
+        else:
+             imported_paths = list(imported_preprocessed_path)
 
-        # Give warning if imported file is not specified
-        if not imported_preprocessed_path:
+        resolved_paths = []
+        json_dir = os.path.dirname(args.json) if getattr(args, 'json', None) else None
+
+        for path in imported_paths:
+            if path and not os.path.isabs(path):
+                if json_dir:
+                    path = os.path.abspath(os.path.join(json_dir, path))
+                else:
+                    path = os.path.abspath(path)
+            
+            if path and not os.path.exists(path):
+                logging.error("Specified imported file %s does not exist locally.", path)
+                return 1
+            if path:
+                resolved_paths.append(path)
+
+        if not resolved_paths:
             logging.error("Reimport requested but no preprocessed files listed in JSON outputs. Aborting.")
             return 1
         
         # All good now, read the preprocessed emissions data
         try:
-            emis_df = pd.read_csv(imported_preprocessed_path)
+            dfs = []
+            for p in resolved_paths:
+                dfs.append(pd.read_csv(p))
+            emis_df = pd.concat(dfs, ignore_index=True)
+
+            # Apply filtering BEFORE aggregation to ensure we don't lose granularity
+            filter_col = args.filter_col
+            filter_start = args.filter_start
+            filter_end = args.filter_end
+            filter_values = args.filter_values
+
+            if filter_col and (filter_start is not None) and (filter_end is not None):
+                try:
+                    emis_df = filter_dataframe_by_range(
+                        emis_df,
+                        filter_col,
+                        float(filter_start),
+                        float(filter_end)
+                    )
+                    logging.info(
+                        "Applied reimport filtering on column %s for range %.4g to %.4g",
+                        filter_col,
+                        float(filter_start),
+                        float(filter_end)
+                    )
+                except Exception:
+                    logging.exception("Failed to apply reimport filtering by range on column %s", filter_col)
+            
+            if filter_col and (filter_values is not None):
+                try:
+                    emis_df = filter_dataframe_by_values(
+                        emis_df,
+                        filter_col,
+                        filter_values
+                    )
+                    logging.info(
+                        "Applied reimport filtering on column %s for values %s",
+                        filter_col,
+                        repr(filter_values)
+                    )
+                except Exception:
+                    logging.exception("Failed to apply reimport filtering by values on column %s", filter_col)
+
+            # Ensure FIPS column exists for aggregation
+            try:
+                emis_df = get_emis_fips(emis_df)
+            except Exception:
+                pass
+
+            # Aggregation logic
+            group_keys = []
+            if 'FIPS' in emis_df.columns:
+                group_keys.append('FIPS')
+            elif 'GRID_RC' in emis_df.columns:
+                group_keys.append('GRID_RC')
+            
+            if 'country_cd' in emis_df.columns:
+                group_keys.append('country_cd')
+            
+            if group_keys:
+                # Clear cached pollutants from attrs if any
+                if hasattr(emis_df, 'attrs'):
+                     emis_df.attrs.pop('_detected_pollutants', None)
+                
+                pols = detect_pollutants(emis_df)
+                if pols:
+                    agg_dict = {p: 'sum' for p in pols}
+                    # Handle other columns (take first)
+                    for c in emis_df.columns:
+                        if c not in group_keys and c not in pols:
+                            agg_dict[c] = 'first'
+                    
+                    emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
+                    logging.info("Aggregated reimported data by %s", group_keys)
+
         except Exception:
-            logging.exception("Failed to reimport processed emissions data from %s", imported_preprocessed_path)
+            logging.exception("Failed to reimport processed emissions data from %s", resolved_paths)
             return 1
         
         # Restore DataFrame attributes
@@ -520,46 +632,12 @@ def _batch_mode(args):
             for key, value in attrs_from_json.items():
                 emis_df.attrs[key] = value
         
-        logging.info("Reimported processed emissions data from %s", imported_preprocessed_path)
+        logging.info("Reimported processed emissions data from %s", resolved_paths)
 
         raw_df = emis_df.copy(deep=True)
         
         # Apply filtering if specified in JSON arguments
-        filter_col = args.filter_col
-        filter_start = args.filter_start
-        filter_end = args.filter_end
-        filter_values = args.filter_values
-        #print(filter_col, filter_start, filter_end, filter_values)
-        if filter_col and (filter_start is not None) and (filter_end is not None):
-            try:
-                emis_df = filter_dataframe_by_range(
-                    emis_df,
-                    filter_col,
-                    float(filter_start),
-                    float(filter_end)
-                )
-                logging.info(
-                    "Applied reimport filtering on column %s for range %.4g to %.4g",
-                    filter_col,
-                    float(filter_start),
-                    float(filter_end)
-                )
-            except Exception:
-                logging.exception("Failed to apply reimport filtering by range on column %s", filter_col)
-        if filter_col and (filter_values is not None):
-            try:
-                emis_df = filter_dataframe_by_values(
-                    emis_df,
-                    filter_col,
-                    filter_values
-                )
-                logging.info(
-                    "Applied reimport filtering on column %s for values %s",
-                    filter_col,
-                    repr(filter_values)
-                )
-            except Exception:
-                logging.exception("Failed to apply reimport filtering by values on column %s", filter_col)
+        # (Filtering has already been applied before aggregation above)
         
     else: # Not reimporting; read raw input file
         if not args.filepath:
@@ -607,11 +685,22 @@ def _batch_mode(args):
     # Capture emissions DataFrame attributes for later use
     emis_attrs = dict(getattr(emis_df, 'attrs', {}) or {})
 
+
     # Update input_basename; use sector if specified in arguments or in JSON payload
-    input_basename = getattr(args, 'sector', None) or json_payload.get('arguments', {}).get('sector', None) or os.path.basename(args.filepath)
+    start_sector = getattr(args, 'sector', None)
+    json_sector = None
+    if json_payload:
+        json_sector = json_payload.get('arguments', {}).get('sector', None)
+    
+    input_basename = start_sector or json_sector or os.path.basename(args.filepath)
+
 
     # Export processed emissions data to CSV if requested in arguments or JSON payload
-    if (getattr(args, 'export_csv', False) or json_payload.get('arguments', {}).get('export_csv', False)):
+    csv_from_json = False
+    if isinstance(json_payload, dict):
+        csv_from_json = json_payload.get('arguments', {}).get('export_csv', False)
+
+    if (getattr(args, 'export_csv', False) or csv_from_json):
         # Create output directory if it doesn't exist
         os.makedirs(args.outdir, exist_ok=True)
         if args.filter_col:
