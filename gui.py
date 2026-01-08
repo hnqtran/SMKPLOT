@@ -528,7 +528,7 @@ class EmissionGUI:
 
     def _format_attrs_for_display(self, source=None, *, max_units: int = 12, max_chars: int = 4000) -> str:
         """Return a human-friendly summary of DataFrame attrs for GUI display."""
-        attrs: dict[str, object] = {}
+        attrs: Dict[str, object] = {}
         if source is None and isinstance(self.emissions_df, pd.DataFrame):
             try:
                 attrs = dict(getattr(self.emissions_df, 'attrs', {}))
@@ -543,10 +543,10 @@ class EmissionGUI:
             attrs = dict(source)
         if not attrs:
             return ''
-        lines: list[str] = []
+        lines: List[str] = []
         for key, value in attrs.items():
             if key == 'units_map' and isinstance(value, dict):
-                pairs: list[str] = []
+                pairs: List[str] = []
                 for idx, (k, v) in enumerate(value.items()):
                     if idx >= max_units:
                         pairs.append('...')
@@ -554,7 +554,7 @@ class EmissionGUI:
                     pairs.append(f"{k}: {v}")
                 lines.append(f"{key}: " + ', '.join(pairs))
             elif isinstance(value, dict):
-                snippets: list[str] = []
+                snippets: List[str] = []
                 for idx, (k, v) in enumerate(value.items()):
                     if idx >= max_units:
                         snippets.append('...')
@@ -979,7 +979,7 @@ class EmissionGUI:
             return val or None
         return mapping.get(token, None)
 
-    def _current_delimiter_state(self) -> tuple[str, str, str]:
+    def _current_delimiter_state(self) -> Tuple[str, str, str]:
         if not self.delim_var:
             fallback = self.emissions_delim if self.emissions_delim is not None else '__AUTO__'
             return ('', '', fallback)
@@ -1008,7 +1008,7 @@ class EmissionGUI:
             if current_state != self._last_loaded_delim_state:
                 self.load_inputfile(show_preview=True)
 
-    def _parse_bins(self) -> list[float]:
+    def _parse_bins(self) -> List[float]:
         """Parse custom bins from the GUI field (comma or space separated)."""
         raw = (self.class_bins_var.get() if self.class_bins_var else '').strip()
         if not raw:
@@ -1085,7 +1085,7 @@ class EmissionGUI:
         attrs_summary = self._format_attrs_for_display(self.emissions_df)
         self._last_attrs_summary = attrs_summary
 
-        summary_parts: list[str] = []
+        summary_parts: List[str] = []
         label = source_label
         if label is None and self.inputfile_path:
             label = os.path.basename(self.inputfile_path)
@@ -1194,7 +1194,7 @@ class EmissionGUI:
                                 agg_dict = {p: 'sum' for p in pols}
                                 for c in emis_df.columns:
                                     if c not in group_keys and c not in pols:
-                                        agg_dict[c] = 'first'
+                                        agg_Dict[c] = 'first'
                                 
                                 emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
                     else:
@@ -2559,7 +2559,7 @@ class EmissionGUI:
             except Exception:
                 global_series = None
             global_stats = _calc_stats(global_series)
-            base_view_holder: dict[str, Optional[tuple[tuple[float, float], tuple[float, float]]]] = {'limits': None}
+            base_view_holder: Dict[str, Optional[Tuple[Tuple[float, float], Tuple[float, float]]]] = {'limits': None}
 
             def _view_matches_base(xlim, ylim, tol=1e-6):
                 base = base_view_holder.get('limits')
@@ -2946,9 +2946,9 @@ class EmissionGUI:
             raise ValueError('No pollutant numeric columns to summarize.')
         lower_map = {c.lower(): c for c in raw.columns}
         mode_l = (mode or '').strip().lower()
-        group_cols: list[str] = []
+        group_cols: List[str] = []
         # Prepare optional name enrichment columns
-        add_cols: dict[str, pd.Series] = {}
+        add_cols: Dict[str, pd.Series] = {}
         # County
         source_type = None
         try:

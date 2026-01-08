@@ -428,7 +428,7 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     return pol, os.path.abspath(out_file)
 
 
-def _plot_worker(pol: str) -> tuple[str, str]:
+def _plot_worker(pol: str) -> Tuple[str, str]:
     if _PLOT_CONTEXT is None:
         raise RuntimeError("Plot context is not initialized")
     return _render_single_pollutant(pol, _PLOT_CONTEXT)
@@ -772,7 +772,7 @@ def _batch_mode(args):
         logging.error("No pollutant columns detected.")
         return 1
 
-    requested: list[str] = []
+    requested: List[str] = []
     try:
         raw_requested = getattr(args, 'pollutant_list', None)
         if raw_requested:

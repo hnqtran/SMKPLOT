@@ -252,7 +252,7 @@ def merge_emissions_with_geometry(
     sort: bool = False,
     copy_geometry: bool = False,
     pad_fips: bool = True,
-) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+) -> Tuple[gpd.GeoDataFrame, pd.DataFrame]:
     """Prepare emissions data and merge with geometry using shared rules.
 
     Returns a tuple of (merged GeoDataFrame, prepared emissions DataFrame). When duplicate
@@ -347,7 +347,7 @@ def merge_emissions_with_geometry(
     return merged, emis_prepped
 
 
-def _file_signature(path: str) -> tuple[str, Optional[int]]:
+def _file_signature(path: str) -> Tuple[str, Optional[int]]:
     if not isinstance(path, str):
         return (str(path), None)
     abs_path = os.path.abspath(path)
@@ -421,7 +421,7 @@ def remap_columns(df: pd.DataFrame, src_type: str):
         df = df[col_lst].rename(columns={icol: col_maps[icol] for icol in col_lst})
         return df, col_lst
 
-def _safe_pivot(df: pd.DataFrame, index_cols: list[str], pol_col: str, emis_col: str) -> pd.DataFrame:
+def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col: str) -> pd.DataFrame:
     """
     Safely pivot a long DataFrame to wide format, avoiding OverflowError in pandas groupby
     when dealing with many grouping columns (high cardinality cartesian product).
@@ -452,7 +452,7 @@ def _safe_pivot(df: pd.DataFrame, index_cols: list[str], pol_col: str, emis_col:
     
     return result
 
-def _categorize_columns(df: pd.DataFrame, columns: list[str]) -> None:
+def _categorize_columns(df: pd.DataFrame, columns: List[str]) -> None:
     for col in columns:
         if col not in df.columns:
             continue
@@ -561,7 +561,7 @@ def filter_dataframe_by_values(
     if not column or not values:
         return df
 
-    normalized_tokens: list[str] = []
+    normalized_tokens: List[str] = []
     digits_only = True
     for raw in values:
         if raw is None:
@@ -1304,7 +1304,7 @@ def read_smkreport(
 
 
 @_memoize(maxsize=6)
-def _load_shapefile(path: str, get_fips: bool, _signature: tuple[str, Optional[int]]) -> gpd.GeoDataFrame:
+def _load_shapefile(path: str, get_fips: bool, _signature: Tuple[str, Optional[int]]) -> gpd.GeoDataFrame:
     """Read and normalize a counties shapefile, returning a GeoDataFrame."""
     del _signature  # used only to bust caches when the underlying file changes
     is_url = isinstance(path, str) and path.lower().startswith(("http://", "https://"))
@@ -1422,7 +1422,7 @@ def _clean_name(raw: str) -> str:
     return raw.strip()
 
 @_memoize(maxsize=8)
-def _load_griddesc(path: str, _signature: tuple[str, Optional[int]]) -> Tuple[Dict, Dict]:
+def _load_griddesc(path: str, _signature: Tuple[str, Optional[int]]) -> Tuple[Dict, Dict]:
     del _signature
     with open(path, 'r') as f:
         lines = f.readlines()
@@ -1516,7 +1516,7 @@ def _create_domain_gdf_cached(
     griddesc_path: str,
     grid_name: str,
     full_grid: bool,
-    _signature: tuple[str, Optional[int]],
+    _signature: Tuple[str, Optional[int]],
 ) -> gpd.GeoDataFrame:
     del _signature
     coord_params, grid_params = extract_grid(griddesc_path, grid_name)
@@ -1746,7 +1746,7 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame) -> pd.Dat
         pass
     return mapped
 
-def detect_pollutants(df: pd.DataFrame) -> list[str]:
+def detect_pollutants(df: pd.DataFrame) -> List[str]:
     try:
         cached = df.attrs.get('_detected_pollutants')  # type: ignore[attr-defined]
         if isinstance(cached, (list, tuple)):
