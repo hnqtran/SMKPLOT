@@ -180,25 +180,25 @@ class EmissionGUI:
         elif self._json_arguments.get('log_scale', None) is None:
             self.scale_var.set('linear')
         else:
-            self.scale_var.set(ui_state['scale'])
+            self.scale_var.set(ui_state.get('scale', 'linear'))
         
         # Settings for bins var
         if self._json_arguments.get('bins', None):
             self.class_bins_var.set(str(self._json_arguments.get('bins')))
         else:
-            self.class_bins_var.set(ui_state['bins'])
+            self.class_bins_var.set(ui_state.get('bins', ''))
             
         # Settings for cmaps
         if self._json_arguments.get('cmap', None):
             self.cmap_var.set(str(self._json_arguments.get('cmap')))
         else:
-            self.cmap_var.set(ui_state['colormap'])
+            self.cmap_var.set(ui_state.get('colormap', 'viridis'))
 
         # Setting for delimiter
         if self._json_arguments.get('delim', None):
             self.delim_var.set(str(self._json_arguments.get('delim')))
         else:
-            self.delim_var.set(ui_state['delimiter'])            
+            self.delim_var.set(ui_state.get('delimiter', ','))            
             
         if self.custom_delim_var and ui_state.get('custom_delimiter'): self.custom_delim_var.set(ui_state['custom_delimiter'])
         if self.plot_by_var and ui_state.get('plot_by'): self.plot_by_var.set(ui_state['plot_by'])
