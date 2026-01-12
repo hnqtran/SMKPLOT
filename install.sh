@@ -6,7 +6,7 @@
 # Configuration
 VENV_DIR=".venv"
 REQUIREMENTS="requirements.txt"
-MAIN_SCRIPT="main.py"
+MAIN_SCRIPT="smkplot.py"
 
 # Ensure we are in the script's directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
@@ -50,7 +50,7 @@ else
     echo "WARNING: $REQUIREMENTS not found. Skipping package installation."
 fi
 
-# 4. Update Shebang in main.py
+# 4. Update Shebang in smkplot.py
 echo "[3/3] Configuring $MAIN_SCRIPT..."
 if [ -f "$MAIN_SCRIPT" ]; then
     # Create a temporary file with the new shebang

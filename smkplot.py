@@ -35,6 +35,8 @@ from utils import USING_TK, tk, _prune_incompatible_bundled_libs, _import_numpy_
 from gui import EmissionGUI
 from batch import _batch_mode
 
+SMKPLOT_VERSION = "1.0"
+
 _POLLUTANT_SPLIT_RE = re.compile(r'[\s,]+')
 
 _prune_incompatible_bundled_libs()
@@ -51,20 +53,20 @@ def parse_args():
         epilog=(
             "Examples\n"
             "  # 1) Launch GUI (auto-detects Tk/display)\n"
-            "  python3 main.py --filepath report.csv\n\n"
+            "  python3 smkplot.py --filepath report.csv\n\n"
             "  # 2) GUI with a specific counties layer and delimiter\n"
-            "  python3 main.py --filepath report.txt --delim tab --county-shapefile counties.zip\n\n"
+            "  python3 smkplot.py --filepath report.txt --delim tab --county-shapefile counties.zip\n\n"
                 "  # 3) Batch: selected pollutants (comma separated)\n"
-                "  python3 main.py --no-gui \\\n"
+                "  python3 smkplot.py --no-gui \\\n"
                 "                   --filepath report.csv --county-shapefile counties.zip \\\n"
                 "                   --pollutant NOX,VOC,PM2_5 --outdir maps\n\n"
                 "  # 4) Batch: all pollutants\n"
-                "  python3 main.py --no-gui --filepath report.csv --county-shapefile counties.zip --batch-all --outdir maps\n\n"
+                "  python3 smkplot.py --no-gui --filepath report.csv --county-shapefile counties.zip --batch-all --outdir maps\n\n"
                 "  # 5) Batch: grid plotting\n"
-                "  python3 main.py --no-gui --pltyp grid --griddesc GRIDDESC --gridname 12US1_36-12-4 \\\n"
+                "  python3 smkplot.py --no-gui --pltyp grid --griddesc GRIDDESC --gridname 12US1_36-12-4 \\\n"
                     "                   --filepath report.csv --pollutant CO --outdir maps\n\n"
                     "  # 6) Reimport using a saved JSON snapshot\n"
-                    "  python3 main.py --no-gui --json outputs/example_sector.json --reimport --outdir maps\n\n"
+                    "  python3 smkplot.py --no-gui --json outputs/example_sector.json --reimport --outdir maps\n\n"
             "Notes\n"
             "- Delimiter tokens accepted by --delim: comma | semicolon | tab | pipe | space | \\\"\\t\\\"\n"
             "- GUI grid mode (ROW/COL) requires providing a GRIDDESC in the GUI.\n"
@@ -109,6 +111,7 @@ def parse_args():
     ap.add_argument('--json', help='Load arguments from a previously saved JSON settings snapshot (produced by prior batch runs).')
     ap.add_argument('--yaml', help='Load arguments from a previously saved YAML settings snapshot.')
     ap.add_argument('--reimport', '--import', dest='reimport', action='store_true', help='Reuse processed emissions already recorded in a JSON/YAML snapshot instead of re-reading the raw input file.')
+    ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
 
     args = ap.parse_args()
 
@@ -133,11 +136,7 @@ def parse_args():
             if current == default:
                 setattr(args, key, value)
         args.json = json_path
-        args.json_path = json_path
-        try:
-            args.json_dir = os.path.dirname(json_path)
-        except Exception:
-            args.json_dir = None
+        args.config_path = json_path
     elif args.yaml:
         yaml_path = os.path.abspath(args.yaml)
         try:
@@ -159,11 +158,7 @@ def parse_args():
                 setattr(args, key, value)
         # Map to existing json fields for compatibility
         args.json = yaml_path
-        args.json_path = yaml_path
-        try:
-            args.json_dir = os.path.dirname(yaml_path)
-        except Exception:
-            args.json_dir = None
+        args.config_path = yaml_path
 
     args.json_payload = payload
 
@@ -305,6 +300,7 @@ def main():
             args.county_shapefile,
             emissions_delim=args.delim,
             cli_args=args,
+            app_version=SMKPLOT_VERSION,
         )
         # Pass batch-mode grid settings to the GUI instance if provided
         if args.griddesc:

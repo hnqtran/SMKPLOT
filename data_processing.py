@@ -109,7 +109,7 @@ def _resolve_default_cache_dir() -> Optional[str]:
     search_roots = [here.parent, here.parent.parent, here.parent.parent.parent]
     for root in search_roots:
         try:
-            candidate = root / 'main.py'
+            candidate = root / 'smkplot.py'
         except Exception:
             continue
         if candidate.exists():
@@ -612,7 +612,7 @@ def filter_dataframe_by_values(
     return filtered
 
 def read_inputfile(
-    fpath: str,
+    fpath: Union[str, Sequence[str]],
     sector: Optional[str] = None,
     delim: Optional[str] = ",",
     skiprows: Optional[int] = None,
@@ -631,6 +631,48 @@ def read_inputfile(
       * If 1st line has #LIST, treat as list file of multiple FF10 files
       * else, treat as smkreport and call read_smkreport().
     """
+    if isinstance(fpath, (list, tuple)):
+        # Recursively read each file and concatenate
+        dfs = []
+        raw_dfs = []
+        for p in fpath:
+            p = p.strip()
+            if not p:
+                continue
+            _emit_user_message(notify, 'INFO', f"Reading input file: {p} ...")
+            try:
+                d, r = read_inputfile(
+                    p, sector, delim, skiprows, comment, encoding, header_last, 
+                    flter_col, flter_start, flter_end, flter_val, notify
+                )
+                if d is not None:
+                    dfs.append(d)
+                if r is not None:
+                    raw_dfs.append(r)
+            except Exception as e:
+                _emit_user_message(notify, 'ERROR', f"Failed reading {p}: {e}")
+                # We continue with other files or fail? 
+                # Let's fail hard if one fails to ensure consistency, 
+                # or maybe just log. User usually wants all.
+                raise e 
+        
+        if not dfs:
+            return None, None
+        
+        # Concatenate
+        combined_df = pd.concat(dfs, ignore_index=True)
+        combined_raw = pd.concat(raw_dfs, ignore_index=True) if raw_dfs else None
+        
+        # Merge attributes (prefer first file's attributes, or accumulate?)
+        # For simple metadata like 'pollutants', we might want to re-detect.
+        # But commonly preserved attrs might be source_type, etc.
+        if dfs:
+            # Copy attrs from the first dataframe
+            for k, v in dfs[0].attrs.items():
+                combined_df.attrs[k] = v
+                
+        return _normalize_input_result((combined_df, combined_raw))
+
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
     if "#FORMAT=FF10_NONPOINT" in first_line:
@@ -677,7 +719,10 @@ def read_inputfile(
             notify=notify,
         )
     else:
-        _emit_user_message(notify, 'INFO', "Detected SMKREPORT format identifier in first line. Readding as SMKREPORT format...")
+        if "#Label" in first_line or "# County" in first_line:
+             _emit_user_message(notify, 'INFO', "Detected SMKREPORT header in first line. Reading as SMKREPORT format...")
+        else:
+             _emit_user_message(notify, 'INFO', "Could not determine file format. Reading as SMKREPORT format...")
         result = read_smkreport(
             fpath=fpath,
             delim=delim,
@@ -1047,10 +1092,20 @@ def read_smkreport(
                     break
             prev_line = line
             
-    if header_idx == -1:
-        raise ValueError("No '#Label' or '# County' header line found in file.")
-
     comment_marker = comment if (comment is not None and comment != "") else '#'
+
+    if header_idx == -1:
+        # Fallback: Treat the first non-comment line as the header (generic CSV support)
+        with open(fpath, **open_kwargs) as f:
+            for i, line in enumerate(f):
+                sline = line.strip()
+                if sline and not sline.startswith(comment_marker):
+                    header_idx = i
+                    header_line = sline
+                    break
+        
+        if header_idx == -1:
+             raise ValueError("No valid header line found in file (neither '#Label'/'# County' nor generic CSV header).")
     
     # Delimiter selection
     sep = delim

@@ -32,16 +32,16 @@ This tool provides a graphical user interface (GUI) and a headless batch mode fo
 
 ## Usage
 
-The tool is launched via `main.py`. It attempts to start the GUI by default but will fall back to batch mode if no display is detected or if `--no-gui` is specified.
+The tool is launched via `smkplot.py`. It attempts to start the GUI by default but will fall back to batch mode if no display is detected or if `--no-gui` is specified.
 
 ### 1. Graphical User Interface (GUI)
 
 Simply run the script without arguments (or with an initial file) to open the GUI:
 
 ```bash
-python3 main.py
+python3 smkplot.py
 # OR load a file on startup
-python3 main.py --filepath /path/to/emissions.csv
+python3 smkplot.py --filepath /path/to/emissions.csv
 ```
 
 **GUI Features:**
@@ -56,7 +56,7 @@ Generate maps automatically without opening a window. Use `--no-gui` to force ba
 
 **Basic Example:**
 ```bash
-python3 main.py --no-gui \
+python3 smkplot.py --no-gui \
   --filepath /path/to/emissions.csv \
   --county-shapefile /path/to/counties.gpkg \
   --pollutant "NOX,VOC" \
@@ -65,7 +65,7 @@ python3 main.py --no-gui \
 
 **Grid Plotting Example:**
 ```bash
-python3 main.py --no-gui \
+python3 smkplot.py --no-gui \
   --pltyp grid \
   --griddesc /path/to/GRIDDESC \
   --gridname 12US1_36-12-4 \
@@ -80,15 +80,25 @@ You can save your run settings to a file (automatically done in batch mode) and 
 
 **Using a YAML Configuration:**
 ```bash
-python3 main.py --yaml config.yaml
+python3 smkplot.py --yaml config.yaml
 ```
 
 **Re-importing Processed Data:**
 If you have already processed a large dataset and saved it (via `--export-csv`), you can skip the raw data parsing step by using `--reimport` with your config file:
 
 ```bash
-python3 main.py --yaml config.yaml --reimport
+python3 smkplot.py --yaml config.yaml --reimport
 ```
+
+### 4. Handling Missing Data (Map Holes)
+
+By default, regions with no matching emissions data are left empty (transparent/white). To fill these regions with a specific value (e.g., 0), use the `--fill-nan` option:
+
+```bash
+python3 smkplot.py --fill-nan 0.0 ...
+```
+
+In the GUI, you can check the **"Fill NaN=0"** box to automatically set this to 0.0.
 
 ## Configuration File Structure (YAML)
 
@@ -134,6 +144,7 @@ outputs:
 | `--log-scale` | Use logarithmic color scale. |
 | `--cmap` | Matplotlib colormap name (e.g., `viridis`, `jet`). |
 | `--bins` | Custom bin edges for the colorbar. |
+| `--fill-nan` | Value to fill missing data with (e.g. `0.0`). Fills both empty map regions and NaNs in data. |
 | `--zoom-to-data` | Zoom map extent to where data exists. |
 | `--export-csv` | Export the processed DataFrame to CSV. |
 

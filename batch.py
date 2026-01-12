@@ -12,6 +12,7 @@ It supports:
 
 import os
 import logging
+import copy
 import json
 import yaml
 import multiprocessing
@@ -103,12 +104,23 @@ def _write_settings_snapshot(args, plots, files, attrs=None):
     """Persist run configuration and generated artifacts for reuse."""
     try:
         os.makedirs(args.outdir, exist_ok=True)
+        
+        arg_dict = {
+            k: getattr(args, k) for k in vars(args)
+            if k not in {'json', 'yaml', 'json_payload', 'pollutant_list', 'pollutant_first','filter_values'}
+        }
+        
+        # Only preserve 'imported_file' if we are actually in reimport mode
+        if getattr(args, 'reimport', False):
+            jp = getattr(args, 'json_payload', None)
+            if jp and isinstance(jp, dict):
+                prev_imp = jp.get('arguments', {}).get('imported_file')
+                if prev_imp:
+                    arg_dict['imported_file'] = prev_imp
+
         payload = {
             'timestamp_utc': datetime.utcnow().isoformat() + 'Z',
-            'arguments': {
-                k: getattr(args, k) for k in vars(args)
-                if k not in {'json', 'yaml', 'json_payload', 'pollutant_list', 'pollutant_first','filter_values'}
-            },
+            'arguments': arg_dict,
             'outputs': {
                 'output_directory': os.path.abspath(args.outdir),
                 'plots': [os.path.abspath(p) for p in plots if p],
@@ -204,7 +216,17 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
 
     if bins and len(bins) >= 2:
         try:
-            plot_kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=True)
+            # Update cmap to support transparency for values below first bin
+            # Use extend='neither' and clip=False to preserve original bin colors
+            cmap = copy.copy(cmap)
+            cmap.set_under('none')
+            try:
+                cmap.set_over(cmap(cmap.N - 1))
+            except Exception:
+                pass
+                
+            plot_kwargs['cmap'] = cmap
+            plot_kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
         except Exception:
             pass
         use_log = False
@@ -294,7 +316,7 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     except Exception:
         bins_ticks = []
     try:
-        from matplotlib.ticker import FixedLocator
+        from matplotlib.ticker import FixedLocator, FuncFormatter
 
         if cb_ax is not None and bins_ticks:
             try:
@@ -303,6 +325,14 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
                 _norm = None
             is_log = isinstance(_norm, LogNorm)
             ticks = [t for t in bins_ticks if (t > 0)] if is_log else list(bins_ticks)
+            
+            # Formatter for small values at bin edges
+            def _fmt_precise(x, pos=None):
+                if x == 0: return "0"
+                if 0 < abs(x) < 0.1:
+                    return f"{x:.4g}"
+                return f"{x:.4g}"
+            
             if ticks:
                 try:
                     bbox = cb_ax.get_position()
@@ -312,11 +342,13 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
                 if orient_vertical:
                     try:
                         cb_ax.yaxis.set_major_locator(FixedLocator(ticks))
+                        cb_ax.yaxis.set_major_formatter(FuncFormatter(_fmt_precise))
                     except Exception:
                         pass
                 else:
                     try:
                         cb_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                        cb_ax.xaxis.set_major_formatter(FuncFormatter(_fmt_precise))
                     except Exception:
                         pass
                 try:
@@ -677,6 +709,33 @@ def _batch_mode(args):
             return 1
         logging.exception("Error building FIPS columns")
         return 1
+    
+    # Handle fill-nan option
+    fill_nan_val = getattr(args, 'fill_nan', None)
+    should_fill = False
+    fill_number = 0.0
+    
+    if fill_nan_val is not None:
+        if isinstance(fill_nan_val, bool) and not fill_nan_val:
+            should_fill = False
+        elif isinstance(fill_nan_val, str) and fill_nan_val.lower() == 'false':
+            should_fill = False
+        else:
+            try:
+                fill_number = float(fill_nan_val)
+                should_fill = True
+            except (ValueError, TypeError):
+                should_fill = False
+
+    if should_fill:
+        try:
+           # Only fill numeric columns
+           num_cols = emis_df.select_dtypes(include=[np.number]).columns
+           if not num_cols.empty:
+               emis_df[num_cols] = emis_df[num_cols].fillna(fill_number)
+               logging.info("Filled NaN values with %.4f", fill_number)
+        except Exception:
+           logging.exception("Failed to fill NaN values")
 
     print(emis_df.attrs)
     print(emis_df.head(5))
@@ -833,6 +892,16 @@ def _batch_mode(args):
     except Exception:
         logging.exception("Failed to merge emissions with geometry")
         return 1
+    
+    # Fill NaNs in merged geometry if requested (fixes holes in map)
+    if should_fill:
+        try:
+           cols_to_fill = [p for p in pollutants if p in merged.columns]
+           if cols_to_fill:
+               merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_number)
+               logging.info("Filled NaN values in merged geometry with %.4f", fill_number)
+        except Exception:
+           logging.exception("Failed to fill NaN values in merged dataframe")
     
     # Export merged GeoDataFrame to file if requested
     #if (getattr(args, 'export_csv', False) or json_payload.get('arguments', {}).get('export_csv', False)):

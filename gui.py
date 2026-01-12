@@ -12,6 +12,7 @@ Features include:
 
 import os
 import sys
+import copy
 import logging
 import io
 import threading
@@ -65,9 +66,9 @@ else:
     ttk = None  # type: ignore
     filedialog = None  # type: ignore
 class EmissionGUI:
-    def __init__(self, root, inputfile_path: Optional[str], counties_path: Optional[str], emissions_delim: Optional[str] = None, *, cli_args=None):
+    def __init__(self, root, inputfile_path: Optional[str], counties_path: Optional[str], emissions_delim: Optional[str] = None, *, cli_args=None, app_version: str = "1.0"):
         self.root = root
-        self.root.title("SMKREPORT Emission Plotter (Author: tranhuy@email.unc.edu)")
+        self.root.title(f"SMKPLOT version {app_version} (Author: tranhuy@email.unc.edu)")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # UI scaling based on screen resolution (baseline ~1600px width)
         try:
@@ -98,6 +99,20 @@ class EmissionGUI:
         self.skiprows = getattr(cli_args, 'skiprows', None) if cli_args else None or self._json_arguments.get('skiprows', None)
         self.comment_token = getattr(cli_args, 'comment', None) if cli_args else None or self._json_arguments.get('comment', None)
         self.encoding = getattr(cli_args, 'encoding', None) if cli_args else None or self._json_arguments.get('encoding', None)
+        
+        # fill_nan logic
+        self.fill_nan_arg = getattr(cli_args, 'fill_nan', None) if cli_args else None or self._json_arguments.get('fill_nan', None)
+        
+        # Fill NaN with Zero checkbox state
+        # If fill_nan_arg is approximately 0, default to checked
+        default_zero = False
+        if self.fill_nan_arg is not None:
+            try:
+                if abs(float(self.fill_nan_arg)) < 1e-9:
+                    default_zero = True
+            except Exception:
+                pass
+        self.fill_zero_var = tk.BooleanVar(value=default_zero)
 
         self.filter_col = getattr(cli_args, 'filter_col', None) if cli_args else None or self._json_arguments.get('filter_col', None)
         self.filter_start = getattr(cli_args, 'filter_start', None) if cli_args else None or self._json_arguments.get('filter_start', None)
@@ -233,9 +248,12 @@ class EmissionGUI:
                 if not os.path.exists(p):
                     raise ValueError(f'Reimport specified but could not locate imported_file {p}. Aborting.')
             
-            self.inputfile_path = self.imported_paths[0]
+            if len(self.imported_paths) > 1:
+                self.inputfile_path = "; ".join(self.imported_paths)
+            else:
+                self.inputfile_path = self.imported_paths[0]
 
-        if self.inputfile_path and os.path.exists(self.inputfile_path):
+        if self.inputfile_path and (";" in self.inputfile_path or os.path.exists(self.inputfile_path)):
             try:
                 self.emis_entry.delete(0, tk.END)
                 self.emis_entry.insert(0, self.inputfile_path)
@@ -761,33 +779,38 @@ class EmissionGUI:
         self.zoom_var = tk.BooleanVar(value=True)
         self.zoom_check = ttk.Checkbutton(btn_frame, text='Zoom to Data', variable=self.zoom_var)
         self.zoom_check.grid(row=0, column=5, sticky='w', padx=(12,0))
+        
+        # Fill NaN=0 Checkbox
+        self.fill_zero_check = ttk.Checkbutton(btn_frame, text='Fill NaN=0', variable=self.fill_zero_var)
+        self.fill_zero_check.grid(row=0, column=6, sticky='w', padx=(8,0))
+
         # Scale next to Zoom to Data and before Bins
         self.scale_label = ttk.Label(btn_frame, text="Scale:")
-        self.scale_label.grid(row=0, column=6, sticky='e', padx=(12,2))
+        self.scale_label.grid(row=0, column=7, sticky='e', padx=(12,2))
         self.scale_var = tk.StringVar(value='linear')
         self.scale_menu_widget = ttk.OptionMenu(btn_frame, self.scale_var, 'linear', 'linear', 'log')
-        self.scale_menu_widget.grid(row=0, column=7, sticky='w')
+        self.scale_menu_widget.grid(row=0, column=8, sticky='w')
         # Plot-by control (Auto/County/Grid)
         self.plotby_label = ttk.Label(btn_frame, text='Plot by:')
-        self.plotby_label.grid(row=0, column=8, sticky='e', padx=(12,2))
+        self.plotby_label.grid(row=0, column=9, sticky='e', padx=(12,2))
         self.plot_by_var = tk.StringVar(value='auto')
         self.plotby_menu_widget = ttk.OptionMenu(btn_frame, self.plot_by_var, 'auto', 'auto', 'county', 'grid')
-        self.plotby_menu_widget.grid(row=0, column=9, sticky='w')
+        self.plotby_menu_widget.grid(row=0, column=10, sticky='w')
         # Projection selection (Auto / WGS84 / LCC)
         self.proj_label = ttk.Label(btn_frame, text='Proj:')
-        self.proj_label.grid(row=0, column=10, sticky='e', padx=(12,2))
+        self.proj_label.grid(row=0, column=11, sticky='e', padx=(12,2))
         self.projection_var = tk.StringVar(value='auto')
         self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'auto', 'auto', 'wgs84', 'lcc')
-        self.proj_menu_widget.grid(row=0, column=11, sticky='w')
+        self.proj_menu_widget.grid(row=0, column=12, sticky='w')
         # Bins and Colormap controls
         self.bins_label = ttk.Label(btn_frame, text='Bins:')
-        self.bins_label.grid(row=0, column=12, sticky='e', padx=(12,2))
+        self.bins_label.grid(row=0, column=13, sticky='e', padx=(12,2))
         self.bins_entry = ttk.Entry(btn_frame, width=self._w_chars(28, min_chars=18, max_chars=40), textvariable=self.class_bins_var)
-        self.bins_entry.grid(row=0, column=13, sticky='we')
+        self.bins_entry.grid(row=0, column=14, sticky='we')
         self.cmap_label = ttk.Label(btn_frame, text='Colormap:')
-        self.cmap_label.grid(row=0, column=14, sticky='e', padx=(12,2))
+        self.cmap_label.grid(row=0, column=15, sticky='e', padx=(12,2))
         self.cmap_menu_widget = ttk.OptionMenu(btn_frame, self.cmap_var, self.cmap_var.get(), *self._cmap_choices)
-        self.cmap_menu_widget.grid(row=0, column=15, sticky='w')
+        self.cmap_menu_widget.grid(row=0, column=16, sticky='w')
 
         # SCC selection dropdown (replaces free-text keyword)
         self.scc_select_var = tk.StringVar(value='All SCC')
@@ -795,8 +818,8 @@ class EmissionGUI:
         # Wider combobox to show long SCC descriptions
         self.scc_entry = ttk.Combobox(btn_frame, textvariable=self.scc_select_var, values=[], width=self._w_chars(80, min_chars=40, max_chars=120), state='disabled')
         # place after colormap
-        self.scc_label.grid(row=0, column=16, sticky='e', padx=(12,2))
-        self.scc_entry.grid(row=0, column=17, sticky='w')
+        self.scc_label.grid(row=0, column=17, sticky='e', padx=(12,2))
+        self.scc_entry.grid(row=0, column=18, sticky='w')
         # initially disabled until we detect SCC columns
         try:
             self.scc_entry.state(['disabled'])
@@ -843,16 +866,16 @@ class EmissionGUI:
         # Adjust grid positions depending on mode
         if mode == 'wide':
             try:
-                self._btn_frame.columnconfigure(13, weight=1)
-                for c in (1, 17):
+                self._btn_frame.columnconfigure(14, weight=1)
+                for c in (1, 18):
                     self._btn_frame.columnconfigure(c, weight=0)
             except Exception:
                 pass
             # Put all on row 0
             for widget, col in [
-                (self.proj_label, 10), (self.proj_menu_widget, 11),
-                (self.bins_label, 12), (self.bins_entry, 13), (self.cmap_label, 14), (self.cmap_menu_widget, 15),
-                (self.scc_label, 16), (self.scc_entry, 17)
+                (self.proj_label, 11), (self.proj_menu_widget, 12),
+                (self.bins_label, 13), (self.bins_entry, 14), (self.cmap_label, 15), (self.cmap_menu_widget, 16),
+                (self.scc_label, 17), (self.scc_entry, 18)
             ]:
                 try:
                     widget.grid_configure(row=0, column=col)
@@ -864,7 +887,7 @@ class EmissionGUI:
                 self._btn_frame.columnconfigure(3, weight=1)
                 self._btn_frame.columnconfigure(7, weight=1)
                 # Reset weights for columns used in wide mode
-                for c in (13, 17):
+                for c in (14, 18):
                     self._btn_frame.columnconfigure(c, weight=0)
             except Exception:
                 pass
@@ -915,12 +938,15 @@ class EmissionGUI:
             init_dir = None
         if init_dir is None:
             init_dir = DEFAULT_INPUTS_INITIALDIR if os.path.isdir(DEFAULT_INPUTS_INITIALDIR) else None
-        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("CSV/List", "*.csv *.txt *.lst"), ("All", "*.*")])
-        if not path:
+        paths = filedialog.askopenfilenames(initialdir=init_dir, filetypes=[("CSV/List", "*.csv *.txt *.lst"), ("All", "*.*")])
+        if not paths:
             return
+        
+        # Join with semicolon for display
+        joined_path = "; ".join(paths)
         self.emis_entry.delete(0, tk.END)
-        self.emis_entry.insert(0, path)
-        self.inputfile_path = path
+        self.emis_entry.insert(0, joined_path)
+        self.inputfile_path = joined_path
         self.load_inputfile(show_preview=True)
 
     def browse_griddesc(self):
@@ -1194,13 +1220,14 @@ class EmissionGUI:
                                 agg_dict = {p: 'sum' for p in pols}
                                 for c in emis_df.columns:
                                     if c not in group_keys and c not in pols:
-                                        agg_Dict[c] = 'first'
+                                        agg_dict[c] = 'first'
                                 
                                 emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
                     else:
                         emis_df = pd.read_csv(self.inputfile_path)
                 except Exception as exc:
-                    self.root.after(0, lambda: self._notify('ERROR', 'Reimport Load Error', f"Failed to load processed emissions data: {exc}", exc=exc))
+                    err = exc
+                    self.root.after(0, lambda: self._notify('ERROR', 'Reimport Load Error', f"Failed to load processed emissions data: {err}", exc=err))
                     return
 
                 attrs = self._json_arguments.get('imported_attrs')
@@ -1224,7 +1251,9 @@ class EmissionGUI:
                 # Pre-compute SCC data in thread
                 scc_data = self._compute_scc_data(self.raw_df)
 
-                self.root.after(0, lambda: self._loader_notify('INFO', f"Reimported processed emissions file: {os.path.basename(self.inputfile_path)}"))
+                msg_paths = self.imported_paths if (hasattr(self, 'imported_paths') and self.imported_paths) else [self.inputfile_path]
+                msg_str = ", ".join(os.path.basename(p) for p in msg_paths)
+                self.root.after(0, lambda: self._loader_notify('INFO', f"Reimported processed emissions file(s): {msg_str}"))
                 self.reimport_requested = False
                 self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
 
@@ -1233,9 +1262,14 @@ class EmissionGUI:
                     # Thread-safe notify wrapper
                     def safe_notify(level, message):
                         self.root.after(0, lambda: self._loader_notify(level, message))
+                    
+                    # Handle multiple files (semicolon separated)
+                    f_input = self.inputfile_path
+                    if f_input and ";" in f_input:
+                        f_input = [x.strip() for x in f_input.split(";") if x.strip()]
 
                     emissions_df, raw_df = read_inputfile(
-                        self.inputfile_path,
+                        f_input,
                         sector=self.sector,
                         delim=effective_delim,
                         skiprows=self.skiprows,
@@ -1255,6 +1289,35 @@ class EmissionGUI:
                         self.root.after(0, lambda e=e: self._notify('ERROR', 'Emissions Load Error', str(e), exc=e))
                     return
                 
+                # Apply fill-nan if configured
+                fn_arg = getattr(self, 'fill_nan_arg', None)
+                if fn_arg is not None:
+                    try:
+                        should_fill = False
+                        fill_num = 0.0
+                        if isinstance(fn_arg, bool) and not fn_arg:
+                            should_fill = False
+                        elif isinstance(fn_arg, str) and fn_arg.lower() == 'false':
+                            should_fill = False
+                        else:
+                            try:
+                                fill_num = float(fn_arg)
+                                should_fill = True
+                            except Exception:
+                                pass
+                        
+                        if should_fill:
+                             # Fill emissions_df
+                             cols = emissions_df.select_dtypes(include=[np.number]).columns
+                             if len(cols) > 0:
+                                 emissions_df[cols] = emissions_df[cols].fillna(fill_num)
+                             # Fill raw_df
+                             rcols = raw_df.select_dtypes(include=[np.number]).columns
+                             if len(rcols) > 0:
+                                 raw_df[rcols] = raw_df[rcols].fillna(fill_num)
+                    except Exception as e:
+                        print(f"Fill NaN error: {e}")
+
                 self.emissions_df = emissions_df
                 self.raw_df = raw_df
                 if effective_delim is not None:
@@ -1481,6 +1544,8 @@ class EmissionGUI:
             id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
             sel_code if use_scc_filter else '',
             pol_tuple,
+            getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
+            getattr(self, 'fill_nan_arg', None)
         )
         cached = self._merged_cache.get(cache_key)
         if cached is not None:
@@ -1582,6 +1647,39 @@ class EmissionGUI:
                 merged['__has_emissions'] = merged[merge_on].notna()
             except Exception:
                 merged['__has_emissions'] = False
+        
+        # Apply fill_nan if configured (for map regions with no data)
+        try:
+            fill_arg = getattr(self, 'fill_nan_arg', None)
+            fill_zero = getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get()
+
+            do_fill = False
+            fill_val = 0.0
+
+            if fill_zero:
+                do_fill = True
+                fill_val = 0.0
+            elif fill_arg is not None:
+                if isinstance(fill_arg, bool) and not fill_arg:
+                    do_fill = False
+                elif isinstance(fill_arg, str) and str(fill_arg).lower() == 'false':
+                    do_fill = False
+                else:
+                    try:
+                        fill_val = float(fill_arg)
+                        do_fill = True
+                    except Exception:
+                        pass
+                
+            if do_fill:
+                # Identify pollutant columns to fill
+                pols = getattr(self, 'pollutants', [])
+                if pols:
+                    cols_to_fill = [c for c in pols if c in merged.columns]
+                    if cols_to_fill:
+                            merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_val)
+        except Exception as e:
+            print(f"Error filling NaNs in merged geometry: {e}")
 
         try:
             cache_df = merged.copy()
@@ -2117,8 +2215,21 @@ class EmissionGUI:
         # Decide discrete vs continuous based on custom bins
         bins = self._parse_bins()
         if len(bins) >= 2:
-            # Discrete mapping using boundaries; ignore log scale for coloring
-            norm = BoundaryNorm(bins, ncolors=cmap.N, clip=True)
+            # Discrete mapping using boundaries
+            # Handle user request for transparency below first bin:
+            # - Use clip=False so values < bins[0] map to -1 (Under)
+            # - Use extend='neither' to preserve original bin-to-color mapping (extend='max' shifts colors)
+            # - Explicitly set under/over colors
+            
+            cmap = copy.copy(cmap)
+            cmap.set_under('none')            # Transparent for values < bins[0]
+            try:
+                # Ensure values > bins[-1] stay opaque (last color) like clip=True
+                cmap.set_over(cmap(cmap.N - 1)) 
+            except Exception:
+                pass
+            
+            norm = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
         else:
             # Continuous; honor linear/log selection
             if self.scale_var.get() == 'log' and vmax > 0 and vmin > 0:
@@ -2171,14 +2282,26 @@ class EmissionGUI:
                             orient_vertical = (bbox.height >= bbox.width)
                         except Exception:
                             orient_vertical = True
+                        # Determine formatter that shows requested precision
+                        def _fmt_precise(x, pos=None):
+                            if x == 0: return "0"
+                            # If very small, use up to 4 decimal places, else standard
+                            if 0 < abs(x) < 0.1:
+                                return f"{x:.4g}"
+                            return f"{x:.4g}"
+                        
+                        from matplotlib.ticker import FuncFormatter
+
                         if orient_vertical:
                             try:
                                 cbar_ax.yaxis.set_major_locator(FixedLocator(ticks))
+                                cbar_ax.yaxis.set_major_formatter(FuncFormatter(_fmt_precise))
                             except Exception:
                                 pass
                         else:
                             try:
                                 cbar_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                                cbar_ax.xaxis.set_major_formatter(FuncFormatter(_fmt_precise))
                             except Exception:
                                 pass
                         try:
@@ -2499,8 +2622,21 @@ class EmissionGUI:
             gdf_for_stats = merged_plot
             prepared_for_stats = merged.attrs.get('__prepared_emis') if hasattr(merged, 'attrs') else None
             merge_key_name = merged.attrs.get('__merge_key') if hasattr(merged, 'attrs') else None
+            # Determine if fill was applied
+            fill_active = False
+            try:
+                if getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get():
+                   fill_active = True
+                else:
+                    arg = getattr(self, 'fill_nan_arg', None)
+                    if arg is not None and str(arg).lower() != 'false':
+                        fill_active = True
+            except Exception:
+                pass
+
             if (
-                isinstance(prepared_for_stats, pd.DataFrame)
+                not fill_active
+                and isinstance(prepared_for_stats, pd.DataFrame)
                 and isinstance(merge_key_name, str)
                 and merge_key_name in prepared_for_stats.columns
             ):
