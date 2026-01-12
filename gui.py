@@ -260,8 +260,9 @@ class EmissionGUI:
             except Exception:
                 pass
             
-            if self.json_payload:
-                self._set_status('Auto-loading data from JSON/YAML configuration...', level='INFO')
+            cli_filepath = getattr(cli_args, 'filepath', None) if cli_args else None
+            if self.json_payload or cli_filepath:
+                self._set_status('Auto-loading data...', level='INFO')
                 # Schedule load to run after UI init
                 self.root.after(200, lambda: self.load_inputfile(show_preview=False))
             else:
@@ -508,11 +509,33 @@ class EmissionGUI:
 
     def _save_settings(self) -> None:
         """Collect and save current GUI settings to the JSON config file."""
+        # Sync from widgets first to capture manual edits (e.g. user typed path but didn't click load/preview)
+        current_input = self.inputfile_path
+        if hasattr(self, 'emis_entry'):
+            try:
+                val = self.emis_entry.get().strip()
+                if val: current_input = val
+            except Exception: pass
+            
+        current_griddesc = self.griddesc_path
+        if hasattr(self, 'griddesc_entry'):
+            try:
+                val = self.griddesc_entry.get().strip()
+                if val: current_griddesc = val
+            except Exception: pass
+            
+        current_counties = self.counties_path
+        if hasattr(self, 'county_entry'):
+            try:
+                 val = self.county_entry.get().strip()
+                 if val: current_counties = val
+            except Exception: pass
+
         settings = {
             'last_paths': {
-                'inputpath': self.inputfile_path or '',
-                'griddesc': self.griddesc_path or '',
-                'counties': self.counties_path or '',
+                'inputpath': current_input or '',
+                'griddesc': current_griddesc or '',
+                'counties': current_counties or '',
             },
             'ui_state': {
                 'scale': self.scale_var.get() if self.scale_var else 'linear',
@@ -772,7 +795,7 @@ class EmissionGUI:
             current_state = self._current_delimiter_state()
             if current_state == self._last_loaded_delim_state:
                 return
-            self.load_inputfile(show_preview=True)
+            self.load_inputfile(show_preview=False)
         self.custom_delim_entry.bind('<FocusOut>', _reload_event)
         self.custom_delim_entry.bind('<Return>', _reload_event)
         # Zoom to Data next to Delim
@@ -783,34 +806,60 @@ class EmissionGUI:
         # Fill NaN=0 Checkbox
         self.fill_zero_check = ttk.Checkbutton(btn_frame, text='Fill NaN=0', variable=self.fill_zero_var)
         self.fill_zero_check.grid(row=0, column=6, sticky='w', padx=(8,0))
+        
+        # NCF Controls (Layer / TStep) - initially enabled but state set to disabled
+        self.ncf_layer_var = tk.StringVar(value='')
+        self.ncf_tstep_var = tk.StringVar(value='')
+        
+        self.ncf_layer_label = ttk.Label(btn_frame, text='Lay:')
+        self.ncf_layer_menu = ttk.Combobox(btn_frame, textvariable=self.ncf_layer_var, state='disabled', width=8)
+        self.ncf_tstep_label = ttk.Label(btn_frame, text='Time:')
+        self.ncf_tstep_menu = ttk.Combobox(btn_frame, textvariable=self.ncf_tstep_var, state='disabled', width=26)
+        
+        # Bind events
+        def _on_ncf_param_change(event):
+             if not self.inputfile_path: return
+             # Only trigger if NCF and valid selections
+             if not (self.ncf_layer_menu.get() and self.ncf_tstep_menu.get()): return
+             self.load_inputfile(show_preview=False)
 
+        self.ncf_layer_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
+        self.ncf_tstep_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
+        
+        # Initially grid them (they will be disabled)
+        self.ncf_layer_label.grid(row=0, column=7, sticky='e', padx=2)
+        self.ncf_layer_menu.grid(row=0, column=8, sticky='w')
+        self.ncf_tstep_label.grid(row=0, column=9, sticky='e', padx=2)
+        self.ncf_tstep_menu.grid(row=0, column=10, sticky='w')
+
+        # Shift subsequent columns due to insertion
         # Scale next to Zoom to Data and before Bins
         self.scale_label = ttk.Label(btn_frame, text="Scale:")
-        self.scale_label.grid(row=0, column=7, sticky='e', padx=(12,2))
+        self.scale_label.grid(row=0, column=11, sticky='e', padx=(12,2)) # Was 7
         self.scale_var = tk.StringVar(value='linear')
         self.scale_menu_widget = ttk.OptionMenu(btn_frame, self.scale_var, 'linear', 'linear', 'log')
-        self.scale_menu_widget.grid(row=0, column=8, sticky='w')
+        self.scale_menu_widget.grid(row=0, column=12, sticky='w') # Was 8
         # Plot-by control (Auto/County/Grid)
         self.plotby_label = ttk.Label(btn_frame, text='Plot by:')
-        self.plotby_label.grid(row=0, column=9, sticky='e', padx=(12,2))
+        self.plotby_label.grid(row=0, column=13, sticky='e', padx=(12,2)) # Was 9
         self.plot_by_var = tk.StringVar(value='auto')
         self.plotby_menu_widget = ttk.OptionMenu(btn_frame, self.plot_by_var, 'auto', 'auto', 'county', 'grid')
-        self.plotby_menu_widget.grid(row=0, column=10, sticky='w')
+        self.plotby_menu_widget.grid(row=0, column=14, sticky='w') # Was 10
         # Projection selection (Auto / WGS84 / LCC)
         self.proj_label = ttk.Label(btn_frame, text='Proj:')
-        self.proj_label.grid(row=0, column=11, sticky='e', padx=(12,2))
+        self.proj_label.grid(row=0, column=15, sticky='e', padx=(12,2)) # Was 11
         self.projection_var = tk.StringVar(value='auto')
         self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'auto', 'auto', 'wgs84', 'lcc')
-        self.proj_menu_widget.grid(row=0, column=12, sticky='w')
+        self.proj_menu_widget.grid(row=0, column=16, sticky='w') # Was 12
         # Bins and Colormap controls
         self.bins_label = ttk.Label(btn_frame, text='Bins:')
-        self.bins_label.grid(row=0, column=13, sticky='e', padx=(12,2))
+        self.bins_label.grid(row=0, column=17, sticky='e', padx=(12,2)) # Was 13
         self.bins_entry = ttk.Entry(btn_frame, width=self._w_chars(28, min_chars=18, max_chars=40), textvariable=self.class_bins_var)
-        self.bins_entry.grid(row=0, column=14, sticky='we')
+        self.bins_entry.grid(row=0, column=18, sticky='we') # Was 14
         self.cmap_label = ttk.Label(btn_frame, text='Colormap:')
-        self.cmap_label.grid(row=0, column=15, sticky='e', padx=(12,2))
+        self.cmap_label.grid(row=0, column=19, sticky='e', padx=(12,2)) # Was 15
         self.cmap_menu_widget = ttk.OptionMenu(btn_frame, self.cmap_var, self.cmap_var.get(), *self._cmap_choices)
-        self.cmap_menu_widget.grid(row=0, column=16, sticky='w')
+        self.cmap_menu_widget.grid(row=0, column=20, sticky='w') # Was 16
 
         # SCC selection dropdown (replaces free-text keyword)
         self.scc_select_var = tk.StringVar(value='All SCC')
@@ -818,8 +867,8 @@ class EmissionGUI:
         # Wider combobox to show long SCC descriptions
         self.scc_entry = ttk.Combobox(btn_frame, textvariable=self.scc_select_var, values=[], width=self._w_chars(80, min_chars=40, max_chars=120), state='disabled')
         # place after colormap
-        self.scc_label.grid(row=0, column=17, sticky='e', padx=(12,2))
-        self.scc_entry.grid(row=0, column=18, sticky='w')
+        self.scc_label.grid(row=0, column=21, sticky='e', padx=(12,2)) # Was 17
+        self.scc_entry.grid(row=0, column=22, sticky='w') # Was 18
         # initially disabled until we detect SCC columns
         try:
             self.scc_entry.state(['disabled'])
@@ -866,45 +915,79 @@ class EmissionGUI:
         # Adjust grid positions depending on mode
         if mode == 'wide':
             try:
-                self._btn_frame.columnconfigure(14, weight=1)
-                for c in (1, 18):
+                self._btn_frame.columnconfigure(18, weight=1) # Bins entry at col 18
+                for c in (1, 22):
                     self._btn_frame.columnconfigure(c, weight=0)
             except Exception:
                 pass
             # Put all on row 0
-            for widget, col in [
-                (self.proj_label, 11), (self.proj_menu_widget, 12),
-                (self.bins_label, 13), (self.bins_entry, 14), (self.cmap_label, 15), (self.cmap_menu_widget, 16),
-                (self.scc_label, 17), (self.scc_entry, 18)
-            ]:
+            # Note: NCF widgets (7-10), Scale (11-12), PlotBy (13-14) are typically roughly static or managed by init
+            # We explicitly place the ones that move between rows 0 and 1
+            widgets_map = [
+                (self.ncf_layer_label, 7), (self.ncf_layer_menu, 8),
+                (self.ncf_tstep_label, 9), (self.ncf_tstep_menu, 10),
+                (self.scale_label, 11), (self.scale_menu_widget, 12),
+                (self.plotby_label, 13), (self.plotby_menu_widget, 14),
+                (self.proj_label, 15), (self.proj_menu_widget, 16),
+                (self.bins_label, 17), (self.bins_entry, 18), 
+                (self.cmap_label, 19), (self.cmap_menu_widget, 20),
+                (self.scc_label, 21), (self.scc_entry, 22)
+            ]
+            for widget, col in widgets_map:
                 try:
-                    widget.grid_configure(row=0, column=col)
+                    sticky_val = 'we' if widget in (self.bins_entry, self.scc_entry) else 'w'
+                    if widget in (self.proj_label, self.bins_label, self.cmap_label, self.scc_label, self.scale_label, self.plotby_label, self.ncf_layer_label, self.ncf_tstep_label):
+                         sticky_val = 'e'
+                    widget.grid_configure(row=0, column=col, sticky=sticky_val)
                 except Exception:
                     pass
         else:  # compact
             try:
                 # Make bins entry and scc entry stretch on compact row
                 self._btn_frame.columnconfigure(3, weight=1)
-                self._btn_frame.columnconfigure(7, weight=1)
                 # Reset weights for columns used in wide mode
-                for c in (14, 18):
+                for c in (18, 22):
                     self._btn_frame.columnconfigure(c, weight=0)
             except Exception:
                 pass
-            # Move Bins/Colormap/SCC to row 1
-            mapping = [
-                (self.proj_label, 0), (self.proj_menu_widget, 1),
-                (self.bins_label, 2), (self.bins_entry, 3),
-                (self.cmap_label, 4), (self.cmap_menu_widget, 5),
-                (self.scc_label, 6), (self.scc_entry, 7),
+            # Move Bins/Colormap/SCC/Proj to row 1
+            # Leave Scale and PlotBy on Row 0? 
+            # Row 0: Plot, Preview, Delim, Custom, Zoom, FillZero, Scale, PlotBy
+            # Cols: 0, 1, 2-3, 4, 5, 6, 7-8, 9-10 (shifted indices)
+            
+            # Reposition items that stay on Row 0 but need shifting in compact mode?
+            # Actually, standardizing: keep NCF on row 1 in compact mode for space?
+            
+            mapping_row1 = [
+                (self.ncf_layer_label, 0), (self.ncf_layer_menu, 1), 
+                (self.ncf_tstep_label, 2), (self.ncf_tstep_menu, 3),
+                (self.proj_label, 4), (self.proj_menu_widget, 5),
+                (self.bins_label, 6), (self.bins_entry, 7),
+                (self.cmap_label, 8), (self.cmap_menu_widget, 9),
+                (self.scc_label, 10), (self.scc_entry, 11),
             ]
-            for widget, col in mapping:
+            for widget, col in mapping_row1:
                 try:
                     # Allow both entry widgets to stretch horizontally
                     sticky_val = 'we' if widget in (self.bins_entry, self.scc_entry) else 'w'
+                    if widget in (self.proj_label, self.bins_label, self.cmap_label, self.scc_label, self.ncf_layer_label, self.ncf_tstep_label):
+                        sticky_val = 'e'
                     widget.grid_configure(row=1, column=col, sticky=sticky_val)
                 except Exception:
                     pass
+                    
+            # Ensure Scale/PlotBy are on Row 0
+            # Scale (11,12 in wide), PlotBy (13,14 in wide) -> might be 7,8 and 9,10 in compact row 0?
+            # Let's just put them after FillZero (col 6)
+            row0_extra = [
+                (self.scale_label, 7), (self.scale_menu_widget, 8),
+                (self.plotby_label, 9), (self.plotby_menu_widget, 10)
+            ]
+            for widget, col in row0_extra:
+                try:
+                     widget.grid_configure(row=0, column=col, sticky='w' if 'label' not in str(widget) else 'e')
+                except Exception:
+                     pass
 
     def _on_resize(self, event=None):
         try:
@@ -938,7 +1021,7 @@ class EmissionGUI:
             init_dir = None
         if init_dir is None:
             init_dir = DEFAULT_INPUTS_INITIALDIR if os.path.isdir(DEFAULT_INPUTS_INITIALDIR) else None
-        paths = filedialog.askopenfilenames(initialdir=init_dir, filetypes=[("CSV/List", "*.csv *.txt *.lst"), ("All", "*.*")])
+        paths = filedialog.askopenfilenames(initialdir=init_dir, filetypes=[("CSV/List/NetCDF", "*.csv *.txt *.lst *.ncf *.nc"), ("All", "*.*")])
         if not paths:
             return
         
@@ -947,7 +1030,7 @@ class EmissionGUI:
         self.emis_entry.delete(0, tk.END)
         self.emis_entry.insert(0, joined_path)
         self.inputfile_path = joined_path
-        self.load_inputfile(show_preview=True)
+        self.load_inputfile(show_preview=False)
 
     def browse_griddesc(self):
         path = filedialog.askopenfilename(filetypes=[("All files", "*.*")])
@@ -1032,7 +1115,7 @@ class EmissionGUI:
         if self.inputfile_path:
             current_state = self._current_delimiter_state()
             if current_state != self._last_loaded_delim_state:
-                self.load_inputfile(show_preview=True)
+                self.load_inputfile(show_preview=False)
 
     def _parse_bins(self) -> List[float]:
         """Parse custom bins from the GUI field (comma or space separated)."""
@@ -1148,6 +1231,14 @@ class EmissionGUI:
             self.preview_data()
 
     def load_inputfile(self, show_preview: bool = True):
+        # Sync path from entry widget if changed manually
+        try:
+            val = self.emis_entry.get().strip()
+            if val:
+                self.inputfile_path = val
+        except Exception:
+            pass
+
         try:
             self._loader_messages.clear()
         except Exception:
@@ -1163,15 +1254,41 @@ class EmissionGUI:
             effective_delim = None
             current_delim_state = None
 
+        # Capture NCF dropdown state to preserve selection across reload
+        ncf_preserve = {}
+        try:
+            if hasattr(self, 'ncf_layer_var'):
+                ncf_preserve['layer'] = self.ncf_layer_var.get()
+            if hasattr(self, 'ncf_tstep_var'):
+                ncf_preserve['tstep'] = self.ncf_tstep_var.get()
+        except Exception:
+            pass
+
         self._set_status("Loading data...", level="INFO")
         
         threading.Thread(
             target=self._load_inputfile_worker, 
-            args=(show_preview, effective_delim, current_delim_state), 
+            args=(show_preview, effective_delim, current_delim_state, ncf_preserve), 
             daemon=True
         ).start()
 
-    def _load_inputfile_worker(self, show_preview, effective_delim, current_delim_state):
+    def _load_inputfile_worker(self, show_preview, effective_delim, current_delim_state, ncf_preserve):
+        # Always reset NCF widgets to disabled initially; NCF logic will re-enable if applicable
+        def _reset_ncf_ui():
+            try:
+                # Only clear if we didn't preserve a seemingly valid value?
+                # Actually, clearing 'values' is fine, but we should restore '.set()' if NCF is re-detected.
+                # However, usually we want to clear everything in case it's NOT an NCF file.
+                self.ncf_layer_menu.set('')
+                self.ncf_tstep_menu.set('')
+                self.ncf_layer_menu['values'] = []
+                self.ncf_tstep_menu['values'] = []
+                self.ncf_layer_menu.state(['disabled'])
+                self.ncf_tstep_menu.state(['disabled'])
+            except Exception:
+                pass
+        self.root.after(0, _reset_ncf_ui)
+
         try:
             if self.reimport_requested:
 
@@ -1281,6 +1398,134 @@ class EmissionGUI:
                         flter_val=self.filter_values,
                         notify=safe_notify,
                     )
+
+                    # NCF Auto-Grid Logic
+                    if isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc')):
+                         try:
+                            # Lazy import
+                            from ncf_processing import create_ncf_domain_gdf, read_ncf_grid_params, get_ncf_dims, read_ncf_emissions
+                            safe_notify('INFO', 'Detected NetCDF input. Auto-configuring grid geometry...')
+                            
+                            # Get dimensions and update UI
+                            dims_info = get_ncf_dims(f_input) # {'n_tsteps': X, 'n_layers': Y, ...}
+                            n_lay = dims_info.get('n_layers', 1)
+                            n_ts = dims_info.get('n_tsteps', 1)
+                            tflags = dims_info.get('tflag_values', [])
+                            
+                            def _update_ncf_ui():
+                                # Enable widgets (must clear disabled state first)
+                                self.ncf_layer_menu.state(['!disabled', 'readonly'])
+                                self.ncf_tstep_menu.state(['!disabled', 'readonly'])
+                                
+                                # Populate values
+                                lay_vals = ['Sum All Layers', 'Average All Layers'] + [f"Layer {i+1}" for i in range(n_lay)]
+                                self.ncf_layer_menu['values'] = lay_vals
+                                
+                                # Attempt to restore preserved selection or default to first
+                                target_lay = ncf_preserve.get('layer')
+                                if target_lay and target_lay in lay_vals:
+                                    self.ncf_layer_menu.set(target_lay)
+                                elif self.ncf_layer_var.get() not in lay_vals:
+                                     # Default to Layer 1 for backward compatibility/preference? Or Sum?
+                                     # Let's keep Layer 1 as default as it's often surface
+                                     if n_lay > 0:
+                                       self.ncf_layer_menu.set(lay_vals[2]) # 0 is Sum, 1 is Avg, 2 is Layer 1
+                                
+                                # Use TFLAG values if available
+                                if tflags and len(tflags) == n_ts:
+                                     ts_vals = ['Sum All Time', 'Average All Time'] + [f"{t}" for i, t in enumerate(tflags)]
+                                else:
+                                     ts_vals = ['Sum All Time', 'Average All Time'] + [f"{i+1}" for i in range(n_ts)]
+                                
+                                self.ncf_tstep_menu['values'] = ts_vals
+
+                                # Attempt to restore preserved selection or default
+                                target_ts = ncf_preserve.get('tstep')
+                                if target_ts and target_ts in ts_vals:
+                                    self.ncf_tstep_menu.set(target_ts)
+                                elif self.ncf_tstep_var.get() not in ts_vals:
+                                     self.ncf_tstep_menu.set(ts_vals[0])
+
+                            self.root.after(0, _update_ncf_ui)
+
+                            # Determine read params - use preserved values as they reflect user intent (which was cleared from var)
+                            curr_lay_str = ncf_preserve.get('layer') or ''
+                            curr_ts_str = ncf_preserve.get('tstep') or ''
+                            
+                            l_idx = 0
+                            l_op = 'select'
+                            if 'Sum All' in curr_lay_str:
+                                l_idx = None
+                                l_op = 'sum'
+                            elif 'Average' in curr_lay_str:
+                                l_idx = None
+                                l_op = 'mean'
+                            elif 'Layer' in curr_lay_str:
+                                 try: l_idx = int(curr_lay_str.split()[-1]) - 1
+                                 except: l_idx = 0
+                                 l_op = 'select'
+                            
+                            ts_idx = None
+                            ts_op = 'sum'
+                            if 'Sum All' in curr_ts_str:
+                                ts_idx = None
+                                ts_op = 'sum'
+                            elif 'Average' in curr_ts_str:
+                                ts_idx = None
+                                ts_op = 'mean'
+                            elif curr_ts_str:
+                                 try:
+                                     # Re-construct expected list to find index
+                                     # n_ts and tflags are available here
+                                     flag_list = []
+                                     if tflags and len(tflags) == n_ts:
+                                          flag_list = [f"{t}" for t in tflags]
+                                     else:
+                                          flag_list = [f"{i+1}" for i in range(n_ts)]
+                                     
+                                     if curr_ts_str in flag_list:
+                                          ts_idx = flag_list.index(curr_ts_str)
+                                          ts_op = 'select'
+                                     else:
+                                          # Fallback for old format "Time X ..."
+                                          if 'Time' in curr_ts_str:
+                                               token = curr_ts_str.replace('Time', '', 1).strip().split()[0]
+                                               ts_idx = int(token) - 1
+                                               ts_op = 'select'
+                                 except: 
+                                      ts_idx = None
+                                      ts_op = 'sum'
+                            
+                            # Re-read emissions with specific params
+                            # Note: read_inputfile called read_ncf_emissions default inside data_processing.
+                            # We need to re-call it here to apply params, updating emissions_df
+                            msg = f"Reading NetCDF (Layer: {curr_lay_str or 'Layer 1'}, Time: {curr_ts_str or 'Sum'})..."
+                            safe_notify('INFO', msg)
+                            emissions_df = read_ncf_emissions(f_input, layer_idx=l_idx, tstep_idx=ts_idx, layer_op=l_op, tstep_op=ts_op)
+                            # Update raw_df too for consistency
+                            raw_df = emissions_df
+                            
+                            # ... (existing grid logic) ...
+                            ncf_grid_gdf = create_ncf_domain_gdf(f_input, full_grid=True)
+                            if not ncf_grid_gdf.empty:
+                                def _set_ncf_grid(gdf):
+                                    self.grid_gdf = gdf
+                                    self.plot_by_var.set('grid')
+                                    # Update UI labels to reflect NCF source
+                                    if self.griddesc_entry:
+                                        self.griddesc_entry.delete(0, tk.END)
+                                        self.griddesc_entry.insert(0, "(NetCDF Attributes)")
+                                    # Extract GRID name for UI
+                                    _, gp = read_ncf_grid_params(f_input)
+                                    if self.grid_name_var:
+                                        self.grid_name_var.set(gp[0])
+                                    
+                                    self.status_var.set("Grid geometry loaded from NetCDF.")
+                                
+                                self.root.after(0, lambda: _set_ncf_grid(ncf_grid_gdf))
+                         except Exception as grid_err:
+                             safe_notify('WARNING', f"Failed to auto-configure grid from NetCDF: {grid_err}")
+
                 except Exception as e:
                     err_msg = str(e)
                     if "No valid FIPS code columns found" in err_msg:
@@ -1955,8 +2200,9 @@ class EmissionGUI:
 
     def plot(self):
         if self.emissions_df is None:
-            self._lazy_load_inputfile(show_preview=False)
-        if self.emissions_df is None:
+            if self.inputfile_path:
+                self.load_inputfile(show_preview=False)
+                return
             self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.')
             return
         pollutant = self.pollutant_var.get()
@@ -2436,20 +2682,489 @@ class EmissionGUI:
             pass
         # Title with source name if available
         try:
-            src = self.emissions_df.attrs.get('source_name') if self.emissions_df is not None else None
+            attrs = getattr(self.emissions_df, 'attrs', {})
+            src = attrs.get('source_name') if self.emissions_df is not None else None
+            var_meta = attrs.get('variable_metadata', {}).get(pollutant, {})
         except Exception:
             src = None
+            var_meta = {}
+
         # Build title and optional SCC subtitle
-        main_title = f"{pollutant} emissions from {src}" if src else f"{pollutant} emission"
+        long_name = var_meta.get('long_name')
+        units = var_meta.get('units')
+        
+        if long_name:
+            main_title = long_name
+            if units:
+                main_title += f" ({units})"
+                # Also update units map for colorbar if not set
+                if pollutant not in self.units_map:
+                     self.units_map[pollutant] = units
+        else:
+            main_title = f"{pollutant} emissions from {src}" if src else f"{pollutant} emission"
+        
         try:
             sel_disp = self.scc_select_var.get() if getattr(self, 'scc_select_var', None) else 'All SCC'
         except Exception:
             sel_disp = 'All SCC'
+
+        # Append NetCDF Layer/Time info
+        ncf_parts = []
+        try:
+            # Check if source is NetCDF
+            src_type = attrs.get('source_type')
+            is_ncf_source = (src_type == 'gridded_netcdf') or (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc')))
+            
+            if is_ncf_source:
+                 if hasattr(self, 'ncf_layer_var') and self.ncf_layer_var.get():
+                     ncf_parts.append(self.ncf_layer_var.get())
+                 if hasattr(self, 'ncf_tstep_var') and self.ncf_tstep_var.get():
+                     ts_val = self.ncf_tstep_var.get()
+                     if 'Sum' in ts_val:
+                          ncf_parts.append(ts_val)
+                     else:
+                          ncf_parts.append(f"Time: {ts_val}")
+        except Exception:
+            pass
+
+        title_lines = [main_title]
+        if ncf_parts:
+            title_lines.append(", ".join(ncf_parts))
         if sel_disp and sel_disp != 'All SCC':
-            # Append as subtitle on a new line
-            local_ax.set_title(f"{main_title}\nSCC: {sel_disp}")
-        else:
-            local_ax.set_title(main_title)
+            title_lines.append(f"SCC: {sel_disp}")
+
+        # Add Time Series buttons if NCF
+        is_ncf_source = False
+        ts_click_handler = None
+        try:
+             src_type = attrs.get('source_type')
+             is_ncf_source = (src_type == 'gridded_netcdf') or (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc')))
+        except Exception:
+             pass
+        
+        if is_ncf_source:
+             ts_frame = ttk.Frame(plot_container)
+             ts_frame.pack(side='top', fill='x', pady=(2, 0))
+             
+             def _on_ts(mode):
+                 try:
+                     from ncf_processing import get_ncf_timeseries
+                 except ImportError:
+                     self._notify('ERROR', 'Time Series', 'Could not import NetCDF processing module.')
+                     return
+                 
+                 # 1. Get current bounds
+                 xmin, xmax = local_ax.get_xlim()
+                 ymin, ymax = local_ax.get_ylim()
+                 
+                 # 2. Filter gdf
+                 try:
+                     # merged_plot is in plot CRS, limits are in plot CRS
+                     # Filter by intersection
+                     from shapely.geometry import box
+                     bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
+                     
+                     sidx = merged_plot.sindex
+                     cand_idxs = list(sidx.intersection(bbox.bounds))
+                     subset = merged_plot.iloc[cand_idxs]
+                     subset = subset[subset.intersects(bbox)]
+                     
+                     if subset.empty:
+                         self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
+                         return
+                     
+                     # 3. Get indices
+                     # We need ROW and COL columns. 
+                     # They are 1-based in DF.
+                     # Handle overlap suffix from merge (_x from geom, _y from emis)
+                     r_col = 'ROW'
+                     c_col = 'COL'
+                     if 'ROW' not in subset.columns:
+                          if 'ROW_x' in subset.columns: r_col = 'ROW_x'
+                          else: r_col = None
+                     if 'COL' not in subset.columns:
+                          if 'COL_x' in subset.columns: c_col = 'COL_x'
+                          else: c_col = None
+                          
+                     if not r_col or not c_col:
+                         if 'GRID_RC' in subset.columns:
+                             # Fallback: parse GRID_RC
+                             try:
+                                 # assuming R_C
+                                 subset['_TS_ROW'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[0]))
+                                 subset['_TS_COL'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[1]))
+                                 r_col = '_TS_ROW'
+                                 c_col = '_TS_COL'
+                             except:
+                                 self._notify('ERROR', 'Time Series', 'Grid ROW/COL could not be derived.')
+                                 return
+                         else:
+                             self._notify('ERROR', 'Time Series', 'Grid ROW/COL information missing from plot data.')
+                             return
+                     
+                     rows_0 = subset[r_col].astype(int) - 1
+                     cols_0 = subset[c_col].astype(int) - 1
+                     
+                     # Check bounds validity
+                     if (rows_0 < 0).any() or (cols_0 < 0).any():
+                          self._notify('ERROR', 'Time Series', 'Invalid grid indices found.')
+                          return
+                     
+                 except Exception as e:
+                     self._notify('ERROR', 'Time Series Prep', f"Failed to filter grid: {e}")
+                     return
+
+                 # 4. Get Layer info
+                 try:
+                     lay_setting = self.ncf_layer_var.get()
+                     l_idx = 0
+                     l_op = 'select'
+                     if 'Sum All' in lay_setting:
+                        l_idx = None
+                        l_op = 'sum'
+                     elif 'Average' in lay_setting:
+                        l_idx = None
+                        l_op = 'mean'
+                     elif 'Layer' in lay_setting:
+                         try: l_idx = int(lay_setting.split()[-1]) - 1
+                         except: l_idx = 0
+                         l_op = 'select'
+                 except: # fallback
+                     l_idx = 0
+                     l_op = 'select'
+                 
+                 # 5. Call backend
+                 self._set_status("Extracting time series...", level="INFO")
+                 try:
+                     result = get_ncf_timeseries(
+                         self.inputfile_path,
+                         pollutant,
+                         rows_0.tolist(),
+                         cols_0.tolist(),
+                         layer_idx=l_idx,
+                         layer_op=l_op,
+                         op=mode
+                     )
+                 except Exception as e:
+                     self._notify('ERROR', 'Extract Error', str(e))
+                     return
+                     
+                 if not result:
+                     self._notify('WARNING', 'Time Series', 'Extraction returned no data.')
+                     return
+                 
+                 # 6. Plot
+                 ts_view = tk.Toplevel(self.root)
+                 ts_title = f"{pollutant} Time Series ({mode.title()}) - {len(subset)} Cells"
+                 ts_view.title(ts_title)
+                 
+                 import matplotlib.pyplot as plt
+                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                 
+                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
+                 times = result['times']
+                 vals = result['values']
+                 units = result['units']
+                 
+                 # Parse time labels? YYYYDDD_HHMMSS
+                 # Maybe simplify X axis labels
+                 ax_ts.plot(vals, marker='o', markersize=4)
+                 ax_ts.set_ylabel(f"{pollutant} ({units})")
+                 ax_ts.set_xlabel("Time Step")
+                 ax_ts.grid(True, linestyle='--', alpha=0.7)
+                 
+                 if len(times) > 10:
+                      # Sparse ticks
+                      step = len(times) // 10
+                      ax_ts.set_xticks(range(0, len(times), step))
+                      ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
+                 else:
+                      ax_ts.set_xticks(range(len(times)))
+                      ax_ts.set_xticklabels(times, rotation=30, ha='right')
+                 
+                 fig_ts.tight_layout()
+                 
+                 cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
+                 cv.draw()
+                 cv.get_tk_widget().pack(side='top', fill='both', expand=True)
+                 
+                 tb = NavigationToolbar2Tk(cv, ts_view)
+                 tb.update()
+                 tb.pack(side='top', fill='x')
+                 
+                 self._set_status("Time series extracted.", level="INFO")
+             
+             def _on_animate():
+
+                 try:
+                     from ncf_processing import get_ncf_animation_data
+                 except ImportError: return
+
+                 # 1. Get subset (visible or all?)
+                 # For animation, let's just do visible to keep it fast
+                 xmin, xmax = local_ax.get_xlim()
+                 ymin, ymax = local_ax.get_ylim()
+                 from shapely.geometry import box
+                 bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
+                 
+                 sidx = merged_plot.sindex
+                 cand_idxs = list(sidx.intersection(bbox.bounds))
+                 subset = merged_plot.iloc[cand_idxs]
+                 subset = subset[subset.intersects(bbox)]
+                 
+                 if len(subset) == 0:
+                      self._notify('WARNING', 'Animation', 'No cells visible.')
+                      return
+                 
+                 # 2. Extract indices
+                 r_col = 'ROW'; c_col = 'COL'
+                 if 'ROW' not in subset.columns and 'ROW_x' in subset.columns: r_col = 'ROW_x'
+                 if 'COL' not in subset.columns and 'COL_x' in subset.columns: c_col = 'COL_x'
+                 
+                 # Fallback parsing
+                 sub_R = []; sub_C = []
+                 valid_subset = [] # indices in subset
+                 for i, row in subset.iterrows():
+                     r = row.get(r_col); c = row.get(c_col)
+                     if (pd.isna(r) or pd.isna(c)) and 'GRID_RC' in row:
+                         try:
+                             parts = str(row['GRID_RC']).split('_')
+                             r = int(parts[0]); c = int(parts[1])
+                         except: pass
+                     if pd.notna(r) and pd.notna(c):
+                         sub_R.append(int(r)-1)
+                         sub_C.append(int(c)-1)
+                         valid_subset.append(i) # Keep track of which geometry corresponds to which value
+                 
+                 if not sub_R: return
+
+                 # 3. Layer params
+                 l_idx = 0; l_op = 'select'
+                 try: 
+                     if hasattr(self, 'ncf_layer_var'):
+                         l_sel = self.ncf_layer_var.get()
+                         if "Sum" in l_sel: l_op = 'sum'
+                         elif "Avg" in l_sel: l_op = 'mean'
+                         else:
+                             parts = l_sel.split()
+                             if len(parts) > 1 and parts[-1].isdigit():
+                                 l_idx = int(parts[-1]) - 1
+                 except: pass
+
+                 self._set_status("Loading animation data...", level="INFO")
+                 
+                 # 4. Fetch Data
+                 data_pack = get_ncf_animation_data(
+                     self.inputfile_path, pollutant, sub_R, sub_C, l_idx, l_op
+                 )
+                 if not data_pack:
+                     self._notify('ERROR', 'Animation', 'Failed to load data.')
+                     return
+                 
+                 times = data_pack['times']
+                 values = data_pack['values'] # (T, N)
+                 
+                 # 5. Launch Animation Window
+                 ani_win = tk.Toplevel(self.root)
+                 ani_win.title(f"Animation: {pollutant}")
+                 
+                 import matplotlib.pyplot as plt
+                 from matplotlib.animation import FuncAnimation
+                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                 
+                 # Setup Figure
+                 fig_ani, ax_ani = plt.subplots(figsize=(6, 5))
+                 
+                 # Plot the geometry. We need a flexible collection.
+                 # using subset.plot is easy but static. 
+                 # We need to map `values` to the geometry. 
+                 # The `subset` variable contains geometries in the order we iterated? 
+                 # No, iterrows is slow but preserved order? 
+                 # `valid_subset` holds indices. 
+                 # `subset` is a GeoDataFrame. 
+                 # Let's re-create a GDF that matches the order of `sub_R` exactly.
+                 # The `values` array is (Time, N) where N matches `sub_R`.
+                 
+                 working_gdf = subset.loc[valid_subset].copy() # Ensure alignment
+                 
+                 # Initial plot (Timestep 0)
+                 working_gdf['__value'] = values[0, :]
+                 
+                 vmin = np.nanmin(values)
+                 vmax = np.nanmax(values)
+                 
+                 plot_collection = working_gdf.plot(
+                     column='__value', 
+                     ax=ax_ani, 
+                     cmap=cmap_name, 
+                     vmin=vmin, 
+                     vmax=vmax,
+                     legend=True,
+                     legend_kwds={'label': f"{pollutant} ({data_pack['units']})"}
+                 )
+                 
+                 # Clean up axis
+                 ax_ani.set_axis_off()
+                 title_text = ax_ani.text(0.5, 1.05, "", transform=ax_ani.transAxes, ha="center")
+                 
+                 # Handle collection
+                 # Geopandas plot returns an Axes or list of Axes... wait.
+                 # Actually it returns the Axes. The collection is inside ax_ani.collections[0] usually.
+                 collection = ax_ani.collections[0]
+                 
+                 def update(frame):
+                     # Update scalar mappable
+                     new_vals = values[frame, :]
+                     collection.set_array(new_vals)
+                     title_text.set_text(f"Time: {times[frame]} ({frame+1}/{len(times)})")
+                     return collection, title_text
+                 
+                 ani = FuncAnimation(fig_ani, update, frames=len(times), interval=200, blit=False)
+                 
+                 canvas_ani = FigureCanvasTkAgg(fig_ani, master=ani_win)
+                 canvas_ani.draw()
+                 canvas_ani.get_tk_widget().pack(side='top', fill='both', expand=True)
+                 
+                 # Control Bar
+                 ctrl_frame = ttk.Frame(ani_win)
+                 ctrl_frame.pack(side='bottom', fill='x')
+                 
+                 is_paused = [False]
+                 
+                 def toggle():
+                     if is_paused[0]:
+                         ani.event_source.start()
+                         btn_pause.config(text="Pause")
+                         is_paused[0] = False
+                     else:
+                         ani.event_source.stop()
+                         btn_pause.config(text="Play")
+                         is_paused[0] = True
+                 
+                 btn_pause = ttk.Button(ctrl_frame, text="Pause", command=toggle)
+                 btn_pause.pack(side='left')
+                 
+                 self._set_status("Animation started.", level="INFO")
+                 # Keep ref
+                 ani_win._ani = ani
+
+             ttk.Button(ts_frame, text="Time_Series_Total", command=lambda: _on_ts('sum')).pack(side='left', padx=4)
+             ttk.Button(ts_frame, text="Time_Series_Averaged", command=lambda: _on_ts('mean')).pack(side='left', padx=4)
+             ttk.Button(ts_frame, text="Animate View", command=_on_animate).pack(side='left', padx=4)
+
+             def _display_ts_window(result, title_msg):
+                 ts_view = tk.Toplevel(self.root)
+                 ts_view.title(title_msg)
+                 import matplotlib.pyplot as plt
+                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                 
+                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
+                 times = result['times']
+                 vals = result['values']
+                 units = result['units']
+                 
+                 ax_ts.plot(vals, marker='o', markersize=4)
+                 ax_ts.set_ylabel(f"{pollutant} ({units})")
+                 ax_ts.set_xlabel("Time Step")
+                 ax_ts.grid(True, linestyle='--', alpha=0.7)
+                 
+                 if len(times) > 10:
+                      step = max(1, len(times) // 10)
+                      ax_ts.set_xticks(range(0, len(times), step))
+                      ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
+                 else:
+                      ax_ts.set_xticks(range(len(times)))
+                      ax_ts.set_xticklabels(times, rotation=30, ha='right')
+                 
+                 fig_ts.tight_layout()
+                 
+                 cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
+                 cv.draw()
+                 cv.get_tk_widget().pack(side='top', fill='both', expand=True)
+                 
+                 tb = NavigationToolbar2Tk(cv, ts_view)
+                 tb.update()
+                 tb.pack(side='top', fill='x')
+
+             def _on_click(event):
+                 # Click-to-plot logic
+                 if event.inaxes != local_ax: return
+                 if getattr(toolbar, 'mode', '') != '': return
+                 if event.button != 1: return
+                 
+                 try:
+                     from shapely.geometry import Point
+                     x, y = event.xdata, event.ydata
+                     pt = Point(x, y)
+                     
+                     target = None
+                     # Optimization: use sindex
+                     if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
+                         cands = list(merged_plot.sindex.intersection((x, y, x, y)))
+                         for idx in cands:
+                             row = merged_plot.iloc[idx]
+                             if row.geometry.contains(pt):
+                                 target = row
+                                 break
+                     else:
+                         matches = merged_plot[merged_plot.intersects(pt)]
+                         if not matches.empty:
+                             target = matches.iloc[0]
+                         
+                     if target is None: return
+
+                     # Extract R/C
+                     r = None; c = None
+                     if 'ROW' in target: r = target['ROW']
+                     elif 'ROW_x' in target: r = target['ROW_x']
+                     
+                     if 'COL' in target: c = target['COL']
+                     elif 'COL_x' in target: c = target['COL_x']
+                     
+                     if (r is None or c is None) and 'GRID_RC' in target:
+                          try:
+                              parts = str(target['GRID_RC']).split('_')
+                              r = int(parts[0])
+                              c = int(parts[1])
+                          except: pass
+                          
+                     if r is None or c is None: return
+
+                     l_idx = 0; l_op = 'select'
+                     try: 
+                         if hasattr(self, 'ncf_layer_var'):
+                             l_sel = self.ncf_layer_var.get()
+                             if "Sum" in l_sel: l_op = 'sum'
+                             elif "Avg" in l_sel: l_op = 'mean'
+                             else:
+                                 parts = l_sel.split()
+                                 if len(parts) > 1 and parts[-1].isdigit():
+                                     l_idx = int(parts[-1]) - 1
+                     except: pass
+                     
+                     from ncf_processing import get_ncf_timeseries
+                     self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
+                     
+                     res = get_ncf_timeseries(
+                         self.inputfile_path,
+                         pollutant,
+                         [int(r)-1],
+                         [int(c)-1],
+                         layer_idx=l_idx,
+                         layer_op=l_op,
+                         op='mean'
+                     )
+                     
+                     if res:
+                         _display_ts_window(res, f"{pollutant} Time Series Cell ({r}, {c})")
+                         self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
+                     
+                 except Exception as e:
+                     print(f"Click handler failed: {e}")
+             
+             ts_click_handler = _on_click
+
+        local_ax.set_title("\n".join(title_lines))
         # Install hover/status text formatter with emission values and WGS84 lon/lat
         try:
             self._setup_hover(merged_plot, pollutant, ax=local_ax, lonlat_transformer=tf_inv)
@@ -2526,6 +3241,8 @@ class EmissionGUI:
                 local_fig.canvas.draw_idle()
                 zoom_press['state'] = None
                 if abs(xmax - xmin) < 1e-12 or abs(ymax - ymin) < 1e-12:
+                    if ts_click_handler:
+                         ts_click_handler(event)
                     return
                 try:
                     toolbar.push_current()  # type: ignore[attr-defined]
@@ -2866,8 +3583,9 @@ class EmissionGUI:
 
     def preview_data(self):
         if self.emissions_df is None:
-            self._lazy_load_inputfile(show_preview=False)
-        if self.emissions_df is None:
+            if self.inputfile_path:
+                self.load_inputfile(show_preview=True)
+                return
             self._notify('INFO', 'No Data', 'Load a SMOKE report / FF10 input file first to preview.')
             return
         # Select the raw parsed dataset (pre-filter, pre-aggregation) if available

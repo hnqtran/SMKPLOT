@@ -174,9 +174,18 @@ def _coerce_merge_key(series: pd.Series, pad: Optional[int] = None) -> pd.Series
                 pass
         return s
 
-    # Fast path: already string-like
+    # Fast path: already string-like or simple
+    # If no padding and already object/string, check if we need to do anything
+    if pad_len == 0 and pd.api.types.is_string_dtype(series):
+         return series
+
     if pd.api.types.is_string_dtype(series) or series.dtype == 'object':
         try:
+            # If large series, check duplication? 
+            # Optim: if no padding required, simple astr
+            if pad_len == 0:
+                 return series.astype(str)
+            
             sample = series.dropna().head(32)
             if sample.empty or sample.map(lambda v: isinstance(v, str)).all():
                 coerced = series.astype('string').str.strip()
@@ -301,7 +310,8 @@ def merge_emissions_with_geometry(
         except Exception:
             needs_update = True
         if needs_update:
-            emis_prepped = emis_prepped.copy()
+            if emis_prepped is emis_df:
+                emis_prepped = emis_prepped.copy()
             try:
                 emis_prepped[merge_on] = coerced
             except Exception:
@@ -322,11 +332,12 @@ def merge_emissions_with_geometry(
             needs_geom_update = not geom_series.equals(coerced_geom)
         except Exception:
             needs_geom_update = True
-        if copy_geometry or needs_geom_update:
-            try:
-                geom_prepped = base_geom.copy()
-            except Exception:
-                geom_prepped = base_geom
+        if copy_geometry:
+             geom_prepped = base_geom.copy()
+        elif needs_geom_update:
+             if geom_prepped is base_geom:
+                 geom_prepped = base_geom.copy()
+        
         if needs_geom_update:
             try:
                 geom_prepped[merge_on] = coerced_geom
@@ -631,6 +642,35 @@ def read_inputfile(
       * If 1st line has #LIST, treat as list file of multiple FF10 files
       * else, treat as smkreport and call read_smkreport().
     """
+    # NetCDF Support
+    if isinstance(fpath, str) and (fpath.lower().endswith('.ncf') or fpath.lower().endswith('.nc')):
+        try:
+             # Lazy import to avoid circular dependency
+            from ncf_processing import read_ncf_emissions
+            _emit_user_message(notify, 'INFO', "Detected NetCDF extension. Reading as IOAPI NetCDF...")
+            # Detect implicit pollutants? read_ncf_emissions handles that.
+            # We don't support filtering inside read_ncf yet, but we can filter after.
+            result_df = read_ncf_emissions(fpath)
+            
+            # Apply sector/source_type metadata if possible
+            if sector:
+                result_df.attrs['source_name'] = sector
+            result_df.attrs['source_type'] = 'gridded_netcdf'
+            
+            # Filtering if requested (post-read)
+            filtered_df = result_df
+            if flter_col or flter_start or flter_end or flter_val:
+                 # Note: flter_col might be 'POLL' which is tricky in wide format.
+                 # Actually read_ncf returns wide format (ROW, COL, P1, P2...).
+                 # Usually filtering applies to rows.
+                 pass
+
+            # For NCF, we treat the result as both processed and raw
+            return _normalize_input_result((result_df, result_df))
+        except Exception as e:
+            _emit_user_message(notify, 'ERROR', f"Failed reading NetCDF {fpath}: {e}")
+            raise e
+
     if isinstance(fpath, (list, tuple)):
         # Recursively read each file and concatenate
         dfs = []
