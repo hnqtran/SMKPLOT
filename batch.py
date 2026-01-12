@@ -264,11 +264,10 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     
     if args.zoom_to_data:
         try:
-            valid = merged_plot[merged_plot[pol].notna() & (merged_plot[pol].abs() > 0)]
-            if valid.empty:
-                fallback = merged_plot[merged_plot[pol].notna()]
-                if not fallback.empty:
-                    valid = fallback
+            # Modified to include zero values in zoom extent (per user request)
+            # previously: valid = merged_plot[merged_plot[pol].notna() & (merged_plot[pol].abs() > 0)]
+            valid = merged_plot[merged_plot[pol].notna()]
+            
             if not valid.empty:
                 minx, miny, maxx, maxy = valid.total_bounds
                 pad = max(0.0, min(0.25, args.zoom_pad))
@@ -475,7 +474,7 @@ def _batch_mode(args):
                 # Zoom-to-data demonstration
                 if args.zoom_to_data:
                     try:
-                        valid = merged[merged[pol].fillna(0) != 0]
+                        valid = merged[merged[pol].notna()]
                         if not valid.empty:
                             minx, miny, maxx, maxy = valid.total_bounds
                             dx = (maxx - minx) * 0.05 if maxx > minx else 0.1

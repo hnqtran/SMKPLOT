@@ -2223,7 +2223,8 @@ class EmissionGUI:
                     values_num = None
             if values_num is not None:
                 try:
-                    valid_mask = values_num.notna() & (values_num != 0)
+                    # Modified to include zero values in zoom extent
+                    valid_mask = values_num.notna()
                     if '__has_emissions' in merged_plot.columns:
                         try:
                             has_mask = merged_plot['__has_emissions'].fillna(False)
