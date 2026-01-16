@@ -1,10 +1,174 @@
 """Plotting utilities for SMKPLOT GUI."""
 
+import logging
+import copy
 import numpy as np
+import pandas as pd
+import geopandas as gpd
 import pyproj
+import matplotlib.pyplot as plt
+import matplotlib.cm as mplcm
+from matplotlib.colors import BoundaryNorm, LogNorm
+from matplotlib.figure import Figure
+from typing import Optional, List, Dict, Any, Tuple
 
 from config import USE_SPHERICAL_EARTH
 
+
+def create_map_plot(
+    gdf: gpd.GeoDataFrame,
+    column: str,
+    title: str,
+    ax: plt.Axes,
+    cmap_name: str = 'jet',
+    bins: Optional[List[float]] = None,
+    log_scale: bool = False,
+    unit_label: Optional[str] = None,
+    overlay_counties: Optional[gpd.GeoDataFrame] = None,
+    overlay_shape: Optional[gpd.GeoDataFrame] = None,
+    crs_proj=None,
+    zoom_to_data: bool = True,
+    zoom_pad: float = 0.05,
+):
+    """
+    Shared logic to render an emissions map plot on a given Axes.
+    Returns the collection (artist) representing the main data plot.
+    """
+    
+    # 1. Colormap Resolution ---------------------------------------------------
+    try:
+        if hasattr(plt, 'colormaps'):
+            cmap = plt.colormaps.get_cmap(cmap_name)
+        else:
+             # Fallback for older matplotlib
+             cmap = mplcm.get_cmap(cmap_name)
+    except Exception:
+        try:
+            cmap = plt.get_cmap('jet')
+        except:
+            cmap = mplcm.get_cmap('jet')
+    
+    # Auto-contrast settings based on 'dark' colormaps
+    _cmap_lower = str(cmap_name).lower()
+    _dark_cmaps = {'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'}
+    if _cmap_lower in _dark_cmaps:
+         county_color = '#aaaaaa' 
+         overlay_color = 'cyan'
+         county_lw = 0.3
+         overlay_lw = 0.8
+    else:
+         county_color = '#555555'
+         overlay_color = 'black'
+         county_lw = 0.3
+         overlay_lw = 0.8
+
+    # 2. Plotting Arguments (Norm/Bins) ----------------------------------------
+    plot_kwargs = dict(
+        column=column,
+        ax=ax,
+        legend=True,  # Default legend (can be customized later)
+        cmap=cmap,
+        linewidth=0.05,
+        edgecolor='black',
+        missing_kwds={'color': '#f0f0f0', 'edgecolor': 'none', 'label': 'No Data'},
+    )
+    
+    data = gdf[column]
+    
+    if bins and len(bins) >= 2:
+        try:
+            # Update cmap to support transparency for values below first bin
+            cmap = copy.copy(cmap)
+            cmap.set_under('none')
+            try:
+                cmap.set_over(cmap(cmap.N - 1))
+            except Exception:
+                pass
+                
+            plot_kwargs['cmap'] = cmap
+            plot_kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
+        except Exception:
+            pass
+    else:
+        use_log = log_scale and (data > 0).any()
+        if use_log:
+            positive = data[data > 0]
+            if not positive.empty:
+                plot_kwargs['norm'] = LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
+    
+    # 3. Main Plot -------------------------------------------------------------
+    try:
+        # returns axes usually, but if cbar is off... geopandas returns Axes
+        # Use plot directly
+        gdf.plot(**plot_kwargs)
+    except Exception as e:
+        logging.warning(f"Plotting failed: {e}")
+        return
+
+    ax.set_title(title, fontsize=10)
+    ax.axis('off')
+
+    # 4. Colorbar Labeling -----------------------------------------------------
+    if unit_label:
+        # Find the colorbar axes attached to this axes
+        cb_ax = None
+        if ax.figure:
+             for cand in ax.figure.axes:
+                 if cand is not ax and cand.get_label() == '<colorbar>': # Heuristic
+                     cb_ax = cand
+                     break
+             # Fallback heuristic: check position
+             if not cb_ax:
+                 for cand in ax.figure.axes:
+                     if cand is not ax:
+                         cb_ax = cand
+                         break
+                         
+        if cb_ax:
+            try:
+                bbox = cb_ax.get_position()
+                orient_vertical = (bbox.height >= bbox.width)
+                if orient_vertical:
+                    cb_ax.set_ylabel(unit_label)
+                else:
+                    cb_ax.set_xlabel(unit_label)
+            except Exception:
+                pass
+
+    # 5. Overlays (Counties / Shapes) ------------------------------------------
+    if overlay_counties is not None:
+        try:
+            if crs_proj is not None and getattr(overlay_counties, 'crs', None) is not None:
+                trunc_overlay = overlay_counties.to_crs(crs_proj)
+            else:
+                trunc_overlay = overlay_counties
+            trunc_overlay.boundary.plot(ax=ax, color=county_color, linewidth=county_lw, alpha=0.7)
+        except Exception:
+            logging.exception("Failed to overlay county shapefile")
+            
+    if overlay_shape is not None:
+        try:
+             if crs_proj is not None and getattr(overlay_shape, 'crs', None) is not None:
+                 shape_overlay = overlay_shape.to_crs(crs_proj)
+             else:
+                 shape_overlay = overlay_shape
+             shape_overlay.boundary.plot(ax=ax, color=overlay_color, linewidth=overlay_lw, alpha=0.9, linestyle='--')
+        except Exception:
+             logging.exception("Failed to overlay auxiliary shapefile")
+
+    # 6. Zoom ------------------------------------------------------------------
+    if zoom_to_data:
+        try:
+            valid = gdf[gdf[column].notna()]
+            if not valid.empty:
+                minx, miny, maxx, maxy = valid.total_bounds
+                pad = max(0.0, min(0.25, zoom_pad))
+                dx = (maxx - minx) * pad if maxx > minx else 0.1
+                dy = (maxy - miny) * pad if maxy > miny else 0.1
+                ax.set_xlim(minx - dx, maxx + dx)
+                ax.set_ylim(miny - dy, maxy + dy)
+        except Exception:
+             pass
 
 def _default_conus_lcc_crs():
     """Return a default CONUS Lambert Conformal Conic CRS and transformers.
@@ -42,13 +206,6 @@ def _lcc_from_griddesc(griddesc_path, grid_name):
         return crs_lcc, tf_fwd, tf_inv
     except Exception:
         return None
-
-def _current_lcc_crs(griddesc_path, grid_name):
-    """Legacy helper: fallback to CONUS LCC when GRIDDESC data is absent.
-
-    Retained for backward compatibility; callers should use _plot_crs.
-    """
-    return _lcc_from_griddesc(griddesc_path, grid_name) or _default_conus_lcc_crs()
 
 def _plot_crs(griddesc_path, grid_name):
     """Return (crs, forward_transformer, inverse_transformer) for plotting.

@@ -83,3 +83,36 @@ else:
     tk = None  # type: ignore
     ttk = None  # type: ignore
     filedialog = None  # type: ignore
+
+def _config_file() -> str:
+    """Return the path to the configuration file."""
+    cfg_dir = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('./'), '.config')
+    try:
+        os.makedirs(cfg_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(cfg_dir, 'smkgui_settings.json')
+
+def load_settings() -> dict:
+    """Load the entire settings dictionary from the JSON config file."""
+    import json
+    try:
+        cfg = _config_file()
+        if not os.path.exists(cfg):
+            return {}
+        with open(cfg, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_settings(settings: dict) -> None:
+    """Collect and save current GUI settings to the JSON config file."""
+    import json
+    try:
+        cfg = _config_file()
+        with open(cfg, 'w') as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        # best-effort; ignore failures
+        pass

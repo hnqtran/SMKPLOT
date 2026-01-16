@@ -60,21 +60,19 @@ def parse_args():
                 "  python3 smkplot.py --no-gui \\\n"
                 "                   --filepath report.csv --county-shapefile counties.zip \\\n"
                 "                   --pollutant NOX,VOC,PM2_5 --outdir maps\n\n"
-                "  # 4) Batch: all pollutants\n"
-                "  python3 smkplot.py --no-gui --filepath report.csv --county-shapefile counties.zip --batch-all --outdir maps\n\n"
-                "  # 5) Batch: grid plotting\n"
+
+                "  # 4) Batch: grid plotting\n"
                 "  python3 smkplot.py --no-gui --pltyp grid --griddesc GRIDDESC --gridname 12US1_36-12-4 \\\n"
                     "                   --filepath report.csv --pollutant CO --outdir maps\n\n"
-                    "  # 6) Reimport using a saved JSON snapshot\n"
-                    "  python3 smkplot.py --no-gui --json outputs/example_sector.json --reimport --outdir maps\n\n"
             "Notes\n"
             "- Delimiter tokens accepted by --delim: comma | semicolon | tab | pipe | space | \\\"\\t\\\"\n"
             "- GUI grid mode (ROW/COL) requires providing a GRIDDESC in the GUI.\n"
-            "- Batch grid mode requires --pltyp grid, --griddesc, and --gridname.\n"
+            "- Batch grid mode (for CSV/text) requires --pltyp grid, --griddesc, and --gridname.\n"
+            "- NetCDF inputs (including Inline Point Sources) derive grid parameters from headers; --griddesc is ignored.\n"
             "- If Tk is unavailable, install python3-tk or use --no-gui.\n"
         ),
     )
-    ap.add_argument('--filepath', help='Path to smkreport or ff10 input file; emissions list file allowed')
+    ap.add_argument('-f', '--filepath', help='Path to smkreport or ff10 input file; emissions list file allowed')
     ap.add_argument('--sector', default=None, help='Name of source sector; e.g., rwc, ptfire-rx, ptfire-wild, etc.')
     ap.add_argument('--filter-col', default=None, help='Name of column to filter on; e.g., release_id,scc, region_cd, etc.')
     ap.add_argument('--filter-start', default=None, help='Start value (inclusive) for filtering column.')
@@ -85,7 +83,9 @@ def parse_args():
     ap.add_argument('--comment', help='Comment character to ignore lines (e.g., #).')
     ap.add_argument('--encoding', help='File encoding (e.g., latin1, utf-8).')
     ap.add_argument('--county-shapefile', help='Path/URL to counties shapefile (.shp, .gpkg or .zip) for county plots.')
-    ap.add_argument('--overlay-shapefile', help='Path/URL to auxiliary shapefile for overlaid on plots.')
+    ap.add_argument('--overlay-shapefile', action='append', help='Path/URL to auxiliary shapefile for overlaid on plots. Can be specified multiple times.')
+    ap.add_argument('--filtered-by-overlay', nargs='?', const='intersect', help='Clip/filter data using overlay shapefile. Values: "intersect" (default if flag present), "clipped", "within".')
+    ap.add_argument('--stack-groups', help='Path to STACK_GROUPS file (for Inline Point Source processing).')
     ap.add_argument('--griddesc', help='Path to GRIDDESC file (for batch grid plotting).')
     ap.add_argument('--gridname', help='Name of the grid in GRIDDESC (for batch grid plotting).')
     ap.add_argument('--pltyp', choices=['county', 'grid'], default='county', help='Plot by county or grid (batch mode). Default: county.')
@@ -94,76 +94,93 @@ def parse_args():
     ap.add_argument('--pollutant', help='Pollutant(s) to plot (batch mode or to preselect in GUI). Separate multiple values with comma or space.')
     ap.add_argument('--zoom-to-data', action='store_true', help='In batch mode, limit map extent to data (non-zero pollutant cells) with small padding.')
     ap.add_argument('--zoom-pad', type=float, default=0.02, help='Padding fraction to apply around data extent when using --zoom-to-data (default 0.02 = 2%%).')
-    # Custom bins for colorbar ticks (batch mode)
-    ap.add_argument('--bins', help='Custom colorbar ticks (comma or space separated). Plots remain continuous (linear/log).')
+    ap.add_argument('--bins', help='Custom colorbar ticks (comma or space separated). Plots remain continuous (linear/log).') # Custom bins for colorbar ticks (batch mode)
     ap.add_argument('--cmap', default='viridis', help='Matplotlib colormap name (e.g., viridis, plasma, turbo, Reds).')
-    ap.add_argument('--batch-all', action='store_true', help='In headless mode, output maps for all pollutants.')
     ap.add_argument('--workers', type=int, default=0, help='Number of parallel workers for batch plotting (0=auto).')
     ap.add_argument('--outdir', default='outputs', help='Output directory for batch mode (default to outputs).')
     ap.add_argument('--log-scale', action='store_true', help='Use log scale for color mapping in batch mode.')
     ap.add_argument('--self-test', action='store_true', help='Run a quick self-test: generate synthetic data and produce sample outputs to --outdir.')
-    ap.add_argument('--no-gui', action='store_true', help='Force batch (non-GUI) mode even if display exists.')
-    ap.add_argument('--force-gui', action='store_true', help='Attempt to force GUI even if backend/display heuristics disabled it.')
-    ap.add_argument('--legacy-gui', action='store_true', help='Bypass detection and try direct Tk root creation (debug).')
+    ap.add_argument('--run-mode', choices=['gui', 'batch'], help='Execution mode: "gui" to open interactive window, "batch" to run headless (default).')
     ap.add_argument('--log-file', help='Write logs (INFO..ERROR) to this file (appends). If directory given, a timestamped file is created.')
     ap.add_argument('--log-level', default='INFO', choices=['DEBUG','INFO','WARNING','ERROR','CRITICAL'], help='Logging level (default INFO).')
     ap.add_argument('--export-csv', action='store_true',  help='Export processed emissions data to CSV file(s).')
-    ap.add_argument('--json', help='Load arguments from a previously saved JSON settings snapshot (produced by prior batch runs).')
-    ap.add_argument('--yaml', help='Load arguments from a previously saved YAML settings snapshot.')
-    ap.add_argument('--reimport', '--import', dest='reimport', action='store_true', help='Reuse processed emissions already recorded in a JSON/YAML snapshot instead of re-reading the raw input file.')
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
+    ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
+    ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
 
     args = ap.parse_args()
 
+    # Intelligent handling: if filepath looks like a config file, redirect it
+    config_json = None
+    config_yaml = None
+
+    if args.filepath:
+        lower_path = args.filepath.lower()
+        if lower_path.endswith('.yaml') or lower_path.endswith('.yml'):
+            logging.info("Input filepath '%s' detected as YAML configuration. Switching mode.", args.filepath)
+            config_yaml = args.filepath
+            # Explicitly clear args.filepath so it can be populated from the config file
+            args.filepath = None
+        elif lower_path.endswith('.json'):
+            logging.info("Input filepath '%s' detected as JSON configuration. Switching mode.", args.filepath)
+            config_json = args.filepath
+            # Explicitly clear args.filepath so it can be populated from the config file
+            args.filepath = None
+
     payload = None
-    if args.json:
-        json_path = os.path.abspath(args.json)
+    if config_json:
+        json_path = os.path.abspath(config_json)
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 payload = json.load(f)
         except Exception as exc:
-            ap.error(f"Failed to read JSON settings from {args.json}: {exc}")
+            ap.error(f"Failed to read JSON settings from {config_json}: {exc}")
         if not isinstance(payload, dict):
-            ap.error(f"JSON settings file must contain an object at the top level: {args.json}")
+            ap.error(f"JSON settings file must contain an object at the top level: {config_json}")
         json_args = payload.get('arguments', payload)
         if not isinstance(json_args, dict):
-            ap.error(f"JSON settings file must provide an 'arguments' object: {args.json}")
+            ap.error(f"JSON settings file must provide an 'arguments' object: {config_json}")
         for key, value in json_args.items():
-            if key in {'json'} or not hasattr(args, key):
+            target_key = key
+            if not hasattr(args, target_key):
+                 target_key = key.replace('-', '_')
+            
+            if target_key in {'json'} or not hasattr(args, target_key):
                 continue
-            default = ap.get_default(key)
-            current = getattr(args, key)
+            default = ap.get_default(target_key)
+            current = getattr(args, target_key)
             if current == default:
-                setattr(args, key, value)
+                setattr(args, target_key, value)
         args.json = json_path
         args.config_path = json_path
-    elif args.yaml:
-        yaml_path = os.path.abspath(args.yaml)
+    elif config_yaml:
+        yaml_path = os.path.abspath(config_yaml)
         try:
             with open(yaml_path, 'r', encoding='utf-8') as f:
                 payload = yaml.safe_load(f)
         except Exception as exc:
-            ap.error(f"Failed to read YAML settings from {args.yaml}: {exc}")
+            ap.error(f"Failed to read YAML settings from {config_yaml}: {exc}")
         if not isinstance(payload, dict):
-            ap.error(f"YAML settings file must contain an object at the top level: {args.yaml}")
+            ap.error(f"YAML settings file must contain an object at the top level: {config_yaml}")
         json_args = payload.get('arguments', payload)
         if not isinstance(json_args, dict):
-            ap.error(f"YAML settings file must provide an 'arguments' object: {args.yaml}")
+            ap.error(f"YAML settings file must provide an 'arguments' object: {config_yaml}")
         for key, value in json_args.items():
-            if key in {'json', 'yaml'} or not hasattr(args, key):
+            target_key = key
+            if not hasattr(args, target_key):
+                 target_key = key.replace('-', '_')
+
+            if target_key in {'json', 'yaml'} or not hasattr(args, target_key):
                 continue
-            default = ap.get_default(key)
-            current = getattr(args, key)
+            default = ap.get_default(target_key)
+            current = getattr(args, target_key)
             if current == default:
-                setattr(args, key, value)
+                setattr(args, target_key, value)
         # Map to existing json fields for compatibility
         args.json = yaml_path
         args.config_path = yaml_path
 
     args.json_payload = payload
-
-    if args.reimport and not args.json:
-        ap.error("--reimport requires --json or --yaml to locate saved outputs.")
 
     # Normalize --filter-val argument into a distinct ordered list
     raw_filter_vals = []
@@ -254,42 +271,59 @@ def main():
         # Preserve default behavior after logging
         sys.__excepthook__(exc_type, exc, tb)
     sys.excepthook = _excepthook
-    # Determine reason for headless mode (if any)
+
+    # Determine execution mode from args
+    run_mode = getattr(args, 'run_mode', None)
+
+    # Only run in batch mode if explicitly requested
+    if run_mode == 'batch':
+        logging.info("Batch mode explicitly requested.")
+        import matplotlib.pyplot as plt
+        plt.switch_backend('Agg')
+        return _batch_mode(args)
+
+    # Otherwise default to GUI (run_mode='gui' or run_mode=None)
+    if run_mode is None:
+        if len(sys.argv) == 1:
+            logging.info("No arguments provided; defaulting to GUI mode.")
+        else:
+            logging.info("Run mode not specified; defaulting to GUI mode.")
+
+    # GUI requested
     reason = None
-    if args.no_gui:
-        reason = '--no-gui specified'
-    elif not USING_TK:
+    if not USING_TK:
         reason = f"Matplotlib backend '{matplotlib.get_backend()}' is not TkAgg"
     elif not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
         reason = 'No DISPLAY environment variable'
-
-    if args.force_gui and reason is not None:
-        # Try forcing TkAgg BEFORE creating any Tk root; note pyplot already imported, so may not always succeed.
-        if not matplotlib.get_backend().lower().startswith('tk'):
-            try:
-                # Attempt to switch (may warn); fallback logic
-                matplotlib.use('TkAgg')
-            except Exception as e:
-                logging.warning("Could not switch backend to TkAgg: %s", e)
-        # Re-evaluate USING_TK flag
-        if not matplotlib.get_backend().lower().startswith('tk'):
-            logging.info("Force GUI failed; staying headless (backend=%s)", matplotlib.get_backend())
-        else:
-            reason = None
-
-    # Legacy direct attempt if requested
-    if args.legacy_gui and reason is not None:
-        try:
-            import tkinter as tk  # re-import safe
-            test = tk.Tk(); test.withdraw(); test.destroy()
-            reason = None
-            logging.info("Legacy GUI creation succeeded; proceeding with GUI mode.")
-        except Exception as e:
-            logging.warning("Legacy GUI attempt failed: %s", e)
-
+    
+    # Since user explicitly requested 'gui', we attempt to force it:
     if reason is not None:
-        logging.info("Running in headless/batch mode (%s). To enable GUI: ssh -Y, install python3-tk, unset --no-gui, or set MPLBACKEND=TkAgg; use --force-gui to retry.", reason)
+         logging.info("GUI mode requested but environment issues detected (%s). Attempting to force TkAgg...", reason)
+         if not matplotlib.get_backend().lower().startswith('tk'):
+             try:
+                 matplotlib.use('TkAgg')
+             except Exception as e:
+                 logging.warning("Backend switch failed: %s", e)
+         # Re-evaluate
+         if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+              # Try legacy naive check
+              try:
+                   import tkinter as tk
+                   t = tk.Tk(); t.withdraw(); t.destroy()
+                   reason = None
+                   logging.info("Forced GUI: Tkinter display connection succeeded.")
+              except Exception as e:
+                   logging.error("Forced GUI failed: %s", e)
+         else:
+              reason = None # Assume success if DISPLAY exists or backend switch worked
+    
+    # Fallback to batch if GUI is impossible and force failed
+    if reason is not None:
+        logging.error("Unable to initialize GUI: %s. Falling back to batch mode.", reason)
+        import matplotlib.pyplot as plt
+        plt.switch_backend('Agg')
         return _batch_mode(args)
+
     # GUI path
     try:
         import tkinter as tk  # re-import safe
@@ -317,9 +351,11 @@ def main():
                     app.load_grid_shape()
         if args.pltyp:
             app.plot_by_var.set(args.pltyp)
-
+            
     except Exception as e:
         logging.exception("Failed creating Tk root (final); falling back to batch mode")
+        import matplotlib.pyplot as plt
+        plt.switch_backend('Agg')
         return _batch_mode(args)
     selected_pollutant = args.pollutant_first or args.pollutant
     if selected_pollutant:

@@ -1,6 +1,20 @@
 """
 Batch processing module for SMKPLOT.
 
+##############################################################################
+# STRICT PARAMETER SOURCE RULES
+# 1. Grid Generation Consistency:
+#    - All grid generation (NetCDF or GRIDDESC) MUST produce identical GeoDataFrames.
+#    - All grid generation MUST use the same identical function.
+#    - REQUIRED CRS: EPSG:4326 (WGS84 Lat/Lon).
+#    - REQUIRED COLUMNS: ROW (int), COL (int), GRID_RC (str "R_C"), geometry (Polygon).
+#
+# 2. Parameter Source Determination:
+#    - NetCDF/Inline Files: MUST use internal Global Attributes (XORIG, XCELL, etc).
+#      - DO NOT use external GRIDDESC files for NetCDF inputs.
+#    - SMOKE Reports / FF10: MUST use external GRIDDESC file + Grid Name.
+##############################################################################
+
 This module handles headless (non-GUI) execution of the emissions plotting tool.
 It supports:
 - Loading configuration from command-line arguments, JSON, or YAML files.
@@ -52,15 +66,20 @@ from data_processing import (
     detect_pollutants,
     map_latlon2grd,
     _normalize_delim,
-    country_cols,
     _coerce_merge_key,
     get_emis_fips,
     filter_dataframe_by_range,
-    filter_dataframe_by_values
+    filter_dataframe_by_values,
+    apply_spatial_filter
 )
 
-from config import USE_SPHERICAL_EARTH
-from plotting import _draw_graticule
+from plotting import _draw_graticule, create_map_plot
+
+from config import (
+    USE_SPHERICAL_EARTH, key_cols,
+    COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, UNIT_COLS, REL_COLS,
+    EMIS_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS, COUNTRY_CODE_MAPPINGS
+)
 
 
 def _safe_sector_slug(sector: Optional[str]) -> str:
@@ -92,12 +111,12 @@ except Exception:
 
 
 def _resolve_worker_count(num_jobs: int) -> int:
-    if num_jobs <= 1:
-        return 1 if num_jobs else 0
+    # Aggressively use all cores if needed
     cpu = os.cpu_count() or 1
     if cpu <= 1:
         return 1
-    return min(num_jobs, max(1, cpu - 1))
+    # Use max available cores minus 1 for system responsiveness, but always at least 1
+    return max(1, cpu - 1)
 
 
 def _write_settings_snapshot(args, plots, files, attrs=None):
@@ -110,14 +129,6 @@ def _write_settings_snapshot(args, plots, files, attrs=None):
             if k not in {'json', 'yaml', 'json_payload', 'pollutant_list', 'pollutant_first','filter_values'}
         }
         
-        # Only preserve 'imported_file' if we are actually in reimport mode
-        if getattr(args, 'reimport', False):
-            jp = getattr(args, 'json_payload', None)
-            if jp and isinstance(jp, dict):
-                prev_imp = jp.get('arguments', {}).get('imported_file')
-                if prev_imp:
-                    arg_dict['imported_file'] = prev_imp
-
         payload = {
             'timestamp_utc': datetime.utcnow().isoformat() + 'Z',
             'arguments': arg_dict,
@@ -161,10 +172,12 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     input_basename = ctx['input_basename']
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    data = merged[pol]
     pol_unit = None
     try:
         attrs = getattr(emis_df, 'attrs', None)
+        if attrs and 'units_map' in attrs:
+             logging.info(f"DEBUG Pollutant {pol}: Found units_map in attrs: {attrs['units_map']}")
+        
         if isinstance(attrs, dict):
             key_variants = []
             base_key = str(pol)
@@ -183,18 +196,6 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
                     break
     except Exception:
         pol_unit = None
-    try:
-        cmap_name = args.cmap or 'jet'
-        cmap_registry = getattr(matplotlib, 'colormaps', None)
-        if cmap_registry is not None:
-            cmap = cmap_registry.get_cmap(cmap_name)
-        else:
-            cmap = mplcm.get_cmap(cmap_name)
-    except Exception:
-        try:
-            cmap = mplcm.get_cmap('jet')
-        except Exception:
-            cmap = plt.get_cmap('jet')
 
     bins = None
     if args.bins:
@@ -204,171 +205,33 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         except Exception:
             bins = None
 
-    plot_kwargs = dict(
+    # Use shared plotting function
+    create_map_plot(
+        gdf=merged_plot,
         column=pol,
+        title=f"{pol} Emissions" if not batch_src else f"{batch_src} - {pol}",
         ax=ax,
-        legend=True,
-        cmap=cmap,
-        linewidth=0.05,
-        edgecolor='black',
-        missing_kwds={'color': '#f0f0f0', 'edgecolor': 'none', 'label': 'No Data'},
+        cmap_name=args.cmap or 'jet',
+        bins=bins,
+        log_scale=args.log_scale,
+        unit_label=pol_unit,
+        overlay_counties=overlay_county,
+        overlay_shape=overlay_geom,
+        crs_proj=crs_proj,
+        zoom_to_data=args.zoom_to_data,
+        zoom_pad=args.zoom_pad
     )
-
-    if bins and len(bins) >= 2:
-        try:
-            # Update cmap to support transparency for values below first bin
-            # Use extend='neither' and clip=False to preserve original bin colors
-            cmap = copy.copy(cmap)
-            cmap.set_under('none')
-            try:
-                cmap.set_over(cmap(cmap.N - 1))
-            except Exception:
-                pass
-                
-            plot_kwargs['cmap'] = cmap
-            plot_kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
-        except Exception:
-            pass
-        use_log = False
-    else:
-        use_log = args.log_scale and (data > 0).any()
-        if use_log:
-            positive = data[data > 0]
-            if positive.empty:
-                plot_kwargs['norm'] = None
-            else:
-                plot_kwargs['norm'] = LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
-
-    try:
-        merged_plot.plot(**plot_kwargs)
-    except Exception:
-        merged.plot(**plot_kwargs)
-
-    cb_ax = None
-    try:
-        for candidate in fig.axes:
-            if candidate is not ax:
-                cb_ax = candidate
-                break
-    except Exception:
-        cb_ax = None
-    if cb_ax is not None and pol_unit:
-        try:
-            bbox = cb_ax.get_position()
-            orient_vertical = (bbox.height >= bbox.width)
-        except Exception:
-            orient_vertical = True
-        try:
-            if orient_vertical:
-                cb_ax.set_ylabel(pol_unit)
-            else:
-                cb_ax.set_xlabel(pol_unit)
-        except Exception:
-            pass
-
-    # Overlay county shapefile boundaries if provided
-    if overlay_county is not None:
-        try:
-            if crs_proj is not None and getattr(overlay_county, 'crs', None) is not None:
-                overlay_county = overlay_county.to_crs(crs_proj)
-            overlay_county.boundary.plot(ax=ax, color='black', linewidth=0.3, alpha=0.7)
-        except Exception:
-            logging.exception("Failed to overlay county shapefile boundaries")
     
-    # Overlay shapefile boundaries if provided
-    if overlay_geom is not None:
-        try:
-            if crs_proj is not None and getattr(overlay_geom, 'crs', None) is not None:
-                overlay_geom = overlay_geom.to_crs(crs_proj)
-            overlay_geom.boundary.plot(ax=ax, color='black', linewidth=0.5, alpha=0.7, linestyle='--')
-        except Exception:
-            logging.exception("Failed to overlay auxiliary shapefile boundaries")
-    
-    if args.zoom_to_data:
-        try:
-            # Modified to include zero values in zoom extent (per user request)
-            # previously: valid = merged_plot[merged_plot[pol].notna() & (merged_plot[pol].abs() > 0)]
-            valid = merged_plot[merged_plot[pol].notna()]
-            
-            if not valid.empty:
-                minx, miny, maxx, maxy = valid.total_bounds
-                pad = max(0.0, min(0.25, args.zoom_pad))
-                dx = (maxx - minx) * pad if maxx > minx else 0.1
-                dy = (maxy - miny) * pad if maxy > miny else 0.1
-                ax.set_xlim(minx - dx, maxx + dx)
-                ax.set_ylim(miny - dy, maxy + dy)
-                logging.debug(
-                    "Zoom-to-data applied for %s: bounds=(%.4f,%.4f,%.4f,%.4f) pad=%.3f",
-                    pol,
-                    minx,
-                    miny,
-                    maxx,
-                    maxy,
-                    pad,
-                )
-            else:
-                logging.debug("Zoom-to-data skipped for %s: no valid geometries after filtering", pol)
-        except Exception:
-            logging.exception("Zoom-to-data failed for %s", pol)
-
-    try:
-        bins_ticks = bins or []
-    except Exception:
-        bins_ticks = []
-    try:
-        from matplotlib.ticker import FixedLocator, FuncFormatter
-
-        if cb_ax is not None and bins_ticks:
-            try:
-                _norm = plot_kwargs.get('norm', None)
-            except Exception:
-                _norm = None
-            is_log = isinstance(_norm, LogNorm)
-            ticks = [t for t in bins_ticks if (t > 0)] if is_log else list(bins_ticks)
-            
-            # Formatter for small values at bin edges
-            def _fmt_precise(x, pos=None):
-                if x == 0: return "0"
-                if 0 < abs(x) < 0.1:
-                    return f"{x:.4g}"
-                return f"{x:.4g}"
-            
-            if ticks:
-                try:
-                    bbox = cb_ax.get_position()
-                    orient_vertical = (bbox.height >= bbox.width)
-                except Exception:
-                    orient_vertical = True
-                if orient_vertical:
-                    try:
-                        cb_ax.yaxis.set_major_locator(FixedLocator(ticks))
-                        cb_ax.yaxis.set_major_formatter(FuncFormatter(_fmt_precise))
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        cb_ax.xaxis.set_major_locator(FixedLocator(ticks))
-                        cb_ax.xaxis.set_major_formatter(FuncFormatter(_fmt_precise))
-                    except Exception:
-                        pass
-                try:
-                    fig.canvas.draw_idle()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
     try:
         if crs_proj is not None and tf_fwd is not None and tf_inv is not None:
             _draw_graticule(ax, tf_fwd, tf_inv, lon_step=5, lat_step=5)
-            try:
-                ax.set_aspect('equal', adjustable='box')
-            except Exception:
-                pass
     except Exception:
         pass
 
-    ax.set_axis_off()
+    if crs_proj is None:
+        ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+    else:
+        ax.set_axis_off()
 
 
     stats_source = None
@@ -391,8 +254,11 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         except Exception:
             logging.exception("Failed to calculate stats for visible region; falling back to full data")
 
+    if stats_source is None and isinstance(emis_df, pd.DataFrame) and pol in emis_df.columns:
+        stats_source = emis_df[pol]
+
     if stats_source is None:
-        stats_source = emis_df[pol] if isinstance(emis_df, pd.DataFrame) and pol in emis_df.columns else data
+        stats_source = pd.Series([]) # Fallback empty
 
     numeric_values = pd.to_numeric(stats_source, errors='coerce').dropna()
 
@@ -447,12 +313,16 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         pltyp_suffix = ''
 
     if args.filter_col:
-        out_file = os.path.join(
-            args.outdir,
-            f"{input_basename}_{pol}{pltyp_suffix}.filterby_{args.filter_col}.png",
-        )
+        fname_base = f"{input_basename}_{pol}{pltyp_suffix}.filterby_{args.filter_col}"
     else:
-        out_file = os.path.join(args.outdir, f"{input_basename}_{pol}{pltyp_suffix}.png")
+        fname_base = f"{input_basename}_{pol}{pltyp_suffix}"
+    
+    # Add overlay filter mode to filename if active
+    filter_mode_arg = getattr(args, 'filtered_by_overlay', None)
+    if filter_mode_arg and str(filter_mode_arg).lower() not in ('false', 'none'):
+        fname_base += f".overlay_{filter_mode_arg}"
+
+    out_file = os.path.join(args.outdir, f"{fname_base}.png")
 
     fig.savefig(out_file, dpi=180)
     plt.close(fig)
@@ -529,172 +399,142 @@ def _batch_mode(args):
             return _finish(0)
     
     
-    # Check for JSON payload in args
+    # Retrieve json_payload
     json_payload = getattr(args, 'json_payload', None)
 
-    # Check if reimporting processed data specified in arguments
-    reimport_requested = getattr(args, 'reimport', False)
-    # Check if reimporting processed data specified in JSON payload
-    if not reimport_requested and isinstance(json_payload, dict):
-        reimport_requested = bool(json_payload.get('arguments', {}).get('reimport', False))
+    # -----------------------------------------------------
+    # Unified File Loading Logic
+    # -----------------------------------------------------
+    input_path = args.filepath
+    
+    # Check JSON filepath if still None
+    if not input_path and isinstance(json_payload, dict):
+        input_path = json_payload.get('arguments', {}).get('filepath')
 
+    if not input_path:
+        logging.error("Batch mode requires input file(s). Use --filepath.")
+        return 2
+
+    # Normalize input_path to list of strings
+    if isinstance(input_path, (list, tuple)):
+        # Already a list?
+        file_list = [str(p) for p in input_path if p]
+    elif isinstance(input_path, str):
+        # Support semicolon splitting for multiple files passed as single string
+        file_list = [p.strip() for p in input_path.split(';') if p.strip()]
+    else:
+        file_list = []
+    
+    # Resolve relative paths against JSON directory if applicable
+    json_ref_dir = os.path.dirname(args.json) if getattr(args, 'json', None) else None
+    resolved_files = []
+    for f in file_list:
+        if f and not os.path.isabs(f) and json_ref_dir:
+             resolved_files.append(os.path.abspath(os.path.join(json_ref_dir, f)))
+        elif f:
+             resolved_files.append(os.path.abspath(f))
+    
+    if not resolved_files:
+        logging.error("No valid input files found.")
+        return 2
+
+    # Verify existence
+    missing = [f for f in resolved_files if not os.path.exists(f)]
+    if missing:
+        logging.error("Input file(s) not found: %s", missing)
+        return 1
+
+    msg_load = f"Loading emissions data from: {resolved_files}"
+    logging.info(msg_load)
+    print(msg_load)
+    
+    # Propagate grid/inline arguments to environment variables for reader
+    # Note: NetCDF reader (including Inline proxy) is designed to prefer headers.
+    # We pass STACK_GROUPS to allow Inline conversion. GRIDDESC is passed only if needed, 
+    # but for NetCDF files we expect headers to define the grid.
+    if getattr(args, 'stack_groups', None):
+        os.environ['STACK_GROUPS'] = args.stack_groups
+    
+    # Check for implicit NetCDF grid mode: if it is NetCDF, we don't strictly need GRIDDESC from CLI.
+    # However, if user provided it, we could pass it to env just in case reader wants it as fallback.
+    # But user instruction says: "grid parameter will be taken from headers".
+    # So we strictly rely on headers for NetCDF.
+    
     emis_df = None
     raw_df = None
 
-    if reimport_requested:
-        
-        if not isinstance(json_payload, dict):
-            logging.error("Reimport requires --json or --yaml to point to a saved settings file.")
-            return 2
-        
-        # Locate preprocessed emission file from JSON arguments
-        imported_preprocessed_path = json_payload.get('arguments', {}).get('imported_file', None)
-        
-        # Normalize to list
-        if isinstance(imported_preprocessed_path, (str, type(None))):
-             imported_paths = [imported_preprocessed_path] if imported_preprocessed_path else []
+    # Parse NetCDF dimension args
+    ncf_params = {}
+    
+    # Time Dimension
+    t_arg = getattr(args, 'ncf_tdim', 'avg')
+    if str(t_arg).isdigit():
+        ncf_params['tstep_idx'] = int(t_arg)
+        ncf_params['tstep_op'] = 'select'
+    else:
+        # map common aliases
+        op = str(t_arg).lower()
+        if op in ('avg', 'mean', 'average'):
+            ncf_params['tstep_op'] = 'mean'
+        elif op in ('sum', 'total'):
+            ncf_params['tstep_op'] = 'sum'
+        elif op in ('max', 'maximum'):
+             ncf_params['tstep_op'] = 'max'
+        elif op in ('min', 'minimum'):
+             ncf_params['tstep_op'] = 'min'
         else:
-             imported_paths = list(imported_preprocessed_path)
+             # Default fallback
+             ncf_params['tstep_op'] = 'mean'
 
-        resolved_paths = []
-        json_dir = os.path.dirname(args.json) if getattr(args, 'json', None) else None
+    # Layer Dimension
+    z_arg = getattr(args, 'ncf_zdim', '0')
+    if str(z_arg).isdigit():
+        ncf_params['layer_idx'] = int(z_arg)
+        ncf_params['layer_op'] = 'select'
+    else:
+        op = str(z_arg).lower()
+        ncf_params['layer_idx'] = None # Override default 0
+        if op in ('avg', 'mean', 'average'):
+            ncf_params['layer_op'] = 'mean'
+        elif op in ('sum', 'total'):
+            ncf_params['layer_op'] = 'sum'
+        elif op in ('max', 'maximum'):
+             ncf_params['layer_op'] = 'max'
+        elif op in ('min', 'minimum'):
+             ncf_params['layer_op'] = 'min'
+        else:
+             # Default fallback
+             ncf_params['layer_idx'] = 0
+             ncf_params['layer_op'] = 'select'
 
-        for path in imported_paths:
-            if path and not os.path.isabs(path):
-                if json_dir:
-                    path = os.path.abspath(os.path.join(json_dir, path))
-                else:
-                    path = os.path.abspath(path)
-            
-            if path and not os.path.exists(path):
-                logging.error("Specified imported file %s does not exist locally.", path)
-                return 1
-            if path:
-                resolved_paths.append(path)
-
-        if not resolved_paths:
-            logging.error("Reimport requested but no preprocessed files listed in JSON outputs. Aborting.")
+    try:
+        norm_delim = _normalize_delim(args.delim)
+        # read_inputfile handles list of paths
+        emis_df, raw_df = read_inputfile(
+            fpath=resolved_files,
+            sector=args.sector,
+            delim=norm_delim,
+            skiprows=args.skiprows,
+            comment=args.comment,
+            encoding=args.encoding,
+            flter_col=args.filter_col,
+            flter_start=args.filter_start,
+            flter_end=args.filter_end,
+            flter_val=getattr(args, 'filter_values', None),
+            return_raw=False,
+            ncf_params=ncf_params
+        )
+    except Exception as e:
+        if "No valid FIPS code columns found" in str(e):
+            logging.error("Input file is not supported: No valid FIPS/Region columns found.")
             return 1
-        
-        # All good now, read the preprocessed emissions data
-        try:
-            dfs = []
-            for p in resolved_paths:
-                dfs.append(pd.read_csv(p))
-            emis_df = pd.concat(dfs, ignore_index=True)
+        logging.exception("Error reading emissions: %s", e)
+        return 1
+    
+    # -----------------------------------------------------
+    # End Unified Loading
+    # -----------------------------------------------------
 
-            # Apply filtering BEFORE aggregation to ensure we don't lose granularity
-            filter_col = args.filter_col
-            filter_start = args.filter_start
-            filter_end = args.filter_end
-            filter_values = args.filter_values
-
-            if filter_col and (filter_start is not None) and (filter_end is not None):
-                try:
-                    emis_df = filter_dataframe_by_range(
-                        emis_df,
-                        filter_col,
-                        float(filter_start),
-                        float(filter_end)
-                    )
-                    logging.info(
-                        "Applied reimport filtering on column %s for range %.4g to %.4g",
-                        filter_col,
-                        float(filter_start),
-                        float(filter_end)
-                    )
-                except Exception:
-                    logging.exception("Failed to apply reimport filtering by range on column %s", filter_col)
-            
-            if filter_col and (filter_values is not None):
-                try:
-                    emis_df = filter_dataframe_by_values(
-                        emis_df,
-                        filter_col,
-                        filter_values
-                    )
-                    logging.info(
-                        "Applied reimport filtering on column %s for values %s",
-                        filter_col,
-                        repr(filter_values)
-                    )
-                except Exception:
-                    logging.exception("Failed to apply reimport filtering by values on column %s", filter_col)
-
-            # Ensure FIPS column exists for aggregation
-            try:
-                emis_df = get_emis_fips(emis_df)
-            except Exception:
-                pass
-
-            # Aggregation logic
-            group_keys = []
-            if 'FIPS' in emis_df.columns:
-                group_keys.append('FIPS')
-            elif 'GRID_RC' in emis_df.columns:
-                group_keys.append('GRID_RC')
-            
-            if 'country_cd' in emis_df.columns:
-                group_keys.append('country_cd')
-            
-            if group_keys:
-                # Clear cached pollutants from attrs if any
-                if hasattr(emis_df, 'attrs'):
-                     emis_df.attrs.pop('_detected_pollutants', None)
-                
-                pols = detect_pollutants(emis_df)
-                if pols:
-                    agg_dict = {p: 'sum' for p in pols}
-                    # Handle other columns (take first)
-                    for c in emis_df.columns:
-                        if c not in group_keys and c not in pols:
-                            agg_dict[c] = 'first'
-                    
-                    emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
-                    logging.info("Aggregated reimported data by %s", group_keys)
-
-        except Exception:
-            logging.exception("Failed to reimport processed emissions data from %s", resolved_paths)
-            return 1
-        
-        # Restore DataFrame attributes
-        attrs_from_json = json_payload.get('arguments', {}).get('imported_attrs', None)
-        if isinstance(attrs_from_json, dict):
-            for key, value in attrs_from_json.items():
-                emis_df.attrs[key] = value
-        
-        logging.info("Reimported processed emissions data from %s", resolved_paths)
-
-        raw_df = emis_df.copy(deep=True)
-        
-        # Apply filtering if specified in JSON arguments
-        # (Filtering has already been applied before aggregation above)
-        
-    else: # Not reimporting; read raw input file
-        if not args.filepath:
-            logging.error("Batch mode requires --filepath to specify the SMKREPORT / FF10 input file.")
-            return 2
-        
-        try:
-            norm_delim = _normalize_delim(args.delim)
-            emis_df, raw_df = read_inputfile(
-                fpath=args.filepath,
-                sector=args.sector,
-                delim=norm_delim,
-                skiprows=args.skiprows,
-                comment=args.comment,
-                encoding=args.encoding,
-                flter_col=args.filter_col,
-                flter_start=args.filter_start,
-                flter_end=args.filter_end,
-                flter_val=getattr(args, 'filter_values', None),
-            )
-        except Exception as e:
-            if "No valid FIPS code columns found" in str(e):
-                logging.error("Input file is not supported: No valid FIPS/Region columns found.")
-                return 1
-            logging.exception("Error reading emissions")
-            return 1
     
     if emis_df is None:
         logging.error("No emissions data available for processing.")
@@ -709,6 +549,22 @@ def _batch_mode(args):
             return 1
         logging.exception("Error building FIPS columns")
         return 1
+
+    # Apply units_map from JSON payload if available (overrides input data)
+    # Must be done after get_emis_fips because pd.concat in get_emis_fips may drop attrs
+    if isinstance(json_payload, dict):
+        units_map_arg = json_payload.get('arguments', {}).get('units_map')
+        if isinstance(units_map_arg, dict) and emis_df is not None:
+             # Merge with existing units_map if any, preferring the argument
+             existing_map = emis_df.attrs.get('units_map', {})
+             if not isinstance(existing_map, dict): existing_map = {}
+             
+             for k, v in units_map_arg.items():
+                 existing_map[k] = v
+             
+             emis_df.attrs['units_map'] = existing_map
+             logging.info("Applied units_map from configuration settings.")
+
     
     # Handle fill-nan option
     fill_nan_val = getattr(args, 'fill_nan', None)
@@ -737,9 +593,6 @@ def _batch_mode(args):
         except Exception:
            logging.exception("Failed to fill NaN values")
 
-    print(emis_df.attrs)
-    print(emis_df.head(5))
-    
     # Capture emissions DataFrame attributes for later use
     emis_attrs = dict(getattr(emis_df, 'attrs', {}) or {})
 
@@ -750,45 +603,63 @@ def _batch_mode(args):
     if json_payload:
         json_sector = json_payload.get('arguments', {}).get('sector', None)
     
-    input_basename = start_sector or json_sector or os.path.basename(args.filepath)
+    input_basename = start_sector or json_sector or (os.path.basename(resolved_files[0]) if resolved_files else 'output')
 
+    # Detect NetCDF input
+    is_ncf_input = False
+    if resolved_files and resolved_files[0].lower().endswith(('.nc', '.ncf')):
+        is_ncf_input = True
 
-    # Export processed emissions data to CSV if requested in arguments or JSON payload
-    csv_from_json = False
-    if isinstance(json_payload, dict):
-        csv_from_json = json_payload.get('arguments', {}).get('export_csv', False)
-
-    if (getattr(args, 'export_csv', False) or csv_from_json):
-        # Create output directory if it doesn't exist
-        os.makedirs(args.outdir, exist_ok=True)
-        if args.filter_col:
-            csv_outpath = os.path.join(args.outdir, f"{input_basename}.filterby_{args.filter_col}.pivotted.csv")
-        else:
-            csv_outpath = os.path.join(args.outdir, f"{input_basename}.pivotted.csv")
-        # export raw_df to CSV
-        if reimport_requested:
-            emis_df.to_csv(csv_outpath, index=False)
-        else:
-            raw_df.to_csv(csv_outpath, index=False)
-
-        logging.info("Processed emissions data exported to %s", csv_outpath)
-        generated_files.append(os.path.abspath(csv_outpath))        
-    
     # Validate inputs based on plot type
+    
+    # Strict validation for re-imported grid data
+    if args.pltyp == 'grid' and emis_df.attrs.get('is_preprocessed'):
+        if 'GRID_RC' not in emis_df.columns:
+            logging.error("Plot Type is 'grid' but input pre-processed CSV(s) missing 'GRID_RC' column. Aborting.")
+            return 1
+
     overlay_county = None
     overlay_geom = None
 
-    if args.pltyp == 'grid':
-        if not args.griddesc or not args.gridname:
-            logging.error("Batch grid plotting (--pltyp grid) requires --griddesc and --gridname.")
-            return 2
-    if args.pltyp == 'county':
-        if not args.county_shapefile:
-            logging.error("Batch county plotting (--pltyp county) requires --county-shapefile.")
-            return 2
+    if is_ncf_input:
+        # User policy: NetCDF (Grid or Inline) uses internal headers for grid definition.
+        if args.griddesc or args.gridname:
+            logging.warning("NetCDF input detected: Ignoring provided --griddesc/--gridname. Grid parameters will be taken from NetCDF input file headers instead.")
+            
+    else:
+        if args.pltyp == 'grid':
+            if not args.griddesc or not args.gridname:
+                logging.error("Batch grid plotting (--pltyp grid) requires --griddesc and --gridname.")
+                return 2
+        if args.pltyp == 'county':
+            if not args.county_shapefile:
+                logging.error("Batch county plotting (--pltyp county) requires --county-shapefile.")
+                return 2
 
     # Load geometry based on plot type
-    if args.pltyp == 'grid':
+    if is_ncf_input:
+        try:
+             from ncf_processing import create_ncf_domain_gdf
+             # Use the proxy file for geometry if available (ensures correct 2D grid for Inline sources)
+             geom_source_path = emis_df.attrs.get('proxy_ncf_path', args.filepath)
+             
+             logging.info("Generating grid geometry from NetCDF file parameters (%s)...", "proxy" if geom_source_path != args.filepath else "original")
+             base_geom = create_ncf_domain_gdf(geom_source_path)
+             merge_on = 'GRID_RC'
+        except Exception:
+             logging.exception("Error extracting grid geometry from NetCDF file.")
+             return 1
+        
+        # Overlay county if provided, relaxed requirement
+        if args.county_shapefile:
+             try:
+                 overlay_county = read_shpfile(args.county_shapefile, False)
+                 logging.info("Loaded county shapefile as overlay.")
+             except Exception:
+                 logging.warning(f"Failed to load {args.county_shapefile} for overlay plotting. Ignoring.")
+                 overlay_county = None
+
+    elif args.pltyp == 'grid':
         try:
             base_geom = create_domain_gdf(args.griddesc, args.gridname)
             merge_on = 'GRID_RC'
@@ -816,12 +687,53 @@ def _batch_mode(args):
             overlay_county = None
 
     # Optional overlay when a shapefile is supplied (e.g., for grid runs)
-    if args.overlay_shapefile:
-        try:
-            overlay_geom = read_shpfile(args.overlay_shapefile, False)
-        except Exception:
-            logging.exception(f"Failed to load {args.overlay_shapefile} for plotting. Ignoring overlay.")
-            overlay_geom = None
+    overlay_geom = None
+    ov_paths = getattr(args, 'overlay_shapefile', None)
+    
+    if ov_paths:
+        # Normalize to list (handle string, semicolon separation, lists)
+        ov_file_list = []
+        if isinstance(ov_paths, str):
+            ov_file_list = [p.strip() for p in ov_paths.split(';') if p.strip()]
+        elif isinstance(ov_paths, (list, tuple)):
+             for item in ov_paths:
+                 if isinstance(item, str):
+                     ov_file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                 else:
+                     ov_file_list.append(str(item))
+        
+        # Load and combine
+        loaded_parts = []
+        for fpath in ov_file_list:
+            try:
+                # Resolve path similar to inputs (optional check omitted for brevity, rely on read_shpfile)
+                part_gdf = read_shpfile(fpath, False)
+                if part_gdf is not None and not part_gdf.empty:
+                    loaded_parts.append(part_gdf)
+            except Exception:
+                logging.exception(f"Failed to load overlay shapefile: {fpath}. Skipping.")
+        
+        if loaded_parts:
+            if len(loaded_parts) == 1:
+                overlay_geom = loaded_parts[0]
+            else:
+                try:
+                    # Combine multiple layers
+                    # Use First layer's CRS as target
+                    target = loaded_parts[0]
+                    target_crs = target.crs
+                    
+                    final_list = [target]
+                    for other in loaded_parts[1:]:
+                        if target_crs and other.crs and other.crs != target_crs:
+                            other = other.to_crs(target_crs)
+                        final_list.append(other)
+                    
+                    overlay_geom = pd.concat(final_list, ignore_index=True)
+                    logging.info("Combined %d overlay shapefiles.", len(final_list))
+                except Exception:
+                    logging.exception("Failed to combine multiple overlay shapefiles. Using first successfully loaded file.")
+                    overlay_geom = loaded_parts[0]
 
     # Detect pollutants
     pollutants = detect_pollutants(emis_df)
@@ -859,6 +771,8 @@ def _batch_mode(args):
     os.makedirs(args.outdir, exist_ok=True)
     
     # Simple groupby and sum
+    # NOTE: We aggregate into 'emis_agg' for plotting but keep 'emis_df' intact for export.
+    emis_agg = None
     try:
         attrs = dict(getattr(emis_df, 'attrs', {}))
         try:
@@ -866,18 +780,18 @@ def _batch_mode(args):
         except TypeError:
             grouped = emis_df.groupby(merge_on, sort=False, observed=False)
         if requested:
-            emis_df = grouped[requested].sum(numeric_only=True).reset_index()
+            emis_agg = grouped[requested].sum(numeric_only=True).reset_index()
         else:
-            emis_df = grouped.sum(numeric_only=True).reset_index()
-        emis_df.attrs = attrs
+            emis_agg = grouped.sum(numeric_only=True).reset_index()
+        emis_agg.attrs = attrs
     except Exception:
         logging.exception("Unexpected error while aggregating emissions data")
 
     if merge_on == 'FIPS':
         try:
-            if 'FIPS' in emis_df.columns:
-                emis_df = emis_df.copy()
-                emis_df['FIPS'] = _coerce_merge_key(emis_df['FIPS'], pad=6)
+            if 'FIPS' in emis_agg.columns:
+                emis_agg = emis_agg.copy()
+                emis_agg['FIPS'] = _coerce_merge_key(emis_agg['FIPS'], pad=6)
         except Exception:
             logging.exception("Failed to normalize emissions FIPS prior to merge")
         try:
@@ -888,7 +802,7 @@ def _batch_mode(args):
             logging.exception("Failed to normalize geometry FIPS prior to merge")
 
     try:
-        merged = base_geom.merge(emis_df, on=merge_on, how='left', sort=False)
+        merged = base_geom.merge(emis_agg, on=merge_on, how='left', sort=False)
     except Exception:
         logging.exception("Failed to merge emissions with geometry")
         return 1
@@ -902,22 +816,200 @@ def _batch_mode(args):
                logging.info("Filled NaN values in merged geometry with %.4f", fill_number)
         except Exception:
            logging.exception("Failed to fill NaN values in merged dataframe")
+
+    # Filter by overlay if requested
+    filter_arg = getattr(args, 'filtered_by_overlay', None)
     
-    # Export merged GeoDataFrame to file if requested
-    #if (getattr(args, 'export_csv', False) or json_payload.get('arguments', {}).get('export_csv', False)):
-    #    if args.filter_col:
-    #        csv_outpath = os.path.join(args.outdir, f"{input_basename}.merged.filterby_{args.filter_col}.pivotted.csv")
-    #    else:
-    #        csv_outpath = os.path.join(args.outdir, f"{input_basename}.merged.pivotted.csv")
-    #    # export merged to CSV
-    #    merged.to_csv(csv_outpath, index=False)
-    #    logging.info("Processed emissions data merged with geometry and exported to %s", csv_outpath)
-    #    generated_files.append(os.path.abspath(csv_outpath))  
+    # Resolve boolean/None/String inputs to a canonical mode string
+    filter_mode = None
+    if filter_arg is None:
+        filter_mode = None
+    elif isinstance(filter_arg, bool):
+        filter_mode = 'intersect' if filter_arg else None
+    elif isinstance(filter_arg, str):
+        s = filter_arg.strip().lower()
+        if s in ('', 'false', 'null', 'undefined', 'none'):
+            filter_mode = None
+        else:
+            filter_mode = s
+    else:
+        filter_mode = str(filter_arg).strip().lower()
+
+    if filter_mode:
+        # Update args with the canonical mode so it propagates to title/filename generation
+        args.filtered_by_overlay = filter_mode
+
+        if overlay_geom is None:
+             logging.warning("filtered_by_overlay='%s' requested but no overlay shapefile loaded.", filter_mode)
+        else:
+             try:
+                 logging.info("Applying overlay filter mode: '%s'", filter_mode)
+                 merged = apply_spatial_filter(merged, overlay_geom, filter_mode)
+                 
+                 if filter_mode in ('clipped', 'intersect', 'within'):
+                     logging.info("Filtering complete. Remaining features: %d", len(merged))
+
+             except Exception:
+                 logging.exception("Failed to apply overlay filter '%s'", filter_mode)
+
+    # Export processed emissions data to CSV (post-filtering)
+    csv_from_json = False
+    if isinstance(json_payload, dict):
+        csv_from_json = json_payload.get('arguments', {}).get('export_csv', False)
+
+    if (getattr(args, 'export_csv', False) or csv_from_json):
+        # Create output directory if it doesn't exist
+        os.makedirs(args.outdir, exist_ok=True)
+
+        # construct filename
+        fname_base = f"{input_basename}"
+        if args.filter_col:
+            fname_base += f".filterby_{args.filter_col}"
+        
+        # Add overlay filter mode to filename if active (using the resolved filter_mode variable)
+        if filter_mode:
+            fname_base += f".overlay_{filter_mode}"
+            
+        csv_outpath = os.path.join(args.outdir, f"{fname_base}.pivotted.csv")
+        
+        try:
+             # If spatial filtering occurred, we MUST use 'merged' to reflect the filter.
+             # However, 'merged' contains geometry and shapefile attributes.
+             # 'emis_df' contains only the original data columns.
+             # If filter_mode is active, we export the subset of 'merged'.
+             
+             if filter_mode:
+                 # Ensure we don't carry the geometry column into the CSV
+                 # Instead of exporting the aggregated 'merged' DF (which might lose columns),
+                 # we filter the original 'emis_df' to keep only rows present in the spatial subset.
+                 # We use the merge key to identify valid rows.
+                 try:
+                     if merge_on and merge_on in merged.columns and merge_on in emis_df.columns:
+                         valid_keys = merged[merge_on].unique()
+                         export_df = emis_df[emis_df[merge_on].isin(valid_keys)]
+                     else:
+                          # Fallback: if keys don't match, export merged without geom
+                          export_df = pd.DataFrame(merged.drop(columns='geometry', errors='ignore'))
+                 except Exception:
+                     export_df = pd.DataFrame(merged.drop(columns='geometry', errors='ignore'))
+                 
+                 logging.info("Exporting spatially filtered data (from filtered_by_overlay='%s')", filter_mode)
+             else:
+                 # If no spatial filter, prefer the clean 'emis_df' (original behavior)
+                 # Note: Unlike previous versions which exported the plotting aggregation (County-level),
+                 # this now exports the full source-level data (emis_df) to preserve columns like SCC.
+                 # This results in a larger file (more rows) but retains granular detail.
+                 export_df = emis_df
+            
+             # Filter columns based on key_cols from config to reduce size
+             # This ensures we export only relevant metadata and pollutants.
+             if key_cols:
+                 # Identify columns to keep: those in key_cols, pollutants, or FIPS
+                 # Note: pollutants list was detected earlier
+                 cols_to_keep = set(key_cols)
+
+                 # If user requested specific pollutants, limit export to those ONLY IF reading pre-processed CSV.
+                 # If reading RAW files (FF10/List), user wants to keep ALL pollutants in the export.
+                 is_reused = emis_df.attrs.get('is_preprocessed', False)
+                 
+                 if requested and is_reused:
+                      cols_to_keep.update([p for p in requested if p in export_df.columns])
+                 else:
+                      cols_to_keep.update(pollutants)
+
+                 cols_to_keep.add('FIPS') # Always keep FIPS as primary identifier
+                 cols_to_keep.add('GRID_RC') # Keep grid cell ID if available (from lat/lon mapping)
+                 
+                 # Reorder columns: FIPS/GRID_RC first, then others (preserving original order)
+                 ordered_cols = []
+                 for special in ['FIPS', 'GRID_RC']:
+                     if special in export_df.columns and special in cols_to_keep:
+                         ordered_cols.append(special)
+                 
+                 # Append remaining columns
+                 ordered_cols.extend([c for c in export_df.columns if c in cols_to_keep and c not in ordered_cols])
+                 
+                 export_df = export_df[ordered_cols]
+            
+             # Collapse rows with same key columns by summing pollutant values
+             # This handles cases where input had multiple rows per key (e.g. split by CAS or extraneous metadata)
+             # but we are exporting a simplified view (only key_cols + pollutants).
+             
+             # Ensure identifying columns (FIPS, GRID_RC) are NOT treated as pollutants to be summed
+             safe_identifiers = {'FIPS', 'GRID_RC', 'fips', 'grid_rc', 'ROW', 'COL', 'X', 'Y'}
+             
+             # Determine sum_cols as intersection of (requested or pollutants) and current columns
+             # AND ensure they are numeric.
+             target_pols = set(requested) if requested else set(pollutants)
+             
+             sum_cols = [c for c in export_df.columns if c in target_pols and c not in safe_identifiers and pd.api.types.is_numeric_dtype(export_df[c])]
+             grp_cols = [c for c in export_df.columns if c not in sum_cols]
+             
+             if sum_cols and grp_cols:
+                 try:
+                     # Create a copy immediately to avoid SettingWithCopyWarning and defragment
+                     export_df = export_df.copy()
+                     
+                     # Remove explicit fillna to preserve sparse structure (reduce CSV size)
+                     # export_df[sum_cols] = export_df[sum_cols].fillna(0)
+                     
+                     import warnings
+                     with warnings.catch_warnings():
+                         warnings.simplefilter("ignore")
+                         # Use min_count=1 to preserve NaNs where no data exists (sparse), 
+                         # preventing conversion of NaNs to 0.0 which bloats CSV size.
+                         # observed=True is CRITICAL to prevent expanding all Categorical combinations (MemoryError)
+                         export_df = export_df.groupby(grp_cols, as_index=False, dropna=False, observed=True)[sum_cols].sum(min_count=1)
+                          
+                         # Remove rows where ALL sum_cols are 0.0 or NaN (no emissions)
+                         # This cleans up "ghost" rows that have keys but no data.
+                         if sum_cols:
+                             # Check if sum along pollutant axis is effectively 0/NaN
+                             # We keep rows where at least one pollutant > 0 or < 0 (non-zero)
+                             # Note: is.na() check handles NaNs, == 0 handles zeros.
+                             mask_valid = (export_df[sum_cols].fillna(0) != 0).any(axis=1)
+                             export_df = export_df[mask_valid]
+                 except Exception as e:
+                     logging.warning("Aggregation failed (%s); falling back to simple deduplication.", e)
+                     export_df = export_df.drop_duplicates()
+             else:
+                 export_df = export_df.drop_duplicates()
+
+             # FIPS padding removed to preserve original input format as requested.
+             # if 'FIPS' in export_df.columns:
+             #    export_df['FIPS'] = _coerce_merge_key(export_df['FIPS'], pad=6)
+
+             msg = f"Writing processed data to CSV: {csv_outpath} ... (This may take a moment for large files)"
+             logging.info(msg)
+             print(msg)
+             
+             export_df.to_csv(csv_outpath, index=False)
+             
+             msg_done = f"Successfully exported CSV to: {csv_outpath}"
+             logging.info(msg_done)
+             print(msg_done)
+             
+             generated_files.append(os.path.abspath(csv_outpath))
+        except Exception:
+             logging.exception("Failed to export CSV to %s", csv_outpath) 
 
     # Determine projection (only use LCC when grid + GRIDDESC provided, unless --force-lcc)
     crs_proj = None; tf_fwd = None; tf_inv = None
     if args.projection == 'wgs84':
         crs_proj = None  # keep geographic
+    elif is_ncf_input and args.projection != 'wgs84':
+        try:
+            from ncf_processing import read_ncf_grid_params
+            coord_params, _ = read_ncf_grid_params(args.filepath)
+            gdtyp, p_alpha, p_beta, _p_gamma, x_cent, y_cent = coord_params
+            if gdtyp == 2:
+                 a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
+                 proj4 = f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} +lon_0={x_cent} {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
+                 crs_proj = pyproj.CRS.from_proj4(proj4)
+                 tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_proj, always_xy=True)
+                 tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
+        except Exception:
+             crs_proj = None; tf_fwd = None; tf_inv = None
     elif args.projection == 'lcc':
         # attempt grid-specific if possible, else default CONUS
         if args.griddesc and args.gridname:
@@ -941,8 +1033,8 @@ def _batch_mode(args):
                 tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
             except Exception:
                 crs_proj = None; tf_fwd = None; tf_inv = None
-    elif args.griddesc and args.gridname:
-        # For auto mode: if gridname provided, use grid projection
+    elif args.griddesc and args.gridname and args.pltyp != 'county':
+        # For auto mode: if gridname provided, use grid projection (unless county plot)
         try:
             from data_processing import extract_grid
             coord_params, _ = extract_grid(args.griddesc, args.gridname)
@@ -965,6 +1057,15 @@ def _batch_mode(args):
             crs_proj = None; tf_fwd = None; tf_inv = None
     
     # If crs_proj is None we stay in geographic (EPSG:4326) space
+    # but we initialize identity transformers to allow graticule drawing via _draw_graticule
+    if crs_proj is None:
+        try:
+             crs_proj = pyproj.CRS.from_epsg(4326)
+             tf_fwd = pyproj.Transformer.from_crs(crs_proj, crs_proj, always_xy=True)
+             tf_inv = pyproj.Transformer.from_crs(crs_proj, crs_proj, always_xy=True)
+        except Exception:
+             crs_proj = None; tf_fwd = None; tf_inv = None
+
     try:
         merged_plot = merged.to_crs(crs_proj) if (crs_proj is not None and getattr(merged, 'crs', None) is not None) else merged
     except Exception:
@@ -973,9 +1074,9 @@ def _batch_mode(args):
         batch_src = emis_df.attrs.get('source_name')
     except Exception:
         batch_src = None
-    to_plot = pollutants if args.batch_all else requested
+    to_plot = requested
     if not to_plot:
-        logging.info("Specify --pollutant or --batch-all in batch mode. Available:")
+        logging.info("Specify --pollutant in batch mode. Available:")
         for p in pollutants:
             logging.info("  %s", p)
         return _finish(0)
@@ -994,12 +1095,17 @@ def _batch_mode(args):
     }
     worker_count = 1
     requested_workers = getattr(args, 'workers', 0)
-    if requested_workers > 0:
+    
+    # Auto-detect if workers is 0
+    if requested_workers <= 0:
+        if _PLOT_MP_CONTEXT is not None and len(to_plot) >= 1:
+             # Default to aggressive parallel usage
+             worker_count = _resolve_worker_count(len(to_plot))
+        else:
+             worker_count = 1
+    else:
         worker_count = requested_workers
-    elif _PLOT_MP_CONTEXT is not None and len(to_plot) > 1:
-        resolved = _resolve_worker_count(len(to_plot))
-        if resolved > 1:
-            worker_count = resolved
+        
     if worker_count <= 1:
         for pol in to_plot:
             _, out_path = _render_single_pollutant(pol, context)

@@ -1,6 +1,20 @@
 """
 GUI components for SMKPLOT.
 
+##############################################################################
+# STRICT PARAMETER SOURCE RULES
+# 1. Grid Generation Consistency:
+#    - All grid generation (NetCDF or GRIDDESC) MUST produce identical GeoDataFrames.
+#    - All grid generation MUST use the same identical function.
+#    - REQUIRED CRS: EPSG:4326 (WGS84 Lat/Lon).
+#    - REQUIRED COLUMNS: ROW (int), COL (int), GRID_RC (str "R_C"), geometry (Polygon).
+#
+# 2. Parameter Source Determination:
+#    - NetCDF/Inline Files: MUST use internal Global Attributes (XORIG, XCELL, etc).
+#      - DO NOT use external GRIDDESC files for NetCDF inputs.
+#    - SMOKE Reports / FF10: MUST use external GRIDDESC file + Grid Name.
+##############################################################################
+
 This module implements the Tkinter-based graphical user interface for the tool.
 Features include:
 - Interactive selection of input files (Emissions, Shapefiles, GRIDDESC).
@@ -31,11 +45,12 @@ from shapely.geometry import Polygon
 
 from config import (
     US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
-    DEFAULT_ONLINE_COUNTIES_URL, load_settings, save_settings
+    DEFAULT_ONLINE_COUNTIES_URL
 )
+from utils import load_settings, save_settings
 from data_processing import (
     _normalize_delim, read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
-    merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips
+    merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
 )
 from plotting import _plot_crs, _draw_graticule
 
@@ -128,6 +143,10 @@ class EmissionGUI:
         if not self.filter_values:
             self.filter_values = None
 
+        # NetCDF Dimension Config (from CLI/JSON)
+        self.ncf_tdim = getattr(cli_args, 'ncf_tdim', 'avg') if cli_args else 'avg'
+        self.ncf_zdim = getattr(cli_args, 'ncf_zdim', '0') if cli_args else '0'
+
         # GUI state for delimiter selection (auto/comma/tab/pipe/space/other)
         self.delim_var: Optional[tk.StringVar] = None
         self.custom_delim_var: Optional[tk.StringVar] = None
@@ -162,7 +181,6 @@ class EmissionGUI:
         # Plot-by mode: auto, county, grid
         self.plot_by_var: Optional[tk.StringVar] = None
         # SCC selection dropdown (enabled only when SCC/SCC Description exist)
-        self.scc_keyword_var: Optional[tk.StringVar] = None  # legacy (unused for filtering now)
         self.scc_select_var: Optional[tk.StringVar] = None
         self._scc_display_to_code: Dict[str, str] = {}
         self._has_scc_cols: bool = False
@@ -228,32 +246,18 @@ class EmissionGUI:
         #self._on_delim_change() # Ensure custom delim entry visibility is correct
 
         # Restore last inputpath path but defer loading until user requests it
-        self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) if cli_args else None or self._json_arguments.get('filepath', None) or last_paths.get('inputpath')
-        self.reimport_requested = bool(getattr(cli_args, 'reimport', False)) if cli_args else self._json_arguments.get('reimport', False)
-        if self.reimport_requested:
-            cli_imported = getattr(cli_args, 'imported_file', None) if cli_args else None
-            raw_imported = cli_imported or self._json_arguments.get('imported_file')
-            
-            if isinstance(raw_imported, (list, tuple)):
-                self.imported_paths = [str(p) for p in raw_imported if p]
-            elif raw_imported:
-                self.imported_paths = [str(raw_imported)]
-            else:
-                self.imported_paths = []
+        self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) if cli_args else None or self._json_arguments.get('filepath', None)
 
-            if not self.imported_paths:
-                raise ValueError(f'Reimport specified but no imported_file provided. Aborting.')
+        # Fallback to last used path
+        if not self.inputfile_path:
+            self.inputfile_path = last_paths.get('inputpath')
 
-            for p in self.imported_paths:
-                if not os.path.exists(p):
-                    raise ValueError(f'Reimport specified but could not locate imported_file {p}. Aborting.')
-            
-            if len(self.imported_paths) > 1:
-                self.inputfile_path = "; ".join(self.imported_paths)
-            else:
-                self.inputfile_path = self.imported_paths[0]
-
-        if self.inputfile_path and (";" in self.inputfile_path or os.path.exists(self.inputfile_path)):
+        # Normalize inputfile_path to string (handle list for multiple files)
+        if isinstance(self.inputfile_path, (list, tuple)):
+            filtered_paths = [str(p) for p in self.inputfile_path if p]
+            self.inputfile_path = "; ".join(filtered_paths)
+        
+        if self.inputfile_path and (";" in self.inputfile_path or os.path.exists(self.inputfile_path.split(';')[0].strip())):
             try:
                 self.emis_entry.delete(0, tk.END)
                 self.emis_entry.insert(0, self.inputfile_path)
@@ -308,15 +312,48 @@ class EmissionGUI:
                 self._notify('WARNING', 'Online Counties Not Loaded', f'Could not load default online counties: {e}')
 
         # Load optional overlay shapefile
-        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None)
-        if self.overlay_path and os.path.exists(self.overlay_path):
-            self.load_overlay()
+        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None) or last_paths.get('overlay')
+
+        # Load filtered_by_overlay setting
+        val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
+        if val_filter is None:
+             val_filter = self._json_arguments.get('filtered_by_overlay', None)
+        if val_filter is None:
+             val_filter = last_paths.get('filtered_by_overlay', False)
+        
+        # Normalize to string or boolean (preserving modes like 'intersect', 'within')
+        if isinstance(val_filter, str):
+             s_filter = val_filter.lower()
+             if s_filter in ('true', 'yes', 'on'):
+                 self.initial_filter_overlay = 'intersect' # Default to intersect if True/flag present
+             elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
+                 self.initial_filter_overlay = 'False'
+             else:
+                 self.initial_filter_overlay = val_filter
+        elif isinstance(val_filter, bool):
+             self.initial_filter_overlay = 'intersect' if val_filter else 'False'
         else:
-            # Fall back to online counties
-            try:
-                self.use_online_counties()
-            except Exception as e:
-                self._notify('WARNING', 'Online Counties Not Loaded', f'Could not load default online counties: {e}')
+             self.initial_filter_overlay = 'False'
+
+        if self.overlay_path:
+             # Handle multiple paths (list or valid single path)
+             valid_ov = False
+             if isinstance(self.overlay_path, str) and os.path.exists(self.overlay_path):
+                 valid_ov = True
+                 final_str = self.overlay_path
+             elif isinstance(self.overlay_path, list):
+                 # Just check the first one for existance logic or join
+                 if self.overlay_path:
+                     valid_ov = True
+                     final_str = ";".join([str(p) for p in self.overlay_path])
+             
+             if valid_ov:
+                 try:
+                     self.overlay_entry.delete(0, tk.END)
+                     self.overlay_entry.insert(0, final_str)
+                 except Exception:
+                     pass
+                 self.load_overlay()
 
         
 
@@ -531,11 +568,27 @@ class EmissionGUI:
                  if val: current_counties = val
             except Exception: pass
 
+        current_overlay = getattr(self, 'overlay_path', None)
+        if hasattr(self, 'overlay_entry'):
+            try:
+                 val = self.overlay_entry.get().strip()
+                 if val: current_overlay = val
+            except Exception: pass
+            
+        current_filter_overlay = False
+        if hasattr(self, 'filter_overlay_var'):
+             try:
+                 val = self.filter_overlay_var.get()
+                 current_filter_overlay = (str(val).lower() == 'true')
+             except Exception: pass
+
         settings = {
             'last_paths': {
                 'inputpath': current_input or '',
                 'griddesc': current_griddesc or '',
                 'counties': current_counties or '',
+                'overlay': current_overlay or '',
+                'filtered_by_overlay': current_filter_overlay,
             },
             'ui_state': {
                 'scale': self.scale_var.get() if self.scale_var else 'linear',
@@ -706,9 +759,11 @@ class EmissionGUI:
         self.root.rowconfigure(0, weight=1)
 
         # SMOKE report + delimiter controls
-        ttk.Label(frm, text="SMOKE Report / FF10 Input:").grid(row=0, column=0, sticky='w')
+        ttk.Label(frm, text="SMKREPORT/FF10/NETCDF Input:").grid(row=0, column=0, sticky='w')
         self.emis_entry = ttk.Entry(frm, width=self._w_chars(60))
         self.emis_entry.grid(row=0, column=1, sticky='we')
+        self.emis_entry.bind('<Return>', self._on_emissions_entry_change)
+        self.emis_entry.bind('<FocusOut>', self._on_emissions_entry_change)
         ttk.Button(frm, text="Browse", command=self.browse_inputfile).grid(row=0, column=2, padx=4)
         # Delimiter state (widgets will be placed in button row)
         self.delim_var = tk.StringVar()
@@ -732,27 +787,45 @@ class EmissionGUI:
         ttk.Label(frm, text="Counties Shapefile / Zip / URL:").grid(row=1, column=0, sticky='w')
         self.county_entry = ttk.Entry(frm, width=self._w_chars(60))
         self.county_entry.grid(row=1, column=1, sticky='we')
+        self.county_entry.bind('<Return>', self._on_counties_entry_change)
+        self.county_entry.bind('<FocusOut>', self._on_counties_entry_change)
         ttk.Button(frm, text="Browse", command=self.browse_shpfile).grid(row=1, column=2, padx=4)
         # Online year selector and button
         self.counties_year_var = tk.StringVar(value='2020')
         ttk.OptionMenu(frm, self.counties_year_var, '2020', '2020', '2023', command=lambda *_: self.use_online_counties()).grid(row=1, column=3, sticky='we')
 
+        # Overlay Shapefile (Optional)
+        ttk.Label(frm, text="Overlay Shapefile (optional):").grid(row=2, column=0, sticky='w')
+        self.overlay_entry = ttk.Entry(frm, width=self._w_chars(60))
+        self.overlay_entry.grid(row=2, column=1, sticky='we')
+        self.overlay_entry.bind('<Return>', self._on_overlay_entry_change)
+        self.overlay_entry.bind('<FocusOut>', self._on_overlay_entry_change)
+        ttk.Button(frm, text="Browse", command=self.browse_overlay_shpfile).grid(row=2, column=2, padx=4)
+
+        # Filter by Overlay Shapefile
+        self.filter_overlay_var = tk.StringVar(value=str(getattr(self, 'initial_filter_overlay', 'False')))
+        ttk.Label(frm, text="Filter by Overlay:").grid(row=2, column=3, sticky='e', padx=(10, 2))
+        self.filter_overlay_menu = ttk.OptionMenu(frm, self.filter_overlay_var, self.filter_overlay_var.get(), "False", "clipped", "intersect", "within")
+        self.filter_overlay_menu.grid(row=2, column=4, sticky='we')
+
         # GRIDDESC file
-        ttk.Label(frm, text="GRIDDESC File (optional):").grid(row=2, column=0, sticky='w')
+        ttk.Label(frm, text="GRIDDESC File (optional):").grid(row=3, column=0, sticky='w')
         self.griddesc_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.griddesc_entry.grid(row=2, column=1, sticky='we')
-        ttk.Button(frm, text="Browse", command=self.browse_griddesc).grid(row=2, column=2, padx=4)
+        self.griddesc_entry.grid(row=3, column=1, sticky='we')
+        self.griddesc_entry.bind('<Return>', self._on_griddesc_entry_change)
+        self.griddesc_entry.bind('<FocusOut>', self._on_griddesc_entry_change)
+        ttk.Button(frm, text="Browse", command=self.browse_griddesc).grid(row=3, column=2, padx=4)
 
         # Grid Name selector
         self.grid_name_var = tk.StringVar()
         self.grid_name_menu = ttk.OptionMenu(frm, self.grid_name_var, "Select Grid", command=lambda *_: self.load_grid_shape())
-        self.grid_name_menu.grid(row=2, column=3, sticky='we')
+        self.grid_name_menu.grid(row=3, column=3, sticky='we')
 
         # Pollutant selector
-        ttk.Label(frm, text="Pollutant:").grid(row=3, column=0, sticky='w')
+        ttk.Label(frm, text="Pollutant:").grid(row=4, column=0, sticky='w')
         self.pollutant_var = tk.StringVar()
         self.pollutant_menu = ttk.OptionMenu(frm, self.pollutant_var, None)
-        self.pollutant_menu.grid(row=3, column=1, sticky='we')
+        self.pollutant_menu.grid(row=4, column=1, sticky='we')
 
         # (Scale and Zoom moved to button row to avoid horizontal expansion)
         # Custom bins state (widgets placed later in button row)
@@ -768,7 +841,7 @@ class EmissionGUI:
 
         # Buttons
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=4, column=0, columnspan=4, pady=6, sticky='we')
+        btn_frame.grid(row=5, column=0, columnspan=4, pady=6, sticky='we')
         # Column stretching: let the bins entry grow
         for c in (11,):
             try:
@@ -886,11 +959,11 @@ class EmissionGUI:
 
         # Text preview widget (persistent)
         self.preview = tk.Text(frm, height=10, width=90)
-        self.preview.grid(row=5, column=0, columnspan=4, pady=4, sticky='nsew')
+        self.preview.grid(row=6, column=0, columnspan=4, pady=4, sticky='nsew')
 
-        # Embedded plot frame (row 6) - map will display here (pop-out windows draw their own figs)
+        # Embedded plot frame (row 7) - map will display here (pop-out windows draw their own figs)
         self.plot_frame = ttk.Frame(frm)
-        self.plot_frame.grid(row=6, column=0, columnspan=4, sticky='nsew', pady=(4, 0))
+        self.plot_frame.grid(row=7, column=0, columnspan=4, sticky='nsew', pady=(4, 0))
 
         if USING_TK:
             try:
@@ -900,13 +973,13 @@ class EmissionGUI:
                 self.status_var = None
             if self.status_var is not None:
                 self.status_label = ttk.Label(frm, textvariable=self.status_var, relief='sunken', anchor='w')
-                self.status_label.grid(row=7, column=0, columnspan=4, sticky='we', pady=(4, 0))
+                self.status_label.grid(row=8, column=0, columnspan=4, sticky='we', pady=(4, 0))
 
         # Configure stretch rows/columns for the main frame
         try:
-            frm.rowconfigure(5, weight=1)   # text preview
-            frm.rowconfigure(6, weight=3)   # plot area larger
-            frm.rowconfigure(7, weight=0)
+            frm.rowconfigure(6, weight=1)   # text preview
+            frm.rowconfigure(7, weight=3)   # plot area larger
+            frm.rowconfigure(8, weight=0)
             frm.columnconfigure(1, weight=1)
         except Exception:
             pass
@@ -1051,14 +1124,26 @@ class EmissionGUI:
         self.counties_path = path
         self.load_shpfile()
 
+    def browse_overlay_shpfile(self):
+        init_dir = DEFAULT_SHPFILE_INITIALDIR if os.path.isdir(DEFAULT_SHPFILE_INITIALDIR) else None
+        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Shapefile / Geopackage / Zip", "*.shp *.gpkg *.zip"), ("All", "*.*")])
+        if not path:
+            return
+        self.overlay_entry.delete(0, tk.END)
+        self.overlay_entry.insert(0, path)
+        self.overlay_path = path
+        self.load_overlay()
+
     def use_online_counties(self):
         """Set and load the default online US counties shapefile. User selection can override later."""
         try:
             year = self.counties_year_var.get()
         except Exception:
             year = '2020'
-        from config import _online_counties_url
-        url = _online_counties_url(year) if year else DEFAULT_ONLINE_COUNTIES_URL
+        if year:
+            url = f"https://www2.census.gov/geo/tiger/GENZ{year}/shp/cb_{year}_us_county_500k.zip"        
+        else:
+            url = DEFAULT_ONLINE_COUNTIES_URL
         self.counties_path = url
         try:
             self.county_entry.delete(0, tk.END)
@@ -1066,6 +1151,29 @@ class EmissionGUI:
         except Exception:
             pass
         self.load_shpfile()
+
+    def _on_emissions_entry_change(self, event=None):
+        path = self.emis_entry.get().strip()
+        if path and path != getattr(self, 'inputfile_path', None):
+            self.load_inputfile(show_preview=False)
+
+    def _on_counties_entry_change(self, event=None):
+        path = self.county_entry.get().strip()
+        if path and path != getattr(self, 'counties_path', None):
+            self.counties_path = path
+            self.load_shpfile()
+
+    def _on_overlay_entry_change(self, event=None):
+        path = self.overlay_entry.get().strip()
+        if path and path != getattr(self, 'overlay_path', None):
+            self.overlay_path = path
+            self.load_overlay()
+
+    def _on_griddesc_entry_change(self, event=None):
+        path = self.griddesc_entry.get().strip()
+        if path and path != getattr(self, 'griddesc_path', None):
+            self.griddesc_path = path
+            self.load_griddesc()
 
     def _current_delimiter(self) -> Optional[str]:
         """Return the effective delimiter based on GUI selections.
@@ -1290,91 +1398,7 @@ class EmissionGUI:
         self.root.after(0, _reset_ncf_ui)
 
         try:
-            if self.reimport_requested:
-
-                try:
-                    if hasattr(self, 'imported_paths') and self.imported_paths:
-                        dfs = []
-                        for p in self.imported_paths:
-                            dfs.append(pd.read_csv(p))
-                        emis_df = pd.concat(dfs, ignore_index=True)
-
-                        # Apply filtering BEFORE aggregation
-                        if self.filter_col and (self.filter_start is not None or self.filter_end is not None):
-                            try:
-                                emis_df = filter_dataframe_by_range(emis_df, self.filter_col, self.filter_start, self.filter_end)
-                            except Exception:
-                                self.root.after(0, lambda: self._notify('WARNING', 'Filter Range Failed', 'Could not apply range filter from JSON snapshot.', popup=False))
-                        
-                        if self.filter_col and self.filter_values:
-                            try:
-                                emis_df = filter_dataframe_by_values(emis_df, self.filter_col, self.filter_values)
-                            except Exception:
-                                self.root.after(0, lambda: self._notify('WARNING', 'Filter Values Failed', 'Could not apply discrete filter from JSON snapshot.', popup=False))
-
-                        # Ensure FIPS column exists for aggregation
-                        try:
-                            emis_df = get_emis_fips(emis_df)
-                        except Exception:
-                            pass
-
-                        # Aggregation logic
-                        group_keys = []
-                        if 'FIPS' in emis_df.columns:
-                            group_keys.append('FIPS')
-                        elif 'GRID_RC' in emis_df.columns:
-                            group_keys.append('GRID_RC')
-                        
-                        if 'country_cd' in emis_df.columns:
-                            group_keys.append('country_cd')
-                        
-                        if group_keys:
-                            if hasattr(emis_df, 'attrs'):
-                                emis_df.attrs.pop('_detected_pollutants', None)
-                            
-                            pols = detect_pollutants(emis_df)
-                            if pols:
-                                agg_dict = {p: 'sum' for p in pols}
-                                for c in emis_df.columns:
-                                    if c not in group_keys and c not in pols:
-                                        agg_dict[c] = 'first'
-                                
-                                emis_df = emis_df.groupby(group_keys, as_index=False).agg(agg_dict)
-                    else:
-                        emis_df = pd.read_csv(self.inputfile_path)
-                except Exception as exc:
-                    err = exc
-                    self.root.after(0, lambda: self._notify('ERROR', 'Reimport Load Error', f"Failed to load processed emissions data: {err}", exc=err))
-                    return
-
-                attrs = self._json_arguments.get('imported_attrs')
-                if isinstance(attrs, dict):
-                    for key, value in attrs.items():
-                        try:
-                            emis_df.attrs[key] = value
-                        except Exception:
-                            pass
-
-                emis_df = get_emis_fips(emis_df)
-                #raw_df = emis_df.copy(deep=True)
-
-                filtered = emis_df
-                # Filtering already applied before aggregation
-                
-                self.emissions_df = filtered
-                self.raw_df = self.emissions_df.copy(deep=True)
-                self._ff10_grid_ready = False
-
-                # Pre-compute SCC data in thread
-                scc_data = self._compute_scc_data(self.raw_df)
-
-                msg_paths = self.imported_paths if (hasattr(self, 'imported_paths') and self.imported_paths) else [self.inputfile_path]
-                msg_str = ", ".join(os.path.basename(p) for p in msg_paths)
-                self.root.after(0, lambda: self._loader_notify('INFO', f"Reimported processed emissions file(s): {msg_str}"))
-                self.reimport_requested = False
-                self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
-
-            else:
+            if True: # Unified loading path (reimport deprecated)
                 try:
                     # Thread-safe notify wrapper
                     def safe_notify(level, message):
@@ -1384,6 +1408,37 @@ class EmissionGUI:
                     f_input = self.inputfile_path
                     if f_input and ";" in f_input:
                         f_input = [x.strip() for x in f_input.split(";") if x.strip()]
+
+                    # Prepare NetCDF Params
+                    ncf_params = {}
+                    # Time Dimension
+                    t_arg = getattr(self, 'ncf_tdim', 'avg')
+                    if str(t_arg).isdigit():
+                        ncf_params['tstep_idx'] = int(t_arg)
+                        ncf_params['tstep_op'] = 'select'
+                    else:
+                        op = str(t_arg).lower()
+                        if op in ('avg', 'mean', 'average'): ncf_params['tstep_op'] = 'mean'
+                        elif op in ('sum', 'total'): ncf_params['tstep_op'] = 'sum'
+                        elif op in ('max', 'maximum'): ncf_params['tstep_op'] = 'max'
+                        elif op in ('min', 'minimum'): ncf_params['tstep_op'] = 'min'
+                        else: ncf_params['tstep_op'] = 'mean'
+
+                    # Layer Dimension
+                    z_arg = getattr(self, 'ncf_zdim', '0')
+                    if str(z_arg).isdigit():
+                        ncf_params['layer_idx'] = int(z_arg)
+                        ncf_params['layer_op'] = 'select'
+                    else:
+                        op = str(z_arg).lower()
+                        ncf_params['layer_idx'] = None
+                        if op in ('avg', 'mean', 'average'): ncf_params['layer_op'] = 'mean'
+                        elif op in ('sum', 'total'): ncf_params['layer_op'] = 'sum'
+                        elif op in ('max', 'maximum'): ncf_params['layer_op'] = 'max'
+                        elif op in ('min', 'minimum'): ncf_params['layer_op'] = 'min'
+                        else: 
+                             ncf_params['layer_idx'] = 0
+                             ncf_params['layer_op'] = 'select'
 
                     emissions_df, raw_df = read_inputfile(
                         f_input,
@@ -1397,7 +1452,28 @@ class EmissionGUI:
                         flter_end=self.filter_end,
                         flter_val=self.filter_values,
                         notify=safe_notify,
+                        ncf_params=ncf_params
                     )
+
+                    # Build FIPS to ensure compatibility and consistent attributes
+                    if isinstance(emissions_df, pd.DataFrame):
+                         try:
+                             is_ncf = isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc'))
+                             emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
+                         except ValueError:
+                             # Ignore if FIPS columns not found (e.g. gridded data without region_cd)
+                             pass
+                         except Exception as e:
+                             safe_notify('WARNING', f"Error building FIPS: {e}")
+                    
+                    # Apply units_map from JSON arguments if available (overrides input data)
+                    units_map_arg = self._json_arguments.get('units_map')
+                    if isinstance(units_map_arg, dict) and isinstance(emissions_df, pd.DataFrame):
+                         existing_map = emissions_df.attrs.get('units_map', {})
+                         if not isinstance(existing_map, dict): existing_map = {}
+                         for k, v in units_map_arg.items():
+                             existing_map[k] = v
+                         emissions_df.attrs['units_map'] = existing_map
 
                     # NCF Auto-Grid Logic
                     if isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc')):
@@ -1444,7 +1520,7 @@ class EmissionGUI:
                                 if target_ts and target_ts in ts_vals:
                                     self.ncf_tstep_menu.set(target_ts)
                                 elif self.ncf_tstep_var.get() not in ts_vals:
-                                     self.ncf_tstep_menu.set(ts_vals[0])
+                                     self.ncf_tstep_menu.set(ts_vals[1])
 
                             self.root.after(0, _update_ncf_ui)
 
@@ -1466,7 +1542,7 @@ class EmissionGUI:
                                  l_op = 'select'
                             
                             ts_idx = None
-                            ts_op = 'sum'
+                            ts_op = 'mean'
                             if 'Sum All' in curr_ts_str:
                                 ts_idx = None
                                 ts_op = 'sum'
@@ -1499,7 +1575,7 @@ class EmissionGUI:
                             # Re-read emissions with specific params
                             # Note: read_inputfile called read_ncf_emissions default inside data_processing.
                             # We need to re-call it here to apply params, updating emissions_df
-                            msg = f"Reading NetCDF (Layer: {curr_lay_str or 'Layer 1'}, Time: {curr_ts_str or 'Sum'})..."
+                            msg = f"Reading NetCDF (Layer: {curr_lay_str or 'Layer 1'}, Time: {curr_ts_str or 'Average'})..."
                             safe_notify('INFO', msg)
                             emissions_df = read_ncf_emissions(f_input, layer_idx=l_idx, tstep_idx=ts_idx, layer_op=l_op, tstep_op=ts_op)
                             # Update raw_df too for consistency
@@ -1695,7 +1771,47 @@ class EmissionGUI:
 
     def load_overlay(self):
         try:
-            self.overlay_gdf = read_shpfile(self.overlay_path, False)
+             # Handle multiple files (semicolon separated)
+             ov_paths = self.overlay_path
+             if not ov_paths:
+                 return
+             
+             file_list = []
+             if isinstance(ov_paths, str):
+                 file_list = [p.strip() for p in ov_paths.split(';') if p.strip()]
+             elif isinstance(ov_paths, (list, tuple)):
+                 for item in ov_paths:
+                     if isinstance(item, str):
+                         file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                     else:
+                         file_list.append(str(item))
+             else:
+                 file_list = [str(ov_paths)]
+
+             loaded_parts = []
+             for fpath in file_list:
+                 try:
+                     part = read_shpfile(fpath, False)
+                     if part is not None and not part.empty:
+                         loaded_parts.append(part)
+                 except Exception:
+                     self._notify("WARNING", "Overlay Load Warning", f"Failed to load overlay part: {fpath}")
+             
+             if not loaded_parts:
+                 self.overlay_gdf = None
+             elif len(loaded_parts) == 1:
+                 self.overlay_gdf = loaded_parts[0]
+             else:
+                 # Combine multiple layers
+                 target = loaded_parts[0]
+                 target_crs = target.crs
+                 final_list = [target]
+                 for other in loaded_parts[1:]:
+                     if target_crs and other.crs and other.crs != target_crs:
+                         other = other.to_crs(target_crs)
+                     final_list.append(other)
+                 self.overlay_gdf = pd.concat(final_list, ignore_index=True)
+                 
         except Exception as e:
             self._notify('ERROR', 'Overlay Shapefile Load Error', str(e), exc=e)
             return
@@ -1704,11 +1820,11 @@ class EmissionGUI:
         if self.emissions_df is None:
             return None
 
-        def _do_notify(level, title, msg, exc=None):
+        def _do_notify(level, title, msg, exc=None, **kwargs):
             if notify:
-                notify(level, title, msg, exc)
+                notify(level, title, msg, exc, **kwargs)
             else:
-                self._notify(level, title, msg, exc=exc)
+                self._notify(level, title, msg, exc=exc, **kwargs)
 
         mode = (plot_by_mode if plot_by_mode is not None else (self.plot_by_var.get().lower() if self.plot_by_var else 'auto'))
         base_gdf: Optional[gpd.GeoDataFrame] = None
@@ -1732,7 +1848,7 @@ class EmissionGUI:
         if mode == 'grid':
             if self.grid_gdf is None:
                 _do_notify('WARNING', 'Grid not loaded', 'Select a GRIDDESC and Grid Name first to build the grid geometry.')
-                return None
+                raise ValueError("Handled")
             self._ensure_ff10_grid_mapping(notify_success=False)
             base_gdf = self.grid_gdf
             merge_on = 'GRID_RC'
@@ -1740,7 +1856,7 @@ class EmissionGUI:
         elif mode == 'county':
             if self.counties_gdf is None:
                 _do_notify('WARNING', 'Counties not loaded', 'Load a counties shapefile or use the online counties option.')
-                return None
+                raise ValueError("Handled")
             base_gdf = self.counties_gdf
             merge_on = 'FIPS'
             geometry_tag = 'county'
@@ -1760,7 +1876,7 @@ class EmissionGUI:
                 geometry_tag = 'county'
             if base_gdf is None:
                 _do_notify('WARNING', 'No suitable geometry', 'Could not find a suitable shapefile (Counties or Grid) for the loaded emissions data.')
-                return None
+                raise ValueError("Handled")
 
         if merge_on and isinstance(base_gdf, gpd.GeoDataFrame):
             if merge_on not in base_gdf.columns:
@@ -1772,7 +1888,7 @@ class EmissionGUI:
                         pass
                 else:
                     _do_notify('WARNING', 'Geometry Missing Column', f"Selected geometry layer lacks '{merge_on}' column.")
-                    return None
+                    raise ValueError("Handled")
 
         pol_tuple = tuple(self.pollutants or [])
         if not pol_tuple:
@@ -1790,7 +1906,10 @@ class EmissionGUI:
             sel_code if use_scc_filter else '',
             pol_tuple,
             getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
-            getattr(self, 'fill_nan_arg', None)
+            getattr(self, 'fill_nan_arg', None),
+            # Filter overlay state
+            getattr(self, 'filter_overlay_var', None) and self.filter_overlay_var.get(),
+            id(self.overlay_gdf) if getattr(self, 'overlay_gdf', None) is not None else 0
         )
         cached = self._merged_cache.get(cache_key)
         if cached is not None:
@@ -1864,13 +1983,32 @@ class EmissionGUI:
 
         if merge_on not in emis_for_merge.columns:
             if merge_on == 'GRID_RC':
-                _do_notify('WARNING', 'No GRID_RC in data', 'Plot by Grid requires emissions with X/Y Cell (GRID_RC).')
+                # Enhanced Warning Diagnostics
+                msg_lines = ["Plot by Grid requires 'GRID_RC' column (implied X/Y logic)."]
+                
+                # Check for presence of row/col columns
+                cols_low = [c.lower() for c in emis_for_merge.columns]
+                has_row = any(x in cols_low for x in ['row', 'r', 'y', 'ycell', 'y_cell'])
+                has_col = any(x in cols_low for x in ['col', 'c', 'x', 'xcell', 'x_cell'])
+                
+                if has_row and has_col:
+                    msg_lines.append("Found potential Row/Col columns, but GRID_RC was not generated.")
+                    msg_lines.append("Check that your GRIDDESC file is loaded and the correct Grid Name is selected.")
+                else:
+                    msg_lines.append("Input data appears to be missing 'row'/'col' or 'x'/'y' identifier columns.")
+                
+                if self.grid_gdf is None or self.grid_gdf.empty:
+                    msg_lines.append("CRITICAL: No Grid Definition loaded. You must load a GRIDDESC file.")
+
+                _do_notify('WARNING', 'No GRID_RC in data', "\n".join(msg_lines))
             else:
                 if source_type in ('ff10_point', 'ff10_nonpoint'):
                     _do_notify('WARNING', 'No region_cd in data', 'FF10 data requires region_cd for county plots.')
                 else:
                     _do_notify('WARNING', 'No FIPS in data', 'Plot by County requires emissions with FIPS codes.')
-            return None
+            
+            # Signal to caller that warning is handled to avoid generic "Missing Data" msg
+            raise ValueError("Handled")
 
         try:
             merged, prepared_emis = merge_emissions_with_geometry(
@@ -1925,6 +2063,30 @@ class EmissionGUI:
                             merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_val)
         except Exception as e:
             print(f"Error filling NaNs in merged geometry: {e}")
+
+        # Filter by Overlay Shapefile if enabled
+        try:
+             filter_mode = None
+             if getattr(self, 'filter_overlay_var', None):
+                  val = self.filter_overlay_var.get()
+                  if isinstance(val, str):
+                      s = val.strip().lower()
+                      if s not in ('false', 'none', 'off', 'null', ''):
+                           filter_mode = 'intersect' if s == 'true' else s
+                  elif isinstance(val, bool) and val:
+                      filter_mode = 'intersect'
+             
+             ov_gdf = getattr(self, 'overlay_gdf', None)
+             if filter_mode and ov_gdf is not None and not ov_gdf.empty:
+                 _do_notify('INFO', 'Filtering', f'Filtering data by overlay ({filter_mode})...', popup=False)
+                 
+                 # apply_spatial_filter handles CRS conversion and logic
+                 try:
+                     merged = apply_spatial_filter(merged, ov_gdf, filter_mode)
+                 except Exception as e:
+                     _do_notify('WARNING', 'Filter Failed', f"Could not filter by overlay ({filter_mode}): {e}")
+        except Exception as e:
+             _do_notify('WARNING', 'Filter Logic Error', str(e))
 
         try:
             cache_df = merged.copy()
@@ -2246,15 +2408,22 @@ class EmissionGUI:
     def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info):
         try:
             # Thread-safe notify wrapper
-            def safe_notify(level, title, msg, exc=None):
-                self.root.after(0, lambda: self._notify(level, title, msg, exc=exc))
+            def safe_notify(level, title, msg, exc=None, **kwargs):
+                self.root.after(0, lambda: self._notify(level, title, msg, exc=exc, **kwargs))
 
-            merged = self._merged(
-                plot_by_mode=plot_by_mode, 
-                scc_selection=scc_selection, 
-                scc_code_map=scc_code_map,
-                notify=safe_notify
-            )
+            try:
+                merged = self._merged(
+                    plot_by_mode=plot_by_mode, 
+                    scc_selection=scc_selection, 
+                    scc_code_map=scc_code_map,
+                    notify=safe_notify
+                )
+            except ValueError as ve:
+                if str(ve) == "Handled":
+                     # Diagnostic notification already sent
+                     self.root.after(0, self._enable_plot_btn)
+                     return
+                raise ve
             
             if merged is None:
                 self.root.after(0, lambda: self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.'))
@@ -2265,6 +2434,11 @@ class EmissionGUI:
             plot_crs, tf_fwd, tf_inv = plot_crs_info
             try:
                 merged_plot = merged.to_crs(plot_crs) if plot_crs is not None and getattr(merged, 'crs', None) is not None else merged
+                # Ensure attributes needed for time series (stack_groups_path) are preserved
+                if getattr(merged, 'attrs', None) and getattr(merged_plot, 'attrs', None) is not None:
+                     for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path']:
+                          if k in merged.attrs:
+                               merged_plot.attrs[k] = merged.attrs[k]
             except Exception:
                 merged_plot = merged
             
@@ -2445,6 +2619,24 @@ class EmissionGUI:
 
         # Colormap selection
         cmap_name = self.cmap_var.get() if hasattr(self, 'cmap_var') and self.cmap_var else 'jet'
+
+        # Auto-select boundary colors for contrast
+        # Heuristic: dark-start maps (Jet, Viridis) => Use medium gray for context and bright Cyan for overlay highlight
+        #            light-start maps (Greys, Reds) => Use darker gray for context and Black/Red for overlay
+        _cmap_lower = cmap_name.lower()
+        _dark_cmaps = {'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'}
+        
+        if _cmap_lower in _dark_cmaps:
+             county_color = 'black'    # User requested persistent black
+             overlay_color = 'cyan'    # High contrast highlight (Neon)
+             county_lw = 0.6           # Increased visibility
+             overlay_lw = 0.8
+        else:
+             county_color = 'black'    # User requested persistent black
+             overlay_color = 'black'   # Max contrast on light maps
+             county_lw = 0.6           # Increased visibility
+             overlay_lw = 0.8
+
         try:
             cmap_registry = getattr(matplotlib, 'colormaps', None)
             if cmap_registry is not None:
@@ -2486,20 +2678,50 @@ class EmissionGUI:
         # Plotting
         # Capture axes before plotting so we can detect the newly created colorbar axis
         pre_axes = set(local_fig.axes)
+        
+        # Optimization: Disable edges for large datasets to speed up rendering
+        p_lw = 0.05
+        p_ec = 'black'
+        if len(merged_plot) > 20000:
+             p_lw = 0.0
+             p_ec = 'none'
+             if getattr(self, '_notify', None):
+                  # Update status without popup
+                  try: self.status_var.set("Rendering optimized (edges disabled due to density)...")
+                  except: pass
+        
+        # Ensure uniform collection size for animation (plot all geometries, even if NaN)
+        if pollutant in merged_plot.columns:
+             try:
+                 merged_plot[pollutant] = merged_plot[pollutant].fillna(0.0)
+             except Exception: pass
+
+        # Ensure 'bad' values (NaNs) are plotted in the same collection using set_bad
+        # This prevents GeoPandas from creating a separate collection for missing values,
+        # which is required for the animation updates (set_array) to work correctly on the full grid.
+        try:
+            if not (len(bins) >= 2): # already copied if discrete
+                 cmap = copy.copy(cmap)
+            cmap.set_bad('#f0f0f0', alpha=1.0)
+        except Exception: pass
+
         merged_plot.plot(
             column=pollutant,
             ax=local_ax,
             legend=True,
             cmap=cmap,
-            linewidth=0.05,
-            edgecolor='black',
-            missing_kwds={
-                'color': '#f0f0f0',
-                'edgecolor': 'none',
-                'label': 'No Data'
-            },
-            norm=norm
+            linewidth=p_lw,
+            edgecolor=p_ec,
+            norm=norm,
+            zorder=1
         )
+        # Capture the main data collection immediately to prevent ambiguity later
+        # The last collection added to the axes is the one we just plotted
+        try:
+             self._data_collection = local_ax.collections[-1]
+        except Exception:
+             self._data_collection = None
+
         # Identify newly created colorbar axis (any new axis besides main)
         post_axes = set(local_fig.axes)
         new_axes = [a for a in (post_axes - pre_axes) if a is not local_ax]
@@ -2568,7 +2790,9 @@ class EmissionGUI:
                     overlay = overlay.to_crs(plot_crs) if plot_crs is not None and getattr(overlay, 'crs', None) is not None else overlay
                 except Exception:
                     pass
-                overlay.plot(ax=local_ax, facecolor='none', edgecolor='black', linewidth=0.2, alpha=0.6)
+                # Use a separate axis or just plain plot, but importantly do NOT make it a collection that looks like data
+                # We save it to a variable that is NOT _data_collection
+                overlay.plot(ax=local_ax, facecolor='none', edgecolor=county_color, linewidth=county_lw, alpha=0.6, zorder=20)
             except Exception:
                 pass
         if self.overlay_gdf is not None:
@@ -2578,7 +2802,7 @@ class EmissionGUI:
                     overlay = overlay.to_crs(plot_crs) if plot_crs is not None and getattr(overlay, 'crs', None) is not None else overlay
                 except Exception:
                     pass
-                overlay.plot(ax=local_ax, facecolor='none', edgecolor='black', linewidth=0.5, alpha=0.6)
+                overlay.plot(ax=local_ax, facecolor='none', edgecolor=overlay_color, linewidth=overlay_lw, alpha=0.9, zorder=25)
             except Exception:
                 pass            
         # Optional zoom to data extent (non-NA values)
@@ -2691,7 +2915,7 @@ class EmissionGUI:
 
         # Build title and optional SCC subtitle
         long_name = var_meta.get('long_name')
-        units = var_meta.get('units')
+        units = str(var_meta.get('units', '') or '').strip()
         
         if long_name:
             main_title = long_name
@@ -2713,7 +2937,9 @@ class EmissionGUI:
         try:
             # Check if source is NetCDF
             src_type = attrs.get('source_type')
-            is_ncf_source = (src_type == 'gridded_netcdf') or (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc')))
+            is_ncf_source = (src_type == 'gridded_netcdf') or \
+                            (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
+                            ('proxy_ncf_path' in attrs)
             
             if is_ncf_source:
                  if hasattr(self, 'ncf_layer_var') and self.ncf_layer_var.get():
@@ -2738,13 +2964,302 @@ class EmissionGUI:
         ts_click_handler = None
         try:
              src_type = attrs.get('source_type')
-             is_ncf_source = (src_type == 'gridded_netcdf') or (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc')))
+             is_ncf_source = (src_type == 'gridded_netcdf') or \
+                             (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
+                             ('proxy_ncf_path' in attrs)
         except Exception:
              pass
         
+        # Text artist (Stats) anchored to bottom-left inside axes
+        # Defined early so it can be updated by Time Nav
+        stats_text = local_ax.text(
+            0.01, 0.01,
+            "",
+            transform=local_ax.transAxes,
+            ha='left', va='bottom', fontsize=9, color='#333333', zorder=30,
+            bbox=dict(facecolor='white', edgecolor='#aaaaaa', alpha=0.7, pad=2)
+        )
+
         if is_ncf_source:
              ts_frame = ttk.Frame(plot_container)
              ts_frame.pack(side='top', fill='x', pady=(2, 0))
+
+             # --- Time Stepping Controls ---
+             nav_frame = ttk.Frame(plot_container) 
+             nav_frame.pack(side='top', fill='x', pady=(2, 0))
+             
+             self._t_data_cache = None
+             self._t_idx = 0
+             # stats_box - removed, using stats_text
+             
+             lbl_time = ttk.Label(nav_frame, text="Time: Initial")
+             lbl_time.pack(side='left', padx=5)
+
+             def _ensure_time_data():
+                 if self._t_data_cache is not None: return True
+                 try:
+                     from ncf_processing import get_ncf_animation_data
+                 except ImportError: return False
+                 
+                 # Prepare indices for ALL cells in plot
+                 r_col = 'ROW'; c_col = 'COL'
+                 if 'ROW' not in merged_plot.columns and 'ROW_x' in merged_plot.columns: r_col = 'ROW_x'
+                 if 'COL' not in merged_plot.columns and 'COL_x' in merged_plot.columns: c_col = 'COL_x'
+                 
+                 # 0-based indices
+                 try:
+                     # Robust extraction: fillna(0) ensures no NaNs cause crash during casting
+                     rows = merged_plot[r_col].fillna(0).astype(int) - 1
+                     cols = merged_plot[c_col].fillna(0).astype(int) - 1
+                 except Exception as e:
+                     logging.error(f"Failed to extract grid indices: {e}") 
+                     return False
+                 
+                 # Layer op
+                 l_idx = 0; l_op = 'select'
+                 try: 
+                     lay_setting = self.ncf_layer_var.get()
+                     if "Sum" in lay_setting: l_op = 'sum'
+                     elif "Avg" in lay_setting: l_op = 'mean'
+                     elif "Layer" in lay_setting:
+                         try: l_idx = int(lay_setting.split()[-1]) - 1; l_op = 'select'
+                         except: pass
+                 except: pass
+
+                 self._set_status("Loading full time series...", level="INFO")
+                 
+                 # Determine variables before logging
+                 effective_path = self.inputfile_path
+                 stack_groups_path = None
+                 try:
+                     if hasattr(self.emissions_df, 'attrs'):
+                          if 'proxy_ncf_path' in self.emissions_df.attrs:
+                               effective_path = self.emissions_df.attrs['proxy_ncf_path']
+                          elif 'original_ncf_path' in self.emissions_df.attrs:
+                               effective_path = self.emissions_df.attrs['original_ncf_path']
+                          
+                          if 'stack_groups_path' in self.emissions_df.attrs:
+                               stack_groups_path = self.emissions_df.attrs['stack_groups_path']
+                 except Exception: pass
+
+                 logging.info(f"Loading Animation Data: Path={effective_path}, StackGroups={stack_groups_path}")
+                 if 'proxy_ncf_path' in getattr(self.emissions_df, 'attrs', {}):
+                      logging.info("Using cached gridded file for animation: %s", effective_path)
+
+                 # Capture Current View Scale (Initial Scale)
+                 vmin_init, vmax_init = 0, 1
+                 init_coll = None
+                 try:
+                     if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
+                         init_coll = self._data_collection
+                     else:
+                         for c in local_ax.collections:
+                             if c.get_array() is not None:
+                                 init_coll = c
+                                 break
+                     if init_coll is None and local_ax.collections: init_coll = local_ax.collections[0]
+                     if init_coll:
+                         vmin_init, vmax_init = init_coll.get_clim()
+                 except: pass
+
+                 try:
+                     res = get_ncf_animation_data(
+                         effective_path, 
+                         pollutant, 
+                         rows.tolist(), 
+                         cols.tolist(), 
+                         layer_idx=l_idx, 
+                         layer_op=l_op,
+                         stack_groups_path=stack_groups_path
+                     )
+                     if not res:
+                         logging.error("get_ncf_animation_data returned None. Check logs for details.")
+                         # Don't show popup error, just log it to avoid spamming if user clicks around
+                         # But wait, this is _ensure_time_data, called once on creation.
+                         # If it fails, animation won't work.
+                         self._notify('WARNING', 'Animation Data', 'No time series data could be loaded for this layer.')
+                         return False
+                     
+                     # Add Aggregates
+                     # vals: (T, N)
+                     vals = res['values']
+                     times = res['times']
+                     
+                     # Total All Time (Sum across T)
+                     tot = np.sum(vals, axis=0, keepdims=True)
+                     # Average All Time (Mean across T)
+                     avg = np.mean(vals, axis=0, keepdims=True)
+                     
+                     # Max/Min All Time
+                     mx_agg = np.nanmax(vals, axis=0, keepdims=True)
+                     mn_agg = np.nanmin(vals, axis=0, keepdims=True)
+                     
+                     # Store aggregates separately, do NOT stack into main playback loop
+                     res['tot_val'] = tot.flatten()
+                     res['avg_val'] = avg.flatten()
+                     res['mx_val'] = mx_agg.flatten()
+                     res['mn_val'] = mn_agg.flatten()
+                     
+                     res['values'] = vals
+                     res['times'] = times
+                     
+                     # Calculate scale limits
+                     # Use Global Min/Max across entire time dimension for consistency
+                     # NOTE: 'vals' here is the original time-step data only, excluding Total/Avg aggregates.
+                     
+                     # Determine log scale: Prefer UI setting, then Norm type
+                     is_log = False
+                     try: 
+                        if hasattr(self, 'scale_var') and self.scale_var.get() == 'log':
+                            is_log = True
+                        elif init_coll and isinstance(init_coll.norm, LogNorm):
+                            is_log = True
+                     except: pass
+                     
+                     if is_log:
+                         pos_vals = vals[vals > 0]
+                         res['vmin'] = pos_vals.min() if pos_vals.size > 0 else 0.001
+                         res['vmax'] = vals.max() if vals.size > 0 else 1.0
+                     else:
+                         res['vmin'] = np.nanmin(vals)
+                         res['vmax'] = np.nanmax(vals)
+
+                     self._t_data_cache = res
+
+                     # Sync _t_idx with the current UI selection (only on first load)
+                     try:
+                         # Attempt to align _t_idx with ncf_tstep_var
+                         current_sel = self.ncf_tstep_var.get()
+                         # Since aggregates are now separate, if user selected agg, we should maybe
+                         # initialize plot to that agg? Or just defaut to time step 0?
+                         # Let's default to time step 0 if an aggregate was selected, unless we add
+                         # logic to immediately show the aggregate.
+                         # The user asked to remove them from loop range.
+                         
+                         # If it's a specific time step, match it
+                         found = False
+                         for i, t in enumerate(times):
+                             if str(t).strip() == str(current_sel).strip():
+                                 self._t_idx = i
+                                 found = True
+                                 break
+                             if str(current_sel) in str(t):
+                                 self._t_idx = i
+                                 found = True
+                                 break
+                         
+                         if not found:
+                             self._t_idx = 0
+                             
+                     except Exception:
+                         pass
+
+                     return True
+                 except Exception as e:
+                     self._notify('ERROR', 'Time Data', str(e))
+                     return False
+
+             def _update_view(new_vals, time_lbl):
+                 coll = None
+                 try:
+                     if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
+                         coll = self._data_collection
+                     else:
+                         if self._t_data_cache and 'values' in self._t_data_cache:
+                             expected_size = self._t_data_cache['values'][0].size
+                             for c in local_ax.collections:
+                                 arr = c.get_array()
+                                 if arr is not None and arr.size == expected_size:
+                                     coll = c
+                                     break
+                     if coll is None and local_ax.collections:
+                         c0 = local_ax.collections[0]
+                         if c0.get_array() is not None: coll = c0
+                 except: pass
+
+                 try:
+                     if coll:
+                         coll.set_array(new_vals)
+                         coll.set_clim(self._t_data_cache['vmin'], self._t_data_cache['vmax'])
+                         if hasattr(coll, 'colorbar') and coll.colorbar:
+                             coll.colorbar.update_normal(coll)
+
+                         # Calculate Stats (View Dependent)
+                         try:
+                             x0, x1 = local_ax.get_xlim()
+                             y0, y1 = local_ax.get_ylim()
+                             from shapely.geometry import box
+                             view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                             
+                             visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
+                             
+                             if visible_idxs:
+                                 view_vals = new_vals[visible_idxs]
+                                 filtered = view_vals[~np.isnan(view_vals)]
+                             else:
+                                 filtered = np.array([])
+
+                             u_str = f" ({units})" if units else ""
+                             new_title = f"{pollutant}{u_str}\nTime: {time_lbl}"
+                             local_ax.set_title(new_title)
+
+                             if filtered.size > 0:
+                                 mn = np.min(filtered); mx = np.max(filtered)
+                                 u = np.mean(filtered); s = np.sum(filtered)
+                                 def _fs(v): return f"{v:.4g}"
+                                 stats_txt = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
+                                 if units: stats_txt += f" {units}"
+                                 try: stats_text.set_text(stats_txt)
+                                 except: pass
+                             else:
+                                 try: stats_text.set_text("No Data in View")
+                                 except: pass
+                         except Exception as ex:
+                             print(f"Stats update error: {ex}")
+                         
+                         n_steps = len(self._t_data_cache['times'])
+                         # Update label logic: if custom label (Agg), show it. If index-based, show index.
+                         if "Sum" in time_lbl or "Mean" in time_lbl:
+                             lbl_time.config(text=f"Time: {time_lbl}")
+                         else:
+                             lbl_time.config(text=f"Time: {time_lbl} ({self._t_idx+1}/{n_steps})")
+                         
+                         canvas.draw_idle()
+                 except Exception as e:
+                     print(f"Update failed: {e}")
+
+             def _step_time(delta):
+                 if not _ensure_time_data(): return
+                 n_steps = len(self._t_data_cache['times'])
+                 old_idx = self._t_idx
+                 self._t_idx = (self._t_idx + delta) % n_steps
+                 new_vals = self._t_data_cache['values'][self._t_idx]
+                 time_lbl = self._t_data_cache['times'][self._t_idx]
+                 logging.info(f"Animation Step: {old_idx} -> {self._t_idx}, ValRange=[{new_vals.min():.2f}, {new_vals.max():.2f}]")
+                 _update_view(new_vals, time_lbl)
+            
+             def _show_agg(mode):
+                 if not _ensure_time_data(): return
+                 if mode == 'total':
+                     new_vals = self._t_data_cache['tot_val']
+                     lbl = "Total (Sum)"
+                 elif mode == 'avg':
+                     new_vals = self._t_data_cache['avg_val']
+                     lbl = "Average (Mean)"
+                 elif mode == 'max':
+                     new_vals = self._t_data_cache['mx_val']
+                     lbl = "Max All Time (Grid-wise)"
+                 elif mode == 'min':
+                     new_vals = self._t_data_cache['mn_val']
+                     lbl = "Min All Time (Grid-wise)"
+                 _update_view(new_vals, lbl)
+
+             ttk.Button(nav_frame, text="< Prev", command=lambda: _step_time(-1)).pack(side='left', padx=2)
+             ttk.Button(nav_frame, text="Next >", command=lambda: _step_time(1)).pack(side='left', padx=2)
+             ttk.Button(nav_frame, text="Total", command=lambda: _show_agg('total')).pack(side='left', padx=5)
+             ttk.Button(nav_frame, text="Avg", command=lambda: _show_agg('avg')).pack(side='left', padx=2)
+             ttk.Button(nav_frame, text="Max", command=lambda: _show_agg('max')).pack(side='left', padx=2)
+             ttk.Button(nav_frame, text="Min", command=lambda: _show_agg('min')).pack(side='left', padx=2)
              
              def _on_ts(mode):
                  try:
@@ -2835,15 +3350,29 @@ class EmissionGUI:
                  
                  # 5. Call backend
                  self._set_status("Extracting time series...", level="INFO")
+
+                 # Prepare arguments for Inline support
+                 stack_groups_path = None
+                 effective_path = self.inputfile_path
+                 try:
+                     stack_groups_path = merged_plot.attrs.get('stack_groups_path')
+                     if 'proxy_ncf_path' in merged_plot.attrs:
+                        effective_path = merged_plot.attrs['proxy_ncf_path']
+                     if 'original_ncf_path' in merged_plot.attrs:
+                        effective_path = merged_plot.attrs['original_ncf_path']
+                 except Exception:
+                     pass
+
                  try:
                      result = get_ncf_timeseries(
-                         self.inputfile_path,
+                         effective_path,
                          pollutant,
                          rows_0.tolist(),
                          cols_0.tolist(),
                          layer_idx=l_idx,
                          layer_op=l_op,
-                         op=mode
+                         op=mode,
+                         stack_groups_path=stack_groups_path
                      )
                  except Exception as e:
                      self._notify('ERROR', 'Extract Error', str(e))
@@ -2868,8 +3397,26 @@ class EmissionGUI:
                  
                  # Parse time labels? YYYYDDD_HHMMSS
                  # Maybe simplify X axis labels
-                 ax_ts.plot(vals, marker='o', markersize=4)
-                 ax_ts.set_ylabel(f"{pollutant} ({units})")
+                 if isinstance(vals, dict):
+                      # Multi-line plot (Inline Sources)
+                      for label, series in vals.items():
+                           lw = 2.5 if label == 'Total' else 1.0
+                           alpha = 1.0 if label == 'Total' else 0.6
+                           ms = 4 if label == 'Total' else 2
+                           ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                      
+                      # Only show legend if reasonable number of items
+                      if len(vals) < 25:
+                           ax_ts.legend(fontsize='small', loc='upper right')
+                      else:
+                           # If too many, maybe just Total in legend?
+                           ax_ts.legend(['Total'], loc='upper right')
+                 else:
+                      ax_ts.plot(vals, marker='o', markersize=4)
+                      
+                 u_str = str(units or '').strip()
+                 y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
+                 ax_ts.set_ylabel(y_lbl)
                  ax_ts.set_xlabel("Time Step")
                  ax_ts.grid(True, linestyle='--', alpha=0.7)
                  
@@ -2894,163 +3441,8 @@ class EmissionGUI:
                  
                  self._set_status("Time series extracted.", level="INFO")
              
-             def _on_animate():
-
-                 try:
-                     from ncf_processing import get_ncf_animation_data
-                 except ImportError: return
-
-                 # 1. Get subset (visible or all?)
-                 # For animation, let's just do visible to keep it fast
-                 xmin, xmax = local_ax.get_xlim()
-                 ymin, ymax = local_ax.get_ylim()
-                 from shapely.geometry import box
-                 bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
-                 
-                 sidx = merged_plot.sindex
-                 cand_idxs = list(sidx.intersection(bbox.bounds))
-                 subset = merged_plot.iloc[cand_idxs]
-                 subset = subset[subset.intersects(bbox)]
-                 
-                 if len(subset) == 0:
-                      self._notify('WARNING', 'Animation', 'No cells visible.')
-                      return
-                 
-                 # 2. Extract indices
-                 r_col = 'ROW'; c_col = 'COL'
-                 if 'ROW' not in subset.columns and 'ROW_x' in subset.columns: r_col = 'ROW_x'
-                 if 'COL' not in subset.columns and 'COL_x' in subset.columns: c_col = 'COL_x'
-                 
-                 # Fallback parsing
-                 sub_R = []; sub_C = []
-                 valid_subset = [] # indices in subset
-                 for i, row in subset.iterrows():
-                     r = row.get(r_col); c = row.get(c_col)
-                     if (pd.isna(r) or pd.isna(c)) and 'GRID_RC' in row:
-                         try:
-                             parts = str(row['GRID_RC']).split('_')
-                             r = int(parts[0]); c = int(parts[1])
-                         except: pass
-                     if pd.notna(r) and pd.notna(c):
-                         sub_R.append(int(r)-1)
-                         sub_C.append(int(c)-1)
-                         valid_subset.append(i) # Keep track of which geometry corresponds to which value
-                 
-                 if not sub_R: return
-
-                 # 3. Layer params
-                 l_idx = 0; l_op = 'select'
-                 try: 
-                     if hasattr(self, 'ncf_layer_var'):
-                         l_sel = self.ncf_layer_var.get()
-                         if "Sum" in l_sel: l_op = 'sum'
-                         elif "Avg" in l_sel: l_op = 'mean'
-                         else:
-                             parts = l_sel.split()
-                             if len(parts) > 1 and parts[-1].isdigit():
-                                 l_idx = int(parts[-1]) - 1
-                 except: pass
-
-                 self._set_status("Loading animation data...", level="INFO")
-                 
-                 # 4. Fetch Data
-                 data_pack = get_ncf_animation_data(
-                     self.inputfile_path, pollutant, sub_R, sub_C, l_idx, l_op
-                 )
-                 if not data_pack:
-                     self._notify('ERROR', 'Animation', 'Failed to load data.')
-                     return
-                 
-                 times = data_pack['times']
-                 values = data_pack['values'] # (T, N)
-                 
-                 # 5. Launch Animation Window
-                 ani_win = tk.Toplevel(self.root)
-                 ani_win.title(f"Animation: {pollutant}")
-                 
-                 import matplotlib.pyplot as plt
-                 from matplotlib.animation import FuncAnimation
-                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-                 
-                 # Setup Figure
-                 fig_ani, ax_ani = plt.subplots(figsize=(6, 5))
-                 
-                 # Plot the geometry. We need a flexible collection.
-                 # using subset.plot is easy but static. 
-                 # We need to map `values` to the geometry. 
-                 # The `subset` variable contains geometries in the order we iterated? 
-                 # No, iterrows is slow but preserved order? 
-                 # `valid_subset` holds indices. 
-                 # `subset` is a GeoDataFrame. 
-                 # Let's re-create a GDF that matches the order of `sub_R` exactly.
-                 # The `values` array is (Time, N) where N matches `sub_R`.
-                 
-                 working_gdf = subset.loc[valid_subset].copy() # Ensure alignment
-                 
-                 # Initial plot (Timestep 0)
-                 working_gdf['__value'] = values[0, :]
-                 
-                 vmin = np.nanmin(values)
-                 vmax = np.nanmax(values)
-                 
-                 plot_collection = working_gdf.plot(
-                     column='__value', 
-                     ax=ax_ani, 
-                     cmap=cmap_name, 
-                     vmin=vmin, 
-                     vmax=vmax,
-                     legend=True,
-                     legend_kwds={'label': f"{pollutant} ({data_pack['units']})"}
-                 )
-                 
-                 # Clean up axis
-                 ax_ani.set_axis_off()
-                 title_text = ax_ani.text(0.5, 1.05, "", transform=ax_ani.transAxes, ha="center")
-                 
-                 # Handle collection
-                 # Geopandas plot returns an Axes or list of Axes... wait.
-                 # Actually it returns the Axes. The collection is inside ax_ani.collections[0] usually.
-                 collection = ax_ani.collections[0]
-                 
-                 def update(frame):
-                     # Update scalar mappable
-                     new_vals = values[frame, :]
-                     collection.set_array(new_vals)
-                     title_text.set_text(f"Time: {times[frame]} ({frame+1}/{len(times)})")
-                     return collection, title_text
-                 
-                 ani = FuncAnimation(fig_ani, update, frames=len(times), interval=200, blit=False)
-                 
-                 canvas_ani = FigureCanvasTkAgg(fig_ani, master=ani_win)
-                 canvas_ani.draw()
-                 canvas_ani.get_tk_widget().pack(side='top', fill='both', expand=True)
-                 
-                 # Control Bar
-                 ctrl_frame = ttk.Frame(ani_win)
-                 ctrl_frame.pack(side='bottom', fill='x')
-                 
-                 is_paused = [False]
-                 
-                 def toggle():
-                     if is_paused[0]:
-                         ani.event_source.start()
-                         btn_pause.config(text="Pause")
-                         is_paused[0] = False
-                     else:
-                         ani.event_source.stop()
-                         btn_pause.config(text="Play")
-                         is_paused[0] = True
-                 
-                 btn_pause = ttk.Button(ctrl_frame, text="Pause", command=toggle)
-                 btn_pause.pack(side='left')
-                 
-                 self._set_status("Animation started.", level="INFO")
-                 # Keep ref
-                 ani_win._ani = ani
-
              ttk.Button(ts_frame, text="Time_Series_Total", command=lambda: _on_ts('sum')).pack(side='left', padx=4)
              ttk.Button(ts_frame, text="Time_Series_Averaged", command=lambda: _on_ts('mean')).pack(side='left', padx=4)
-             ttk.Button(ts_frame, text="Animate View", command=_on_animate).pack(side='left', padx=4)
 
              def _display_ts_window(result, title_msg):
                  ts_view = tk.Toplevel(self.root)
@@ -3063,8 +3455,24 @@ class EmissionGUI:
                  vals = result['values']
                  units = result['units']
                  
-                 ax_ts.plot(vals, marker='o', markersize=4)
-                 ax_ts.set_ylabel(f"{pollutant} ({units})")
+                 if isinstance(vals, dict):
+                      # Multi-line plot (Inline Sources)
+                      for label, series in vals.items():
+                           lw = 2.5 if label == 'Total' else 1.0
+                           alpha = 1.0 if label == 'Total' else 0.6
+                           ms = 4 if label == 'Total' else 2
+                           ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                      
+                      if len(vals) < 25:
+                           ax_ts.legend(fontsize='small', loc='upper right')
+                      else:
+                           ax_ts.legend(['Total'], loc='upper right')
+                 else:
+                      ax_ts.plot(vals, marker='o', markersize=4)
+
+                 u_str = str(units or '').strip()
+                 y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
+                 ax_ts.set_ylabel(y_lbl)
                  ax_ts.set_xlabel("Time Step")
                  ax_ts.grid(True, linestyle='--', alpha=0.7)
                  
@@ -3145,14 +3553,26 @@ class EmissionGUI:
                      from ncf_processing import get_ncf_timeseries
                      self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
                      
+                     attrs = getattr(merged_plot, 'attrs', {})
+                     effective_path = self.inputfile_path
+                     if 'proxy_ncf_path' in attrs:
+                        effective_path = attrs['proxy_ncf_path']
+                     if 'original_ncf_path' in attrs:
+                        effective_path = attrs['original_ncf_path']
+
+                     stack_groups_path = None
+                     if 'stack_groups_path' in attrs:
+                          stack_groups_path = attrs['stack_groups_path']
+                          
                      res = get_ncf_timeseries(
-                         self.inputfile_path,
+                         effective_path,
                          pollutant,
                          [int(r)-1],
                          [int(c)-1],
                          layer_idx=l_idx,
                          layer_op=l_op,
-                         op='mean'
+                         op='mean',
+                         stack_groups_path=stack_groups_path
                      )
                      
                      if res:
@@ -3368,14 +3788,7 @@ class EmissionGUI:
                 unit = self.units_map.get(pol)
             except Exception:
                 unit = None
-            # Text artist anchored to bottom-left inside axes
-            stats_text = local_ax.text(
-                0.01, 0.01,
-                "",
-                transform=local_ax.transAxes,
-                ha='left', va='bottom', fontsize=9, color='#333333', zorder=2,
-                bbox=dict(facecolor='white', edgecolor='#aaaaaa', alpha=0.7, pad=2)
-            )
+            # stats_text created earlier
 
             def _calc_stats(raw_values):
                 if raw_values is None:
