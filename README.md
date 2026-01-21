@@ -1,155 +1,281 @@
-# SMKPLOT GUI & Batch Plotting Tool
+# SMKPLOT - Emissions Visualization Tool
 
-This tool provides a graphical user interface (GUI) and a headless batch mode for visualizing emissions data from SMOKE reports, FF10 files, and other CSV/text formats. It supports plotting by county (using FIPS codes) or by grid (using IOAPI GRIDDESC definitions).
+A comprehensive tool for visualizing emissions data from SMOKE reports, FF10 files, NetCDF, and CSV formats. Supports both interactive GUI and automated batch processing modes.
 
 ## Features
 
-*   **Interactive GUI**: Explore data, filter by sector/SCC, customize plot settings (colormap, scale, bins), and export plots.
-*   **Batch Mode**: Automate map generation for multiple pollutants and datasets via command-line arguments or configuration files.
-*   **Configuration Support**: Save and load run configurations using JSON or YAML files for reproducibility.
-*   **Data Formats**: Supports SMOKE reports, FF10 point/nonpoint files, and generic CSVs with flexible delimiter detection.
-*   **Projections**: Supports geographic (WGS84) and Lambert Conformal Conic (LCC) projections.
-*   **Filtering**: Filter data by column values (e.g., specific FIPS, SCCs) or ranges.
+*   **Dual Mode Operation**: Interactive GUI for exploration or headless batch mode for automation
+*   **Multiple Data Formats**: SMOKE reports, FF10 point/nonpoint, NetCDF (including inline sources), CSV/TXT
+*   **Flexible Plotting**: County-based (FIPS) or grid-based visualization
+*   **Spatial Filtering**: Filter data by geographic regions using overlay shapefiles with robust boundary detection
+*   **Projections**: Automatic projection handling (WGS84, Lambert Conformal Conic)
+*   **Configuration Management**: Save/load complete run configurations via YAML/JSON
+*   **Parallel Processing**: Multi-core batch processing for large datasets
 
 ## Installation
 
-1.  **Prerequisites**:
-    *   Python 3.9+
-    *   `tkinter` (usually included with Python, but may need separate installation on Linux, e.g., `sudo apt-get install python3-tk`)
+### Prerequisites
+*   Python 3.9 or higher
+*   `tkinter` for GUI mode (usually included; on Linux: `sudo apt-get install python3-tk`)
 
-2.  **Dependencies**:
-    
-    You can automatically set up the environment and install dependencies using the provided script:
-    ```bash
-    ./install.sh
-    ```
-    
-    Alternatively, manually install the required Python packages:
-    ```bash
-    pip install -r requirements.txt
-    ```
-    *(Note: If `requirements.txt` is not provided, key dependencies include `pandas`, `geopandas`, `matplotlib`, `pyproj`, `shapely`, `pyyaml`)*
+### Quick Setup
+
+Use the provided installation script:
+```bash
+./install.sh
+```
+
+This creates a virtual environment, installs dependencies, and configures the tool.
+
+### Manual Installation
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
 ## Usage
 
-The tool is launched via `smkplot.py`. It attempts to start the GUI by default but will fall back to batch mode if no display is detected or if `--no-gui` is specified.
+### GUI Mode
 
-### 1. Graphical User Interface (GUI)
-
-Simply run the script without arguments (or with an initial file) to open the GUI:
-
+Launch the interactive interface:
 ```bash
-python3 smkplot.py
-# OR load a file on startup
-python3 smkplot.py --filepath /path/to/emissions.csv
+./smkplot.py
+# OR with a data file
+./smkplot.py -f emissions.csv
 ```
 
-**GUI Features:**
-*   **Input**: Select your emissions file, county shapefile, and optional GRIDDESC file.
-*   **Settings**: Choose plot type (County/Grid), pollutant, colormap, scale (Linear/Log), and more.
-*   **Preview**: View a text preview of the loaded data header.
-*   **Plot**: Click "Plot" to generate an interactive map window.
+The GUI provides:
+*   File selection and preview
+*   Interactive plot settings (colormap, scale, bins)
+*   Spatial filtering controls
+*   Real-time plot generation
 
-### 2. Batch Mode (Headless)
+### Batch Mode
 
-Generate maps automatically without opening a window. Use `--no-gui` to force batch mode.
+Generate plots automatically without GUI:
 
-**Basic Example:**
+**Basic County Plot:**
 ```bash
-python3 smkplot.py --no-gui \
-  --filepath /path/to/emissions.csv \
-  --county-shapefile /path/to/counties.gpkg \
-  --pollutant "NOX,VOC" \
-  --outdir ./maps
+./smkplot.py --run-mode batch \
+  -f emissions.csv \
+  --county-shapefile counties.gpkg \
+  --pollutant "NOX,VOC,PM2_5" \
+  --outdir ./output_maps
 ```
 
-**Grid Plotting Example:**
+**Grid Plot:**
 ```bash
-python3 smkplot.py --no-gui \
+./smkplot.py --run-mode batch \
   --pltyp grid \
-  --griddesc /path/to/GRIDDESC \
-  --gridname 12US1_36-12-4 \
-  --filepath /path/to/emissions.csv \
+  --griddesc GRIDDESC.txt \
+  --gridname 12US1_459X299 \
+  -f emissions.csv \
   --pollutant CO \
   --outdir ./grid_maps
 ```
 
-### 3. Configuration Files (JSON / YAML)
-
-You can save your run settings to a file (automatically done in batch mode) and reuse them later. This is ideal for repeating complex runs.
-
-**Using a YAML Configuration:**
+**With Spatial Filtering:**
 ```bash
-python3 smkplot.py --yaml config.yaml
+./smkplot.py --run-mode batch \
+  -f emissions.csv \
+  --county-shapefile counties.gpkg \
+  --overlay-shapefile California.shp \
+  --filtered-by-overlay within \
+  --pollutant NOX \
+  --outdir ./ca_maps
 ```
 
-**Re-importing Processed Data:**
-If you have already processed a large dataset and saved it (via `--export-csv`), you can skip the raw data parsing step by using `--reimport` with your config file:
+### Configuration Files
+
+Configuration files allow you to save complete run settings for reproducibility.
+
+**Using a Configuration File:**
+
+Simply pass a `.yaml` or `.json` file to `-f` / `--filepath`. The tool automatically detects configuration files by extension:
 
 ```bash
-python3 smkplot.py --yaml config.yaml --reimport
+./smkplot.py -f my_config.yaml
 ```
 
-### 4. Handling Missing Data (Map Holes)
-
-By default, regions with no matching emissions data are left empty (transparent/white). To fill these regions with a specific value (e.g., 0), use the `--fill-nan` option:
-
-```bash
-python3 smkplot.py --fill-nan 0.0 ...
-```
-
-In the GUI, you can check the **"Fill NaN=0"** box to automatically set this to 0.0.
-
-## Configuration File Structure (YAML)
-
-A typical YAML configuration file looks like this:
+**Configuration File Structure:**
 
 ```yaml
-timestamp_utc: '2025-01-01T12:00:00Z'
+timestamp_utc: '2026-01-21T12:00:00Z'
 arguments:
-  filepath: /path/to/input.csv       # Input emissions file
-  sector: my_sector                  # Sector label
-  filter_col: region_cd              # Column to filter by
-  filter_val: ['37001', '37003']     # Values to keep
-  county_shapefile: /path/to/shp.gpkg
-  pltyp: county                      # 'county' or 'grid'
-  pollutant: NOX,VOC                 # Pollutants to plot
-  cmap: jet                          # Colormap
-  log_scale: true                    # Logarithmic scale
-  outdir: ./outputs                  # Output directory
-  export_csv: true                   # Save processed data to CSV
-  # ... other arguments matching command-line flags
+  filepath: /path/to/emissions.csv
+  sector: my_sector
+  county_shapefile: /path/to/counties.gpkg
+  overlay_shapefile: /path/to/state.shp
+  filtered_by_overlay: within
+  pltyp: county
+  pollutant: NOX,VOC
+  cmap: viridis
+  log_scale: true
+  zoom_to_data: true
+  outdir: ./outputs
+  export_csv: true
 outputs:
-  # ... (generated by the tool)
+  # Auto-generated by the tool
 ```
+
+**Note:** Batch mode automatically saves a configuration snapshot after each run for easy replication.
 
 ## Command Line Arguments
 
+### Input/Output
 | Argument | Description |
 | :--- | :--- |
-| `--filepath` | Path to input emissions file (CSV, TXT, LST). |
-| `--sector` | Sector name (used for output filenames). |
-| `--no-gui` | Force batch mode (do not open window). |
-| `--yaml` | Load settings from a YAML configuration file. |
-| `--json` | Load settings from a JSON configuration file. |
-| `--reimport` | Reuse pre-processed data defined in the config file. |
-| `--outdir` | Directory to save output maps and files. |
-| `--pollutant` | Comma-separated list of pollutants to plot. |
-| `--pltyp` | Plot type: `county` or `grid`. |
-| `--county-shapefile` | Path to county boundary shapefile. |
-| `--griddesc` | Path to GRIDDESC file (required for grid plots). |
-| `--gridname` | Name of the grid in GRIDDESC. |
-| `--filter-col` | Column name to filter data by. |
-| `--filter-val` | Value(s) to keep in the filter column. |
-| `--log-scale` | Use logarithmic color scale. |
-| `--cmap` | Matplotlib colormap name (e.g., `viridis`, `jet`). |
-| `--bins` | Custom bin edges for the colorbar. |
-| `--fill-nan` | Value to fill missing data with (e.g. `0.0`). Fills both empty map regions and NaNs in data. |
-| `--zoom-to-data` | Zoom map extent to where data exists. |
-| `--export-csv` | Export the processed DataFrame to CSV. |
+| `-f`, `--filepath` | Path to emissions file (CSV, TXT, NetCDF, FF10) **OR** configuration file (`.yaml`, `.json`) |
+| `--sector` | Sector name for output file prefixes |
+| `--outdir` | Output directory (default: `outputs`) |
+| `--export-csv` | Export processed data to CSV |
+
+### Execution Mode
+| Argument | Description |
+| :--- | :--- |
+| `--run-mode` | Execution mode: `gui` or `batch` (auto-detected if omitted) |
+| `--self-test` | Run synthetic data test to verify installation |
+| `--workers` | Number of parallel workers for batch (0=auto, default) |
+
+### Plot Settings
+| Argument | Description |
+| :--- | :--- |
+| `--pltyp` | Plot type: `county` (default) or `grid` |
+| `--pollutant` | Pollutant(s) to plot (comma/space-separated) |
+| `--cmap` | Colormap name (default: `viridis`; e.g., `jet`, `plasma`, `turbo`) |
+| `--log-scale` | Use logarithmic color scale |
+| `--bins` | Custom colorbar bin edges (comma/space-separated) |
+| `--fill-nan` | Value for missing data (e.g., `0.0`) |
+| `--zoom-to-data` | Zoom to data extent (auto-enabled with spatial filtering) |
+| `--zoom-pad` | Padding fraction for zoom (default: 0.02) |
+
+### Geometry & Projections
+| Argument | Description |
+| :--- | :--- |
+| `--county-shapefile` | Path to county boundary shapefile (required for county plots) |
+| `--griddesc` | Path to GRIDDESC file (required for grid plots, except NetCDF) |
+| `--gridname` | Grid name from GRIDDESC |
+| `--overlay-shapefile` | Path to overlay shapefile (can specify multiple times) |
+| `--projection` | Projection mode: `auto` (default), `wgs84`, or `lcc` |
+| `--force-lcc` | Force legacy CONUS LCC projection (deprecated) |
+
+### Spatial Filtering
+| Argument | Description |
+| :--- | :--- |
+| `--filtered-by-overlay` | Filter mode: `within`, `intersect`, or `clipped` |
+
+**Filter Modes:**
+*   **`within`**: Keeps features inside overlay (uses dual-check: centroid + representative point for coastal/irregular shapes)
+*   **`intersect`**: Keeps features touching overlay
+*   **`clipped`**: Geometrically clips features to overlay boundary
+
+### Data Filtering
+| Argument | Description |
+| :--- | :--- |
+| `--filter-col` | Column name to filter by (e.g., `SCC`, `region_cd`) |
+| `--filter-start` | Start value for range filter (inclusive) |
+| `--filter-end` | End value for range filter (inclusive) |
+| `--filter-val` | Discrete value(s) to keep (repeat flag or use commas) |
+
+### File Parsing
+| Argument | Description |
+| :--- | :--- |
+| `--delim` | Delimiter: `comma`, `tab`, `pipe`, `semicolon`, or literal character |
+| `--skiprows` | Skip first N lines before header |
+| `--comment` | Comment character (e.g., `#`) |
+| `--encoding` | File encoding (e.g., `utf-8`, `latin1`) |
+
+### NetCDF Options
+| Argument | Description |
+| :--- | :--- |
+| `--ncf-tdim` | Time dimension operation: `avg`, `sum`, `max`, `min`, or index (default: `avg`) |
+| `--ncf-zdim` | Layer dimension operation: `avg`, `sum`, `max`, `min`, or index (default: `0`) |
+| `--stack-groups` | Path to STACK_GROUPS file for inline point sources |
+
+### Logging
+| Argument | Description |
+| :--- | :--- |
+| `--log-level` | Verbosity: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL` |
+| `--log-file` | Write logs to file (appends; creates timestamped file if directory given) |
+
+## Advanced Features
+
+### Spatial Filtering with Dual-Check Strategy
+
+The `within` filter mode uses a robust dual-check approach:
+1.  Checks if feature **centroid** is within overlay
+2.  Checks if feature **representative point** is within overlay
+3.  Includes feature if **either** check passes
+
+This ensures accurate filtering for complex geometries like coastal counties where centroids may fall in water.
+
+### Automatic Zoom Behavior
+
+When spatial filtering is active (`--filtered-by-overlay`), the tool automatically enables `--zoom-to-data` to focus the map on the filtered region, eliminating empty space.
+
+### NetCDF Grid Handling
+
+NetCDF files (including inline point sources) automatically derive grid parameters from file headers. External `--griddesc` arguments are ignored for NetCDF inputs.
+
+### Warning Management
+
+Python warnings (e.g., from matplotlib, geopandas) are captured and routed through the logging system, respecting the `--log-level` setting.
 
 ## Troubleshooting
 
-*   **"No module named 'tkinter'"**: Install the python-tk package for your OS.
-*   **"No module named 'yaml'"**: Install PyYAML: `pip install PyYAML`.
-*   **Display Issues**: If running on a remote server without X11 forwarding, use `--no-gui`.
+| Issue | Solution |
+| :--- | :--- |
+| **"No module named 'tkinter'"** | Install: `sudo apt-get install python3-tk` (Linux) or reinstall Python with Tk support |
+| **"No module named 'yaml'"** | Install: `pip install PyYAML` |
+| **Display issues on remote server** | Use `--run-mode batch` to force headless operation |
+| **Missing counties in spatial filter** | Verify overlay shapefile CRS matches data; try `intersect` mode |
+| **Tight layout warnings** | These are now handled internally and can be ignored |
+| **Empty plots** | Check that pollutant names match data columns exactly (case-sensitive) |
+
+## Examples
+
+**1. Quick GUI exploration:**
+```bash
+./smkplot.py -f report.csv
+```
+
+**2. Batch process multiple pollutants:**
+```bash
+./smkplot.py --run-mode batch \
+  -f emissions.csv \
+  --county-shapefile counties.gpkg \
+  --pollutant "NOX,VOC,SO2,PM2_5" \
+  --cmap jet \
+  --log-scale \
+  --outdir ./batch_output
+```
+
+**3. State-specific analysis:**
+```bash
+./smkplot.py --run-mode batch \
+  -f national_emissions.csv \
+  --county-shapefile us_counties.gpkg \
+  --overlay-shapefile texas.shp \
+  --filtered-by-overlay within \
+  --pollutant NOX \
+  --zoom-to-data \
+  --outdir ./texas_maps
+```
+
+**4. Grid plotting with NetCDF:**
+```bash
+./smkplot.py --run-mode batch \
+  -f CCTM_output.nc \
+  --pltyp grid \
+  --pollutant NO2 \
+  --ncf-tdim avg \
+  --ncf-zdim 0 \
+  --outdir ./netcdf_maps
+```
+
+**5. Reuse saved configuration:**
+```bash
+./smkplot.py -f previous_run.yaml
+```

@@ -7,3 +7,4 @@ shapely
 pyyaml
 joblib
 pyogrio
+netCDF4

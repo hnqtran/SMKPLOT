@@ -47,12 +47,12 @@ from config import (
     US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
     DEFAULT_ONLINE_COUNTIES_URL
 )
-from utils import load_settings, save_settings
+from utils import load_settings, save_settings, normalize_delim
 from data_processing import (
-    _normalize_delim, read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
+    read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
     merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
 )
-from plotting import _plot_crs, _draw_graticule
+from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
 
 # Backend selection: try Tk if DISPLAY exists, otherwise Agg
 _display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
@@ -107,9 +107,9 @@ class EmissionGUI:
         self.json_path = getattr(cli_args, 'json', None) if cli_args else None
         self._json_arguments = self.json_payload.get('arguments', {}) if isinstance(self.json_payload, dict) else {}
         
-        # Priotize arguments from CLI args before JSON snapshot        
+        # Prioritize arguments from CLI before configuration snapshot        
         self.emissions_delim = getattr(cli_args, 'delim', None) if cli_args else None or self._json_arguments.get('delim', None)
-        self.emissions_delim = _normalize_delim(self.emissions_delim)
+        self.emissions_delim = normalize_delim(self.emissions_delim)
         self.sector = getattr(cli_args, 'sector', None) if cli_args else None or self._json_arguments.get('sector', None)
         self.skiprows = getattr(cli_args, 'skiprows', None) if cli_args else None or self._json_arguments.get('skiprows', None)
         self.comment_token = getattr(cli_args, 'comment', None) if cli_args else None or self._json_arguments.get('comment', None)
@@ -170,6 +170,12 @@ class EmissionGUI:
         self._preview_win = None  # popup preview window
         # Interactive zoom state
         self._zoom_rect = None
+
+        # State for "Update, Don't Replot" optimization
+        # Mapping: pollutant -> { 'win': Toplevel, 'fig': Figure, 'ax': Axes, 'canvas': Canvas, 'stats_cbids': list }
+        self._plot_windows = {}
+        
+        # Restore UI state first
         self._zoom_press = None
         self._zoom_cids = []
         # Base view (xlim, ylim) to support Reset View behavior
@@ -317,43 +323,43 @@ class EmissionGUI:
         # Load filtered_by_overlay setting
         val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
         if val_filter is None:
-             val_filter = self._json_arguments.get('filtered_by_overlay', None)
+            val_filter = self._json_arguments.get('filtered_by_overlay', None)
         if val_filter is None:
-             val_filter = last_paths.get('filtered_by_overlay', False)
+            val_filter = last_paths.get('filtered_by_overlay', False)
         
         # Normalize to string or boolean (preserving modes like 'intersect', 'within')
         if isinstance(val_filter, str):
-             s_filter = val_filter.lower()
-             if s_filter in ('true', 'yes', 'on'):
-                 self.initial_filter_overlay = 'intersect' # Default to intersect if True/flag present
-             elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
-                 self.initial_filter_overlay = 'False'
-             else:
-                 self.initial_filter_overlay = val_filter
+            s_filter = val_filter.lower()
+            if s_filter in ('true', 'yes', 'on'):
+                self.initial_filter_overlay = 'intersect' # Default to intersect if True/flag present
+            elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
+                self.initial_filter_overlay = 'False'
+            else:
+                self.initial_filter_overlay = val_filter
         elif isinstance(val_filter, bool):
-             self.initial_filter_overlay = 'intersect' if val_filter else 'False'
+            self.initial_filter_overlay = 'intersect' if val_filter else 'False'
         else:
-             self.initial_filter_overlay = 'False'
+            self.initial_filter_overlay = 'False'
 
         if self.overlay_path:
-             # Handle multiple paths (list or valid single path)
-             valid_ov = False
-             if isinstance(self.overlay_path, str) and os.path.exists(self.overlay_path):
-                 valid_ov = True
-                 final_str = self.overlay_path
-             elif isinstance(self.overlay_path, list):
-                 # Just check the first one for existance logic or join
-                 if self.overlay_path:
-                     valid_ov = True
-                     final_str = ";".join([str(p) for p in self.overlay_path])
+            # Handle multiple paths (list or valid single path)
+            valid_ov = False
+            if isinstance(self.overlay_path, str) and os.path.exists(self.overlay_path):
+                valid_ov = True
+                final_str = self.overlay_path
+            elif isinstance(self.overlay_path, list):
+                # Just check the first one for existance logic or join
+                if self.overlay_path:
+                    valid_ov = True
+                    final_str = ";".join([str(p) for p in self.overlay_path])
              
-             if valid_ov:
-                 try:
-                     self.overlay_entry.delete(0, tk.END)
-                     self.overlay_entry.insert(0, final_str)
-                 except Exception:
-                     pass
-                 self.load_overlay()
+            if valid_ov:
+                try:
+                    self.overlay_entry.delete(0, tk.END)
+                    self.overlay_entry.insert(0, final_str)
+                except Exception:
+                    pass
+                self.load_overlay()
 
         
 
@@ -415,9 +421,8 @@ class EmissionGUI:
         """Return (crs, forward_transformer, inverse_transformer) for plotting.
 
         New behavior: ONLY use an LCC projection when a GRIDDESC file is provided AND a valid
-        grid name is selected. Otherwise, fall back to WGS84 (EPSG:4326) so maps render in
-        geographic coordinates. This improves interpretability for county-only plots or when
-        the user has not supplied grid context.
+        grid name is selected. Otherwise,        fallback to WGS84 (EPSG:4326). This ensures geographic coordinate rendering
+        when no specific grid context is available.
         """
         choice = None
         try:
@@ -457,14 +462,14 @@ class EmissionGUI:
         except Exception:
             return None, None, None
 
-    def _draw_graticule(self, ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, lon_step=5, lat_step=5, with_labels=True):
+    def _draw_graticule(self, ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, lon_step=None, lat_step=None, with_labels=True):
         """Draw longitude/latitude lines (in degrees) on the given axes using provided transformers.
         The axes must be in the projected (LCC) coordinates. Optionally label lines along edges.
         """
-        from .plotting import _draw_graticule as _draw_helper
+
 
         if ax is None:
-            return _draw_helper(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+            return _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
 
         def _remove_existing():
             artists = getattr(ax, '_smk_graticule_artists', None)
@@ -500,7 +505,7 @@ class EmissionGUI:
         except Exception:
             pass
 
-        artists = _draw_helper(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+        artists = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
         if not isinstance(artists, dict):
             artists = {'lines': [], 'texts': []}
         ax._smk_graticule_artists = artists  # type: ignore[attr-defined]
@@ -508,7 +513,7 @@ class EmissionGUI:
         def _on_limits(_axis):
             try:
                 _remove_existing()
-                refreshed = _draw_helper(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+                refreshed = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
                 if not isinstance(refreshed, dict):
                     refreshed = {'lines': [], 'texts': []}
                 ax._smk_graticule_artists = refreshed  # type: ignore[attr-defined]
@@ -546,7 +551,7 @@ class EmissionGUI:
 
     def _save_settings(self) -> None:
         """Collect and save current GUI settings to the JSON config file."""
-        # Sync from widgets first to capture manual edits (e.g. user typed path but didn't click load/preview)
+        # Sync from widgets first to capture manual edits (prior to explicit load/preview)
         current_input = self.inputfile_path
         if hasattr(self, 'emis_entry'):
             try:
@@ -564,23 +569,23 @@ class EmissionGUI:
         current_counties = self.counties_path
         if hasattr(self, 'county_entry'):
             try:
-                 val = self.county_entry.get().strip()
-                 if val: current_counties = val
+                val = self.county_entry.get().strip()
+                if val: current_counties = val
             except Exception: pass
 
         current_overlay = getattr(self, 'overlay_path', None)
         if hasattr(self, 'overlay_entry'):
             try:
-                 val = self.overlay_entry.get().strip()
-                 if val: current_overlay = val
+                val = self.overlay_entry.get().strip()
+                if val: current_overlay = val
             except Exception: pass
             
         current_filter_overlay = False
         if hasattr(self, 'filter_overlay_var'):
-             try:
-                 val = self.filter_overlay_var.get()
-                 current_filter_overlay = (str(val).lower() == 'true')
-             except Exception: pass
+            try:
+                val = self.filter_overlay_var.get()
+                current_filter_overlay = (str(val).lower() == 'true')
+            except Exception: pass
 
         settings = {
             'last_paths': {
@@ -772,7 +777,7 @@ class EmissionGUI:
         def _initial_delim_token(raw: Optional[str]) -> str:
             if not raw:
                 return 'auto'
-            raw_norm = _normalize_delim(raw)
+            raw_norm = normalize_delim(raw)
             if raw_norm == ',' : return 'comma'
             if raw_norm == ';' : return 'semicolon'
             if raw_norm == '\t' : return 'tab'
@@ -891,10 +896,10 @@ class EmissionGUI:
         
         # Bind events
         def _on_ncf_param_change(event):
-             if not self.inputfile_path: return
-             # Only trigger if NCF and valid selections
-             if not (self.ncf_layer_menu.get() and self.ncf_tstep_menu.get()): return
-             self.load_inputfile(show_preview=False)
+            if not self.inputfile_path: return
+            # Only trigger if NCF and valid selections
+            if not (self.ncf_layer_menu.get() and self.ncf_tstep_menu.get()): return
+            self.load_inputfile(show_preview=False)
 
         self.ncf_layer_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
         self.ncf_tstep_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
@@ -1010,7 +1015,7 @@ class EmissionGUI:
                 try:
                     sticky_val = 'we' if widget in (self.bins_entry, self.scc_entry) else 'w'
                     if widget in (self.proj_label, self.bins_label, self.cmap_label, self.scc_label, self.scale_label, self.plotby_label, self.ncf_layer_label, self.ncf_tstep_label):
-                         sticky_val = 'e'
+                        sticky_val = 'e'
                     widget.grid_configure(row=0, column=col, sticky=sticky_val)
                 except Exception:
                     pass
@@ -1058,9 +1063,9 @@ class EmissionGUI:
             ]
             for widget, col in row0_extra:
                 try:
-                     widget.grid_configure(row=0, column=col, sticky='w' if 'label' not in str(widget) else 'e')
+                    widget.grid_configure(row=0, column=col, sticky='w' if 'label' not in str(widget) else 'e')
                 except Exception:
-                     pass
+                    pass
 
     def _on_resize(self, event=None):
         try:
@@ -1437,8 +1442,8 @@ class EmissionGUI:
                         elif op in ('max', 'maximum'): ncf_params['layer_op'] = 'max'
                         elif op in ('min', 'minimum'): ncf_params['layer_op'] = 'min'
                         else: 
-                             ncf_params['layer_idx'] = 0
-                             ncf_params['layer_op'] = 'select'
+                            ncf_params['layer_idx'] = 0
+                            ncf_params['layer_op'] = 'select'
 
                     emissions_df, raw_df = read_inputfile(
                         f_input,
@@ -1457,27 +1462,27 @@ class EmissionGUI:
 
                     # Build FIPS to ensure compatibility and consistent attributes
                     if isinstance(emissions_df, pd.DataFrame):
-                         try:
-                             is_ncf = isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc'))
-                             emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
-                         except ValueError:
-                             # Ignore if FIPS columns not found (e.g. gridded data without region_cd)
-                             pass
-                         except Exception as e:
-                             safe_notify('WARNING', f"Error building FIPS: {e}")
+                        try:
+                            is_ncf = isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc'))
+                            emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
+                        except ValueError:
+                            # Ignore if FIPS columns not found (e.g. gridded data without region_cd)
+                            pass
+                        except Exception as e:
+                            safe_notify('WARNING', f"Error building FIPS: {e}")
                     
                     # Apply units_map from JSON arguments if available (overrides input data)
                     units_map_arg = self._json_arguments.get('units_map')
                     if isinstance(units_map_arg, dict) and isinstance(emissions_df, pd.DataFrame):
-                         existing_map = emissions_df.attrs.get('units_map', {})
-                         if not isinstance(existing_map, dict): existing_map = {}
-                         for k, v in units_map_arg.items():
-                             existing_map[k] = v
-                         emissions_df.attrs['units_map'] = existing_map
+                        existing_map = emissions_df.attrs.get('units_map', {})
+                        if not isinstance(existing_map, dict): existing_map = {}
+                        for k, v in units_map_arg.items():
+                            existing_map[k] = v
+                        emissions_df.attrs['units_map'] = existing_map
 
                     # NCF Auto-Grid Logic
                     if isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc')):
-                         try:
+                        try:
                             # Lazy import
                             from ncf_processing import create_ncf_domain_gdf, read_ncf_grid_params, get_ncf_dims, read_ncf_emissions
                             safe_notify('INFO', 'Detected NetCDF input. Auto-configuring grid geometry...')
@@ -1502,16 +1507,16 @@ class EmissionGUI:
                                 if target_lay and target_lay in lay_vals:
                                     self.ncf_layer_menu.set(target_lay)
                                 elif self.ncf_layer_var.get() not in lay_vals:
-                                     # Default to Layer 1 for backward compatibility/preference? Or Sum?
-                                     # Let's keep Layer 1 as default as it's often surface
-                                     if n_lay > 0:
-                                       self.ncf_layer_menu.set(lay_vals[2]) # 0 is Sum, 1 is Avg, 2 is Layer 1
+                                    # Default to Layer 1 for backward compatibility/preference? Or Sum?
+                                    # Let's keep Layer 1 as default as it's often surface
+                                    if n_lay > 0:
+                                        self.ncf_layer_menu.set(lay_vals[2]) # 0 is Sum, 1 is Avg, 2 is Layer 1
                                 
                                 # Use TFLAG values if available
                                 if tflags and len(tflags) == n_ts:
-                                     ts_vals = ['Sum All Time', 'Average All Time'] + [f"{t}" for i, t in enumerate(tflags)]
+                                    ts_vals = ['Sum All Time', 'Average All Time'] + [f"{t}" for i, t in enumerate(tflags)]
                                 else:
-                                     ts_vals = ['Sum All Time', 'Average All Time'] + [f"{i+1}" for i in range(n_ts)]
+                                    ts_vals = ['Sum All Time', 'Average All Time'] + [f"{i+1}" for i in range(n_ts)]
                                 
                                 self.ncf_tstep_menu['values'] = ts_vals
 
@@ -1520,7 +1525,7 @@ class EmissionGUI:
                                 if target_ts and target_ts in ts_vals:
                                     self.ncf_tstep_menu.set(target_ts)
                                 elif self.ncf_tstep_var.get() not in ts_vals:
-                                     self.ncf_tstep_menu.set(ts_vals[1])
+                                    self.ncf_tstep_menu.set(ts_vals[1])
 
                             self.root.after(0, _update_ncf_ui)
 
@@ -1537,9 +1542,9 @@ class EmissionGUI:
                                 l_idx = None
                                 l_op = 'mean'
                             elif 'Layer' in curr_lay_str:
-                                 try: l_idx = int(curr_lay_str.split()[-1]) - 1
-                                 except: l_idx = 0
-                                 l_op = 'select'
+                                try: l_idx = int(curr_lay_str.split()[-1]) - 1
+                                except: l_idx = 0
+                                l_op = 'select'
                             
                             ts_idx = None
                             ts_op = 'mean'
@@ -1550,27 +1555,27 @@ class EmissionGUI:
                                 ts_idx = None
                                 ts_op = 'mean'
                             elif curr_ts_str:
-                                 try:
-                                     # Re-construct expected list to find index
-                                     # n_ts and tflags are available here
-                                     flag_list = []
-                                     if tflags and len(tflags) == n_ts:
-                                          flag_list = [f"{t}" for t in tflags]
-                                     else:
-                                          flag_list = [f"{i+1}" for i in range(n_ts)]
+                                try:
+                                    # Re-construct expected list to find index
+                                    # n_ts and tflags are available here
+                                    flag_list = []
+                                    if tflags and len(tflags) == n_ts:
+                                        flag_list = [f"{t}" for t in tflags]
+                                    else:
+                                        flag_list = [f"{i+1}" for i in range(n_ts)]
                                      
-                                     if curr_ts_str in flag_list:
-                                          ts_idx = flag_list.index(curr_ts_str)
-                                          ts_op = 'select'
-                                     else:
-                                          # Fallback for old format "Time X ..."
-                                          if 'Time' in curr_ts_str:
-                                               token = curr_ts_str.replace('Time', '', 1).strip().split()[0]
-                                               ts_idx = int(token) - 1
-                                               ts_op = 'select'
-                                 except: 
-                                      ts_idx = None
-                                      ts_op = 'sum'
+                                    if curr_ts_str in flag_list:
+                                        ts_idx = flag_list.index(curr_ts_str)
+                                        ts_op = 'select'
+                                    else:
+                                        # Fallback for old format "Time X ..."
+                                        if 'Time' in curr_ts_str:
+                                                token = curr_ts_str.replace('Time', '', 1).strip().split()[0]
+                                                ts_idx = int(token) - 1
+                                                ts_op = 'select'
+                                except: 
+                                        ts_idx = None
+                                        ts_op = 'sum'
                             
                             # Re-read emissions with specific params
                             # Note: read_inputfile called read_ncf_emissions default inside data_processing.
@@ -1599,8 +1604,8 @@ class EmissionGUI:
                                     self.status_var.set("Grid geometry loaded from NetCDF.")
                                 
                                 self.root.after(0, lambda: _set_ncf_grid(ncf_grid_gdf))
-                         except Exception as grid_err:
-                             safe_notify('WARNING', f"Failed to auto-configure grid from NetCDF: {grid_err}")
+                        except Exception as grid_err:
+                            safe_notify('WARNING', f"Failed to auto-configure grid from NetCDF: {grid_err}")
 
                 except Exception as e:
                     err_msg = str(e)
@@ -1628,14 +1633,14 @@ class EmissionGUI:
                                 pass
                         
                         if should_fill:
-                             # Fill emissions_df
-                             cols = emissions_df.select_dtypes(include=[np.number]).columns
-                             if len(cols) > 0:
-                                 emissions_df[cols] = emissions_df[cols].fillna(fill_num)
-                             # Fill raw_df
-                             rcols = raw_df.select_dtypes(include=[np.number]).columns
-                             if len(rcols) > 0:
-                                 raw_df[rcols] = raw_df[rcols].fillna(fill_num)
+                            # Fill emissions_df
+                            cols = emissions_df.select_dtypes(include=[np.number]).columns
+                            if len(cols) > 0:
+                                emissions_df[cols] = emissions_df[cols].fillna(fill_num)
+                            # Fill raw_df
+                            rcols = raw_df.select_dtypes(include=[np.number]).columns
+                            if len(rcols) > 0:
+                                raw_df[rcols] = raw_df[rcols].fillna(fill_num)
                     except Exception as e:
                         print(f"Fill NaN error: {e}")
 
@@ -1651,7 +1656,7 @@ class EmissionGUI:
                 self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
         
         except Exception as e:
-             self.root.after(0, lambda: self._notify('ERROR', 'Async Load Error', str(e), exc=e))
+            self.root.after(0, lambda: self._notify('ERROR', 'Async Load Error', str(e), exc=e))
 
     def _compute_scc_data(self, df):
         has = False
@@ -1771,46 +1776,46 @@ class EmissionGUI:
 
     def load_overlay(self):
         try:
-             # Handle multiple files (semicolon separated)
-             ov_paths = self.overlay_path
-             if not ov_paths:
-                 return
+            # Handle multiple files (semicolon separated)
+            ov_paths = self.overlay_path
+            if not ov_paths:
+                return
              
-             file_list = []
-             if isinstance(ov_paths, str):
-                 file_list = [p.strip() for p in ov_paths.split(';') if p.strip()]
-             elif isinstance(ov_paths, (list, tuple)):
-                 for item in ov_paths:
-                     if isinstance(item, str):
-                         file_list.extend([p.strip() for p in item.split(';') if p.strip()])
-                     else:
-                         file_list.append(str(item))
-             else:
-                 file_list = [str(ov_paths)]
+            file_list = []
+            if isinstance(ov_paths, str):
+                file_list = [p.strip() for p in ov_paths.split(';') if p.strip()]
+            elif isinstance(ov_paths, (list, tuple)):
+                for item in ov_paths:
+                    if isinstance(item, str):
+                        file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                    else:
+                        file_list.append(str(item))
+            else:
+                file_list = [str(ov_paths)]
 
-             loaded_parts = []
-             for fpath in file_list:
-                 try:
-                     part = read_shpfile(fpath, False)
-                     if part is not None and not part.empty:
-                         loaded_parts.append(part)
-                 except Exception:
-                     self._notify("WARNING", "Overlay Load Warning", f"Failed to load overlay part: {fpath}")
+            loaded_parts = []
+            for fpath in file_list:
+                try:
+                    part = read_shpfile(fpath, False)
+                    if part is not None and not part.empty:
+                        loaded_parts.append(part)
+                except Exception:
+                    self._notify("WARNING", "Overlay Load Warning", f"Failed to load overlay part: {fpath}")
              
-             if not loaded_parts:
-                 self.overlay_gdf = None
-             elif len(loaded_parts) == 1:
-                 self.overlay_gdf = loaded_parts[0]
-             else:
-                 # Combine multiple layers
-                 target = loaded_parts[0]
-                 target_crs = target.crs
-                 final_list = [target]
-                 for other in loaded_parts[1:]:
-                     if target_crs and other.crs and other.crs != target_crs:
-                         other = other.to_crs(target_crs)
-                     final_list.append(other)
-                 self.overlay_gdf = pd.concat(final_list, ignore_index=True)
+            if not loaded_parts:
+                self.overlay_gdf = None
+            elif len(loaded_parts) == 1:
+                self.overlay_gdf = loaded_parts[0]
+            else:
+                # Combine multiple layers
+                target = loaded_parts[0]
+                target_crs = target.crs
+                final_list = [target]
+                for other in loaded_parts[1:]:
+                    if target_crs and other.crs and other.crs != target_crs:
+                        other = other.to_crs(target_crs)
+                    final_list.append(other)
+                self.overlay_gdf = pd.concat(final_list, ignore_index=True)
                  
         except Exception as e:
             self._notify('ERROR', 'Overlay Shapefile Load Error', str(e), exc=e)
@@ -2066,27 +2071,28 @@ class EmissionGUI:
 
         # Filter by Overlay Shapefile if enabled
         try:
-             filter_mode = None
-             if getattr(self, 'filter_overlay_var', None):
-                  val = self.filter_overlay_var.get()
-                  if isinstance(val, str):
-                      s = val.strip().lower()
-                      if s not in ('false', 'none', 'off', 'null', ''):
-                           filter_mode = 'intersect' if s == 'true' else s
-                  elif isinstance(val, bool) and val:
-                      filter_mode = 'intersect'
+            filter_mode = None
+            if getattr(self, 'filter_overlay_var', None):
+                val = self.filter_overlay_var.get()
+                if isinstance(val, str):
+                        s = val.strip().lower()
+                        if s not in ('false', 'none', 'off', 'null', ''):
+                            filter_mode = 'intersect' if s == 'true' else s
+                elif isinstance(val, bool) and val:
+                        filter_mode = 'intersect'
              
-             ov_gdf = getattr(self, 'overlay_gdf', None)
-             if filter_mode and ov_gdf is not None and not ov_gdf.empty:
-                 _do_notify('INFO', 'Filtering', f'Filtering data by overlay ({filter_mode})...', popup=False)
-                 
-                 # apply_spatial_filter handles CRS conversion and logic
-                 try:
-                     merged = apply_spatial_filter(merged, ov_gdf, filter_mode)
-                 except Exception as e:
-                     _do_notify('WARNING', 'Filter Failed', f"Could not filter by overlay ({filter_mode}): {e}")
+            ov_gdf = getattr(self, 'overlay_gdf', None)
+            if filter_mode and ov_gdf is not None:
+                if not ov_gdf.empty:
+                    _do_notify('INFO', 'Filtering', f'Filtering data by overlay ({filter_mode})...', popup=False)
+                     
+                    # apply_spatial_filter handles CRS conversion and logic
+                    try:
+                        merged = apply_spatial_filter(merged, ov_gdf, filter_mode)
+                    except Exception as e:
+                        _do_notify('WARNING', 'Filter Failed', f"Could not filter by overlay ({filter_mode}): {e}")
         except Exception as e:
-             _do_notify('WARNING', 'Filter Logic Error', str(e))
+            _do_notify('WARNING', 'Filter Logic Error', str(e))
 
         try:
             cache_df = merged.copy()
@@ -2420,9 +2426,9 @@ class EmissionGUI:
                 )
             except ValueError as ve:
                 if str(ve) == "Handled":
-                     # Diagnostic notification already sent
-                     self.root.after(0, self._enable_plot_btn)
-                     return
+                    # Diagnostic notification already sent
+                    self.root.after(0, self._enable_plot_btn)
+                    return
                 raise ve
             
             if merged is None:
@@ -2436,9 +2442,9 @@ class EmissionGUI:
                 merged_plot = merged.to_crs(plot_crs) if plot_crs is not None and getattr(merged, 'crs', None) is not None else merged
                 # Ensure attributes needed for time series (stack_groups_path) are preserved
                 if getattr(merged, 'attrs', None) and getattr(merged_plot, 'attrs', None) is not None:
-                     for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path']:
-                          if k in merged.attrs:
-                               merged_plot.attrs[k] = merged.attrs[k]
+                    for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path']:
+                        if k in merged.attrs:
+                                merged_plot.attrs[k] = merged.attrs[k]
             except Exception:
                 merged_plot = merged
             
@@ -2449,8 +2455,18 @@ class EmissionGUI:
             self.root.after(0, self._enable_plot_btn)
 
     def _finalize_plot(self, merged, merged_plot, pollutant, plot_crs_info):
+        import time
+        _t_start = time.time()
+        _t_last = [_t_start]  # Use list to avoid nonlocal issues
+        def _log_time(msg):
+            elapsed = time.time() - _t_last[0]
+            total = time.time() - _t_start
+            logging.info(f"[PLOT TIMING] {msg}: {elapsed:.2f}s (total: {total:.2f}s)")
+            _t_last[0] = time.time()
+        
         self._enable_plot_btn()
         self._set_status("Rendering plot...", level="INFO")
+        _log_time("Plot initialization")
         # Save current settings on successful plot generation
         self._save_settings()
 
@@ -2462,57 +2478,132 @@ class EmissionGUI:
             self._notify('ERROR', 'Backend Error', f'Failed to load TkAgg backend: {e}', exc=e)
             return
 
-        # Create a new pop-out window for this plot
-        win = tk.Toplevel(self.root)
-        win.title("Map: plotting...")
-        plot_container = ttk.Frame(win)
-        plot_container.pack(side='top', fill='both', expand=True)
-        # Scale figure size modestly with UI scale
-        try:
-            base_w, base_h = 9.0, 5.0
-            fig_w = max(6.0, min(16.0, base_w * getattr(self, '_ui_scale', 1.0)))
-            fig_h = max(3.5, min(10.0, base_h * getattr(self, '_ui_scale', 1.0)))
-        except Exception:
-            fig_w, fig_h = 9.0, 5.0
-        local_fig = Figure(figsize=(fig_w, fig_h), dpi=100)
-        local_ax = local_fig.add_subplot(111)
-        canvas = FigureCanvasTkAgg(local_fig, master=plot_container)
-        canvas.draw()
-        canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
-        # Toolbar (remove Zoom tool)
-        try:
+        # Determine if we can reuse an existing window for THIS pollutant.
+        plot_state = self._plot_windows.get(pollutant)
+        reuse_window = False
+        
+        if plot_state and plot_state.get('win'):
             try:
-                import PIL.ImageTk  # type: ignore  # noqa: F401
+                if plot_state['win'].winfo_exists():
+                    reuse_window = True
+                else:
+                    self._plot_windows.pop(pollutant, None)
+                    plot_state = None
             except Exception:
-                pass
-            BaseNav = NavigationToolbar2Tk
-            class _NoZoomToolbar(BaseNav):
-                toolitems = tuple(t for t in getattr(BaseNav, 'toolitems', []) if t and t[0] != 'Zoom')
-            toolbar = _NoZoomToolbar(canvas, plot_container, pack_toolbar=False)
-        except Exception:
-            from matplotlib.backends._backend_tk import NavigationToolbar2Tk as _Nav
-            class _TextToolbar(_Nav):
-                def _Button(self, text, image_file, toggle=False, command=None):
-                    if text == 'Zoom':
-                        return tk.Button(master=self, text='')
-                    if toggle:
-                        var = tk.IntVar(master=self, value=0)
-                        btn = tk.Checkbutton(master=self, text=text, indicatoron=0, variable=var, command=command)
-                        def _select():
-                            try: var.set(1)
-                            except Exception: pass
-                        def _deselect():
-                            try: var.set(0)
-                            except Exception: pass
-                        btn.select = _select  # type: ignore[attr-defined]
-                        btn.deselect = _deselect  # type: ignore[attr-defined]
-                    else:
-                        btn = tk.Button(master=self, text=text, command=command)
-                    btn.pack(side=tk.LEFT)
-                    return btn
-            toolbar = _TextToolbar(canvas, plot_container, pack_toolbar=False)
-        toolbar.update()
-        toolbar.pack(side='top', fill='x')
+                self._plot_windows.pop(pollutant, None)
+                plot_state = None
+
+        win = None
+        local_fig = None
+        local_ax = None
+        canvas = None
+        toolbar = None
+
+        plot_container = None
+        if reuse_window:
+            # Reuse existing window assets
+            try:
+                local_ax = plot_state['ax']
+                local_fig = plot_state['fig']
+                canvas = plot_state['canvas']
+                win = plot_state['win']
+                toolbar = plot_state.get('toolbar')
+                plot_container = plot_state.get('plot_container')
+
+                # Clear the main axis
+                local_ax.clear()
+                
+                # Clean up UI (Export, Time Series controls)
+                if plot_container:
+                    for child in plot_container.winfo_children():
+                        # Keep Canvas and Toolbar
+                        if child not in (canvas.get_tk_widget(), toolbar):
+                                try: child.destroy()
+                                except: pass
+
+                # Cleanup old stats callbacks specific to this window
+                old_cbids = plot_state.get('stats_cbids', [])
+                for cid in old_cbids:
+                    try: local_ax.callbacks.disconnect(cid)
+                    except: pass
+                plot_state['stats_cbids'] = []
+                
+                # Remove any other axes (colorbars) but keep main ax
+                for ax in local_fig.axes:
+                    if ax != local_ax:
+                        local_fig.delaxes(ax)
+                
+                # Bring to front
+                win.deiconify()
+                win.lift()
+                logging.info(f"Reusing existing plot window for {pollutant}.")
+            except Exception as e:
+                logging.warning("Failed to reuse window: %s", e)
+                reuse_window = False
+                self._plot_windows.pop(pollutant, None)
+                plot_state = None
+
+        if not reuse_window:
+            # Create a new pop-out window for this plot
+            win = tk.Toplevel(self.root)
+            win.title(f"Map: {pollutant}")
+            
+            # Setup close handler to remove from dict
+            def _on_destroy(event, p=pollutant, w=win):
+                if event.widget == w:
+                    try: self._plot_windows.pop(p, None)
+                    except: pass
+            win.bind("<Destroy>", _on_destroy)
+
+            plot_container = ttk.Frame(win)
+            plot_container.pack(side='top', fill='both', expand=True)
+            # Scale figure size modestly with UI scale
+            try:
+                base_w, base_h = 9.0, 5.0
+                fig_w = max(6.0, min(16.0, base_w * getattr(self, '_ui_scale', 1.0)))
+                fig_h = max(3.5, min(10.0, base_h * getattr(self, '_ui_scale', 1.0)))
+            except Exception:
+                fig_w, fig_h = 9.0, 5.0
+            local_fig = Figure(figsize=(fig_w, fig_h), dpi=100)
+            local_ax = local_fig.add_subplot(111)
+            canvas = FigureCanvasTkAgg(local_fig, master=plot_container)
+            canvas.draw()
+            _log_time("Initial canvas draw")
+            canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
+            # Toolbar (remove Zoom tool)
+            try:
+                try:
+                    import PIL.ImageTk  # type: ignore  # noqa: F401
+                except Exception:
+                    pass
+                BaseNav = NavigationToolbar2Tk
+                class _NoZoomToolbar(BaseNav):
+                    toolitems = tuple(t for t in getattr(BaseNav, 'toolitems', []) if t and t[0] != 'Zoom')
+                toolbar = _NoZoomToolbar(canvas, plot_container, pack_toolbar=False)
+            except Exception:
+                from matplotlib.backends._backend_tk import NavigationToolbar2Tk as _Nav
+                class _TextToolbar(_Nav):
+                    def _Button(self, text, image_file, toggle=False, command=None):
+                        if text == 'Zoom': return tk.Button(master=self, text='')
+                        if toggle:
+                            var = tk.IntVar(master=self, value=0)
+                            btn = tk.Checkbutton(master=self, text=text, indicatoron=0, variable=var, command=command)
+                            def _select():
+                                try: var.set(1)
+                                except Exception: pass
+                            def _deselect():
+                                try: var.set(0)
+                                except Exception: pass
+                            btn.select = _select  # type: ignore[attr-defined]
+                            btn.deselect = _deselect  # type: ignore[attr-defined]
+                        else:
+                            btn = tk.Button(master=self, text=text, command=command)
+                        btn.pack(side=tk.LEFT)
+                        return btn
+                toolbar = _TextToolbar(canvas, plot_container, pack_toolbar=False)
+            toolbar.update()
+            toolbar.pack(side='top', fill='x')
+
         cbar_ax = None
 
         # Export controls (extent checkbox + button)
@@ -2521,6 +2612,7 @@ class EmissionGUI:
             export_frame.pack(side='top', fill='x', pady=(2, 0))
             extent_only_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(export_frame, text='Current extent only', variable=extent_only_var).pack(side='left', padx=(4, 8))
+            
             def _export_layer():
                 try:
                     # Choose file path and format by extension
@@ -2532,9 +2624,14 @@ class EmissionGUI:
                 if not path:
                     return
                 try:
-                    gdf_src = merged_plot if 'merged_plot' in locals() and isinstance(merged_plot, gpd.GeoDataFrame) else merged
+                    # Use attached data if available (fixes stale closure on reuse)
+                    try:
+                        gdf_src = getattr(local_ax, '_current_data', merged_plot)
+                    except:
+                        gdf_src = merged_plot
                 except Exception:
                     gdf_src = merged
+                
                 gdf_to_write = gdf_src
                 # Subset to current extent if requested
                 if extent_only_var.get():
@@ -2605,10 +2702,18 @@ class EmissionGUI:
             pass
 
         # Keep references on the instance to prevent GC of handlers
-        self._pop_fig = local_fig
-        self._pop_ax = local_ax
-        self._pop_canvas = canvas
-        self._pop_toolbar = toolbar
+        # Save state to dictionary if this was a new window
+        if not reuse_window:
+            plot_state = {
+                'win': win,
+                'fig': local_fig,
+                'ax': local_ax,
+                'canvas': canvas,
+                'toolbar': toolbar if 'toolbar' in locals() else None,
+                'plot_container': plot_container,
+                'stats_cbids': []
+            }
+            self._plot_windows[pollutant] = plot_state
 
         plot_crs, tf_fwd, tf_inv = plot_crs_info if plot_crs_info else (None, None, None)
         data = merged[pollutant]
@@ -2627,15 +2732,15 @@ class EmissionGUI:
         _dark_cmaps = {'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'}
         
         if _cmap_lower in _dark_cmaps:
-             county_color = 'black'    # User requested persistent black
-             overlay_color = 'cyan'    # High contrast highlight (Neon)
-             county_lw = 0.6           # Increased visibility
-             overlay_lw = 0.8
+            county_color = 'black'    # User requested persistent black
+            overlay_color = 'cyan'    # High contrast highlight (Neon)
+            county_lw = 0.6           # Increased visibility
+            overlay_lw = 0.8
         else:
-             county_color = 'black'    # User requested persistent black
-             overlay_color = 'black'   # Max contrast on light maps
-             county_lw = 0.6           # Increased visibility
-             overlay_lw = 0.8
+            county_color = 'black'    # User requested persistent black
+            overlay_color = 'black'   # Max contrast on light maps
+            county_lw = 0.6           # Increased visibility
+            overlay_lw = 0.8
 
         try:
             cmap_registry = getattr(matplotlib, 'colormaps', None)
@@ -2683,44 +2788,53 @@ class EmissionGUI:
         p_lw = 0.05
         p_ec = 'black'
         if len(merged_plot) > 20000:
-             p_lw = 0.0
-             p_ec = 'none'
-             if getattr(self, '_notify', None):
-                  # Update status without popup
-                  try: self.status_var.set("Rendering optimized (edges disabled due to density)...")
-                  except: pass
+            p_lw = 0.0
+            p_ec = 'none'
+            if getattr(self, '_notify', None):
+                # Update status without popup
+                try: self.status_var.set("Rendering optimized (edges disabled due to density)...")
+                except: pass
         
         # Ensure uniform collection size for animation (plot all geometries, even if NaN)
         if pollutant in merged_plot.columns:
-             try:
-                 merged_plot[pollutant] = merged_plot[pollutant].fillna(0.0)
-             except Exception: pass
+            try:
+                merged_plot[pollutant] = merged_plot[pollutant].fillna(0.0)
+            except Exception: pass
 
         # Ensure 'bad' values (NaNs) are plotted in the same collection using set_bad
         # This prevents GeoPandas from creating a separate collection for missing values,
         # which is required for the animation updates (set_array) to work correctly on the full grid.
         try:
             if not (len(bins) >= 2): # already copied if discrete
-                 cmap = copy.copy(cmap)
+                cmap = copy.copy(cmap)
             cmap.set_bad('#f0f0f0', alpha=1.0)
         except Exception: pass
 
-        merged_plot.plot(
+        # Attach data for export (closure workaround)
+        local_ax._current_data = merged_plot
+        
+        # Use shared plotting function
+        self._data_collection = create_map_plot(
+            gdf=merged_plot,
             column=pollutant,
+            title="", # GUI handles title via window logic
             ax=local_ax,
-            legend=True,
-            cmap=cmap,
+            cmap_name=cmap, # Pass object
+            bins=bins, 
+            unit_label=None, # GUI handles labeling manually below
+            overlay_counties=None, # GUI handles layers separately
+            overlay_shape=None,
+            crs_proj=plot_crs, # needed for overlays if we added them, but helpful for context
+            tf_fwd=None, # GUI handles graticule manually
+            tf_inv=None,
+            zoom_to_data=False, # GUI handles zoom manually
+            # Style & Overrides
             linewidth=p_lw,
             edgecolor=p_ec,
             norm=norm,
             zorder=1
         )
-        # Capture the main data collection immediately to prevent ambiguity later
-        # The last collection added to the axes is the one we just plotted
-        try:
-             self._data_collection = local_ax.collections[-1]
-        except Exception:
-             self._data_collection = None
+        _log_time("GeoPandas plot() completed")
 
         # Identify newly created colorbar axis (any new axis besides main)
         post_axes = set(local_fig.axes)
@@ -2865,20 +2979,24 @@ class EmissionGUI:
                 except Exception:
                     pass
         # Draw graticule lines on projected map
+        logging.info(f"DEBUG GUI Graticule Check: CRS={plot_crs}, FWD={tf_fwd}, INV={tf_inv}")
         try:
-            if plot_crs is not None and tf_fwd is not None and tf_inv is not None and not plot_crs.is_geographic:
+            if plot_crs is not None and tf_fwd is not None and tf_inv is not None:
                 # Slightly behind the polygons (zorder=0 in draw function)
-                self._draw_graticule(local_ax, tf_fwd, tf_inv, lon_step=5, lat_step=5)
+                self._draw_graticule(local_ax, tf_fwd, tf_inv, lon_step=None, lat_step=None)
                 # Equal aspect to preserve shapes visually
                 try:
                     local_ax.set_aspect('equal', adjustable='box')
                 except Exception:
                     pass
+            else:
+                logging.warning("DEBUG GUI Graticule SKIPPED: Missing transformers or CRS")
         except Exception:
             pass
         # Record base view for this window and wire Home
         try:
             base_view = (local_ax.get_xlim(), local_ax.get_ylim())
+            self._base_views[pollutant] = base_view # Store base view per pollutant
             try:
                 base_view_holder = {}
                 base_view_holder['limits'] = base_view  # keep stats baseline aligned with Home view
@@ -2923,7 +3041,7 @@ class EmissionGUI:
                 main_title += f" ({units})"
                 # Also update units map for colorbar if not set
                 if pollutant not in self.units_map:
-                     self.units_map[pollutant] = units
+                    self.units_map[pollutant] = units
         else:
             main_title = f"{pollutant} emissions from {src}" if src else f"{pollutant} emission"
         
@@ -2942,14 +3060,14 @@ class EmissionGUI:
                             ('proxy_ncf_path' in attrs)
             
             if is_ncf_source:
-                 if hasattr(self, 'ncf_layer_var') and self.ncf_layer_var.get():
-                     ncf_parts.append(self.ncf_layer_var.get())
-                 if hasattr(self, 'ncf_tstep_var') and self.ncf_tstep_var.get():
-                     ts_val = self.ncf_tstep_var.get()
-                     if 'Sum' in ts_val:
-                          ncf_parts.append(ts_val)
-                     else:
-                          ncf_parts.append(f"Time: {ts_val}")
+                if hasattr(self, 'ncf_layer_var') and self.ncf_layer_var.get():
+                    ncf_parts.append(self.ncf_layer_var.get())
+                if hasattr(self, 'ncf_tstep_var') and self.ncf_tstep_var.get():
+                    ts_val = self.ncf_tstep_var.get()
+                    if 'Sum' in ts_val:
+                        ncf_parts.append(ts_val)
+                    else:
+                        ncf_parts.append(f"Time: {ts_val}")
         except Exception:
             pass
 
@@ -2958,17 +3076,24 @@ class EmissionGUI:
             title_lines.append(", ".join(ncf_parts))
         if sel_disp and sel_disp != 'All SCC':
             title_lines.append(f"SCC: {sel_disp}")
+        
+        # Apply Title to Axes (Fix for missing title)
+        try:
+            if title_lines:
+                local_ax.set_title("\n".join(title_lines), fontsize=12)
+        except Exception:
+            pass
 
         # Add Time Series buttons if NCF
         is_ncf_source = False
         ts_click_handler = None
         try:
-             src_type = attrs.get('source_type')
-             is_ncf_source = (src_type == 'gridded_netcdf') or \
-                             (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
-                             ('proxy_ncf_path' in attrs)
+            src_type = attrs.get('source_type')
+            is_ncf_source = (src_type == 'gridded_netcdf') or \
+                            (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
+                            ('proxy_ncf_path' in attrs)
         except Exception:
-             pass
+            pass
         
         # Text artist (Stats) anchored to bottom-left inside axes
         # Defined early so it can be updated by Time Nav
@@ -2981,608 +3106,608 @@ class EmissionGUI:
         )
 
         if is_ncf_source:
-             ts_frame = ttk.Frame(plot_container)
-             ts_frame.pack(side='top', fill='x', pady=(2, 0))
+            ts_frame = ttk.Frame(plot_container)
+            ts_frame.pack(side='top', fill='x', pady=(2, 0))
 
-             # --- Time Stepping Controls ---
-             nav_frame = ttk.Frame(plot_container) 
-             nav_frame.pack(side='top', fill='x', pady=(2, 0))
+            # --- Time Stepping Controls ---
+            nav_frame = ttk.Frame(plot_container) 
+            nav_frame.pack(side='top', fill='x', pady=(2, 0))
              
-             self._t_data_cache = None
-             self._t_idx = 0
-             # stats_box - removed, using stats_text
+            self._t_data_cache = None
+            self._t_idx = 0
+            # stats_box - removed, using stats_text
              
-             lbl_time = ttk.Label(nav_frame, text="Time: Initial")
-             lbl_time.pack(side='left', padx=5)
+            lbl_time = ttk.Label(nav_frame, text="Time: Initial")
+            lbl_time.pack(side='left', padx=5)
 
-             def _ensure_time_data():
-                 if self._t_data_cache is not None: return True
-                 try:
-                     from ncf_processing import get_ncf_animation_data
-                 except ImportError: return False
+            def _ensure_time_data():
+                if self._t_data_cache is not None: return True
+                try:
+                    from ncf_processing import get_ncf_animation_data
+                except ImportError: return False
                  
-                 # Prepare indices for ALL cells in plot
-                 r_col = 'ROW'; c_col = 'COL'
-                 if 'ROW' not in merged_plot.columns and 'ROW_x' in merged_plot.columns: r_col = 'ROW_x'
-                 if 'COL' not in merged_plot.columns and 'COL_x' in merged_plot.columns: c_col = 'COL_x'
+                # Prepare indices for ALL cells in plot
+                r_col = 'ROW'; c_col = 'COL'
+                if 'ROW' not in merged_plot.columns and 'ROW_x' in merged_plot.columns: r_col = 'ROW_x'
+                if 'COL' not in merged_plot.columns and 'COL_x' in merged_plot.columns: c_col = 'COL_x'
                  
-                 # 0-based indices
-                 try:
-                     # Robust extraction: fillna(0) ensures no NaNs cause crash during casting
-                     rows = merged_plot[r_col].fillna(0).astype(int) - 1
-                     cols = merged_plot[c_col].fillna(0).astype(int) - 1
-                 except Exception as e:
-                     logging.error(f"Failed to extract grid indices: {e}") 
-                     return False
+                # 0-based indices
+                try:
+                    # Robust extraction: fillna(0) ensures no NaNs cause crash during casting
+                    rows = merged_plot[r_col].fillna(0).astype(int) - 1
+                    cols = merged_plot[c_col].fillna(0).astype(int) - 1
+                except Exception as e:
+                    logging.error(f"Failed to extract grid indices: {e}") 
+                    return False
                  
-                 # Layer op
-                 l_idx = 0; l_op = 'select'
-                 try: 
-                     lay_setting = self.ncf_layer_var.get()
-                     if "Sum" in lay_setting: l_op = 'sum'
-                     elif "Avg" in lay_setting: l_op = 'mean'
-                     elif "Layer" in lay_setting:
-                         try: l_idx = int(lay_setting.split()[-1]) - 1; l_op = 'select'
-                         except: pass
-                 except: pass
+                # Layer op
+                l_idx = 0; l_op = 'select'
+                try: 
+                    lay_setting = self.ncf_layer_var.get()
+                    if "Sum" in lay_setting: l_op = 'sum'
+                    elif "Avg" in lay_setting: l_op = 'mean'
+                    elif "Layer" in lay_setting:
+                        try: l_idx = int(lay_setting.split()[-1]) - 1; l_op = 'select'
+                        except: pass
+                except: pass
 
-                 self._set_status("Loading full time series...", level="INFO")
+                self._set_status("Loading full time series...", level="INFO")
                  
-                 # Determine variables before logging
-                 effective_path = self.inputfile_path
-                 stack_groups_path = None
-                 try:
-                     if hasattr(self.emissions_df, 'attrs'):
-                          if 'proxy_ncf_path' in self.emissions_df.attrs:
-                               effective_path = self.emissions_df.attrs['proxy_ncf_path']
-                          elif 'original_ncf_path' in self.emissions_df.attrs:
-                               effective_path = self.emissions_df.attrs['original_ncf_path']
+                # Determine variables before logging
+                effective_path = self.inputfile_path
+                stack_groups_path = None
+                try:
+                    if hasattr(self.emissions_df, 'attrs'):
+                        if 'proxy_ncf_path' in self.emissions_df.attrs:
+                                effective_path = self.emissions_df.attrs['proxy_ncf_path']
+                        elif 'original_ncf_path' in self.emissions_df.attrs:
+                                effective_path = self.emissions_df.attrs['original_ncf_path']
                           
-                          if 'stack_groups_path' in self.emissions_df.attrs:
-                               stack_groups_path = self.emissions_df.attrs['stack_groups_path']
-                 except Exception: pass
+                        if 'stack_groups_path' in self.emissions_df.attrs:
+                                stack_groups_path = self.emissions_df.attrs['stack_groups_path']
+                except Exception: pass
 
-                 logging.info(f"Loading Animation Data: Path={effective_path}, StackGroups={stack_groups_path}")
-                 if 'proxy_ncf_path' in getattr(self.emissions_df, 'attrs', {}):
-                      logging.info("Using cached gridded file for animation: %s", effective_path)
+                logging.info(f"Loading Animation Data: Path={effective_path}, StackGroups={stack_groups_path}")
+                if 'proxy_ncf_path' in getattr(self.emissions_df, 'attrs', {}):
+                        logging.info("Using cached gridded file for animation: %s", effective_path)
 
-                 # Capture Current View Scale (Initial Scale)
-                 vmin_init, vmax_init = 0, 1
-                 init_coll = None
-                 try:
-                     if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
-                         init_coll = self._data_collection
-                     else:
-                         for c in local_ax.collections:
-                             if c.get_array() is not None:
-                                 init_coll = c
-                                 break
-                     if init_coll is None and local_ax.collections: init_coll = local_ax.collections[0]
-                     if init_coll:
-                         vmin_init, vmax_init = init_coll.get_clim()
-                 except: pass
+                # Capture Current View Scale (Initial Scale)
+                vmin_init, vmax_init = 0, 1
+                init_coll = None
+                try:
+                    if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
+                        init_coll = self._data_collection
+                    else:
+                        for c in local_ax.collections:
+                            if c.get_array() is not None:
+                                init_coll = c
+                                break
+                    if init_coll is None and local_ax.collections: init_coll = local_ax.collections[0]
+                    if init_coll:
+                        vmin_init, vmax_init = init_coll.get_clim()
+                except: pass
 
-                 try:
-                     res = get_ncf_animation_data(
-                         effective_path, 
-                         pollutant, 
-                         rows.tolist(), 
-                         cols.tolist(), 
-                         layer_idx=l_idx, 
-                         layer_op=l_op,
-                         stack_groups_path=stack_groups_path
-                     )
-                     if not res:
-                         logging.error("get_ncf_animation_data returned None. Check logs for details.")
-                         # Don't show popup error, just log it to avoid spamming if user clicks around
-                         # But wait, this is _ensure_time_data, called once on creation.
-                         # If it fails, animation won't work.
-                         self._notify('WARNING', 'Animation Data', 'No time series data could be loaded for this layer.')
-                         return False
+                try:
+                    res = get_ncf_animation_data(
+                        effective_path, 
+                        pollutant, 
+                        rows.tolist(), 
+                        cols.tolist(), 
+                        layer_idx=l_idx, 
+                        layer_op=l_op,
+                        stack_groups_path=stack_groups_path
+                    )
+                    if not res:
+                        logging.error("get_ncf_animation_data returned None. Check logs for details.")
+                        # Don't show popup error, just log it to avoid spamming if user clicks around
+                        # But wait, this is _ensure_time_data, called once on creation.
+                        # If it fails, animation won't work.
+                        self._notify('WARNING', 'Animation Data', 'No time series data could be loaded for this layer.')
+                        return False
                      
-                     # Add Aggregates
-                     # vals: (T, N)
-                     vals = res['values']
-                     times = res['times']
+                    # Add Aggregates
+                    # vals: (T, N)
+                    vals = res['values']
+                    times = res['times']
                      
-                     # Total All Time (Sum across T)
-                     tot = np.sum(vals, axis=0, keepdims=True)
-                     # Average All Time (Mean across T)
-                     avg = np.mean(vals, axis=0, keepdims=True)
+                    # Total All Time (Sum across T)
+                    tot = np.sum(vals, axis=0, keepdims=True)
+                    # Average All Time (Mean across T)
+                    avg = np.mean(vals, axis=0, keepdims=True)
                      
-                     # Max/Min All Time
-                     mx_agg = np.nanmax(vals, axis=0, keepdims=True)
-                     mn_agg = np.nanmin(vals, axis=0, keepdims=True)
+                    # Max/Min All Time
+                    mx_agg = np.nanmax(vals, axis=0, keepdims=True)
+                    mn_agg = np.nanmin(vals, axis=0, keepdims=True)
                      
-                     # Store aggregates separately, do NOT stack into main playback loop
-                     res['tot_val'] = tot.flatten()
-                     res['avg_val'] = avg.flatten()
-                     res['mx_val'] = mx_agg.flatten()
-                     res['mn_val'] = mn_agg.flatten()
+                    # Store aggregates separately, do NOT stack into main playback loop
+                    res['tot_val'] = tot.flatten()
+                    res['avg_val'] = avg.flatten()
+                    res['mx_val'] = mx_agg.flatten()
+                    res['mn_val'] = mn_agg.flatten()
                      
-                     res['values'] = vals
-                     res['times'] = times
+                    res['values'] = vals
+                    res['times'] = times
                      
-                     # Calculate scale limits
-                     # Use Global Min/Max across entire time dimension for consistency
-                     # NOTE: 'vals' here is the original time-step data only, excluding Total/Avg aggregates.
+                    # Calculate scale limits
+                    # Use Global Min/Max across entire time dimension for consistency
+                    # NOTE: 'vals' here is the original time-step data only, excluding Total/Avg aggregates.
                      
-                     # Determine log scale: Prefer UI setting, then Norm type
-                     is_log = False
-                     try: 
+                    # Determine log scale: Prefer UI setting, then Norm type
+                    is_log = False
+                    try: 
                         if hasattr(self, 'scale_var') and self.scale_var.get() == 'log':
                             is_log = True
                         elif init_coll and isinstance(init_coll.norm, LogNorm):
                             is_log = True
-                     except: pass
+                    except: pass
                      
-                     if is_log:
-                         pos_vals = vals[vals > 0]
-                         res['vmin'] = pos_vals.min() if pos_vals.size > 0 else 0.001
-                         res['vmax'] = vals.max() if vals.size > 0 else 1.0
-                     else:
-                         res['vmin'] = np.nanmin(vals)
-                         res['vmax'] = np.nanmax(vals)
+                    if is_log:
+                        pos_vals = vals[vals > 0]
+                        res['vmin'] = pos_vals.min() if pos_vals.size > 0 else 0.001
+                        res['vmax'] = vals.max() if vals.size > 0 else 1.0
+                    else:
+                        res['vmin'] = np.nanmin(vals)
+                        res['vmax'] = np.nanmax(vals)
 
-                     self._t_data_cache = res
+                    self._t_data_cache = res
 
-                     # Sync _t_idx with the current UI selection (only on first load)
-                     try:
-                         # Attempt to align _t_idx with ncf_tstep_var
-                         current_sel = self.ncf_tstep_var.get()
-                         # Since aggregates are now separate, if user selected agg, we should maybe
-                         # initialize plot to that agg? Or just defaut to time step 0?
-                         # Let's default to time step 0 if an aggregate was selected, unless we add
-                         # logic to immediately show the aggregate.
-                         # The user asked to remove them from loop range.
+                    # Sync _t_idx with the current UI selection (only on first load)
+                    try:
+                        # Attempt to align _t_idx with ncf_tstep_var
+                        current_sel = self.ncf_tstep_var.get()
+                        # Since aggregates are now separate, if user selected agg, we should maybe
+                        # initialize plot to that agg? Or just defaut to time step 0?
+                        # Let's default to time step 0 if an aggregate was selected, unless we add
+                        # logic to immediately show the aggregate.
+                        # The user asked to remove them from loop range.
                          
-                         # If it's a specific time step, match it
-                         found = False
-                         for i, t in enumerate(times):
-                             if str(t).strip() == str(current_sel).strip():
-                                 self._t_idx = i
-                                 found = True
-                                 break
-                             if str(current_sel) in str(t):
-                                 self._t_idx = i
-                                 found = True
-                                 break
+                        # If it's a specific time step, match it
+                        found = False
+                        for i, t in enumerate(times):
+                            if str(t).strip() == str(current_sel).strip():
+                                self._t_idx = i
+                                found = True
+                                break
+                            if str(current_sel) in str(t):
+                                self._t_idx = i
+                                found = True
+                                break
                          
-                         if not found:
-                             self._t_idx = 0
+                        if not found:
+                            self._t_idx = 0
                              
-                     except Exception:
-                         pass
+                    except Exception:
+                        pass
 
-                     return True
-                 except Exception as e:
-                     self._notify('ERROR', 'Time Data', str(e))
-                     return False
+                    return True
+                except Exception as e:
+                    self._notify('ERROR', 'Time Data', str(e))
+                    return False
 
-             def _update_view(new_vals, time_lbl):
-                 coll = None
-                 try:
-                     if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
-                         coll = self._data_collection
-                     else:
-                         if self._t_data_cache and 'values' in self._t_data_cache:
-                             expected_size = self._t_data_cache['values'][0].size
-                             for c in local_ax.collections:
-                                 arr = c.get_array()
-                                 if arr is not None and arr.size == expected_size:
-                                     coll = c
-                                     break
-                     if coll is None and local_ax.collections:
-                         c0 = local_ax.collections[0]
-                         if c0.get_array() is not None: coll = c0
-                 except: pass
+            def _update_view(new_vals, time_lbl):
+                coll = None
+                try:
+                    if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
+                        coll = self._data_collection
+                    else:
+                        if self._t_data_cache and 'values' in self._t_data_cache:
+                            expected_size = self._t_data_cache['values'][0].size
+                            for c in local_ax.collections:
+                                arr = c.get_array()
+                                if arr is not None and arr.size == expected_size:
+                                    coll = c
+                                    break
+                    if coll is None and local_ax.collections:
+                        c0 = local_ax.collections[0]
+                        if c0.get_array() is not None: coll = c0
+                except: pass
 
-                 try:
-                     if coll:
-                         coll.set_array(new_vals)
-                         coll.set_clim(self._t_data_cache['vmin'], self._t_data_cache['vmax'])
-                         if hasattr(coll, 'colorbar') and coll.colorbar:
-                             coll.colorbar.update_normal(coll)
+                try:
+                    if coll:
+                        coll.set_array(new_vals)
+                        coll.set_clim(self._t_data_cache['vmin'], self._t_data_cache['vmax'])
+                        if hasattr(coll, 'colorbar') and coll.colorbar:
+                            coll.colorbar.update_normal(coll)
 
-                         # Calculate Stats (View Dependent)
-                         try:
-                             x0, x1 = local_ax.get_xlim()
-                             y0, y1 = local_ax.get_ylim()
-                             from shapely.geometry import box
-                             view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+                        # Calculate Stats (View Dependent)
+                        try:
+                            x0, x1 = local_ax.get_xlim()
+                            y0, y1 = local_ax.get_ylim()
+                            from shapely.geometry import box
+                            view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
                              
-                             visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
+                            visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
                              
-                             if visible_idxs:
-                                 view_vals = new_vals[visible_idxs]
-                                 filtered = view_vals[~np.isnan(view_vals)]
-                             else:
-                                 filtered = np.array([])
+                            if visible_idxs:
+                                view_vals = new_vals[visible_idxs]
+                                filtered = view_vals[~np.isnan(view_vals)]
+                            else:
+                                filtered = np.array([])
 
-                             u_str = f" ({units})" if units else ""
-                             new_title = f"{pollutant}{u_str}\nTime: {time_lbl}"
-                             local_ax.set_title(new_title)
+                            u_str = f" ({units})" if units else ""
+                            new_title = f"{pollutant}{u_str}\nTime: {time_lbl}"
+                            local_ax.set_title(new_title)
 
-                             if filtered.size > 0:
-                                 mn = np.min(filtered); mx = np.max(filtered)
-                                 u = np.mean(filtered); s = np.sum(filtered)
-                                 def _fs(v): return f"{v:.4g}"
-                                 stats_txt = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
-                                 if units: stats_txt += f" {units}"
-                                 try: stats_text.set_text(stats_txt)
-                                 except: pass
-                             else:
-                                 try: stats_text.set_text("No Data in View")
-                                 except: pass
-                         except Exception as ex:
-                             print(f"Stats update error: {ex}")
+                            if filtered.size > 0:
+                                mn = np.min(filtered); mx = np.max(filtered)
+                                u = np.mean(filtered); s = np.sum(filtered)
+                                def _fs(v): return f"{v:.4g}"
+                                stats_txt = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
+                                if units: stats_txt += f" {units}"
+                                try: stats_text.set_text(stats_txt)
+                                except: pass
+                            else:
+                                try: stats_text.set_text("No Data in View")
+                                except: pass
+                        except Exception as ex:
+                            print(f"Stats update error: {ex}")
                          
-                         n_steps = len(self._t_data_cache['times'])
-                         # Update label logic: if custom label (Agg), show it. If index-based, show index.
-                         if "Sum" in time_lbl or "Mean" in time_lbl:
-                             lbl_time.config(text=f"Time: {time_lbl}")
-                         else:
-                             lbl_time.config(text=f"Time: {time_lbl} ({self._t_idx+1}/{n_steps})")
+                        n_steps = len(self._t_data_cache['times'])
+                        # Update label logic: if custom label (Agg), show it. If index-based, show index.
+                        if "Sum" in time_lbl or "Mean" in time_lbl:
+                            lbl_time.config(text=f"Time: {time_lbl}")
+                        else:
+                            lbl_time.config(text=f"Time: {time_lbl} ({self._t_idx+1}/{n_steps})")
                          
-                         canvas.draw_idle()
-                 except Exception as e:
-                     print(f"Update failed: {e}")
+                        canvas.draw_idle()
+                except Exception as e:
+                    print(f"Update failed: {e}")
 
-             def _step_time(delta):
-                 if not _ensure_time_data(): return
-                 n_steps = len(self._t_data_cache['times'])
-                 old_idx = self._t_idx
-                 self._t_idx = (self._t_idx + delta) % n_steps
-                 new_vals = self._t_data_cache['values'][self._t_idx]
-                 time_lbl = self._t_data_cache['times'][self._t_idx]
-                 logging.info(f"Animation Step: {old_idx} -> {self._t_idx}, ValRange=[{new_vals.min():.2f}, {new_vals.max():.2f}]")
-                 _update_view(new_vals, time_lbl)
+            def _step_time(delta):
+                if not _ensure_time_data(): return
+                n_steps = len(self._t_data_cache['times'])
+                old_idx = self._t_idx
+                self._t_idx = (self._t_idx + delta) % n_steps
+                new_vals = self._t_data_cache['values'][self._t_idx]
+                time_lbl = self._t_data_cache['times'][self._t_idx]
+                logging.info(f"Animation Step: {old_idx} -> {self._t_idx}, ValRange=[{new_vals.min():.2f}, {new_vals.max():.2f}]")
+                _update_view(new_vals, time_lbl)
             
-             def _show_agg(mode):
-                 if not _ensure_time_data(): return
-                 if mode == 'total':
-                     new_vals = self._t_data_cache['tot_val']
-                     lbl = "Total (Sum)"
-                 elif mode == 'avg':
-                     new_vals = self._t_data_cache['avg_val']
-                     lbl = "Average (Mean)"
-                 elif mode == 'max':
-                     new_vals = self._t_data_cache['mx_val']
-                     lbl = "Max All Time (Grid-wise)"
-                 elif mode == 'min':
-                     new_vals = self._t_data_cache['mn_val']
-                     lbl = "Min All Time (Grid-wise)"
-                 _update_view(new_vals, lbl)
+            def _show_agg(mode):
+                if not _ensure_time_data(): return
+                if mode == 'total':
+                    new_vals = self._t_data_cache['tot_val']
+                    lbl = "Total (Sum)"
+                elif mode == 'avg':
+                    new_vals = self._t_data_cache['avg_val']
+                    lbl = "Average (Mean)"
+                elif mode == 'max':
+                    new_vals = self._t_data_cache['mx_val']
+                    lbl = "Max All Time (Grid-wise)"
+                elif mode == 'min':
+                    new_vals = self._t_data_cache['mn_val']
+                    lbl = "Min All Time (Grid-wise)"
+                _update_view(new_vals, lbl)
 
-             ttk.Button(nav_frame, text="< Prev", command=lambda: _step_time(-1)).pack(side='left', padx=2)
-             ttk.Button(nav_frame, text="Next >", command=lambda: _step_time(1)).pack(side='left', padx=2)
-             ttk.Button(nav_frame, text="Total", command=lambda: _show_agg('total')).pack(side='left', padx=5)
-             ttk.Button(nav_frame, text="Avg", command=lambda: _show_agg('avg')).pack(side='left', padx=2)
-             ttk.Button(nav_frame, text="Max", command=lambda: _show_agg('max')).pack(side='left', padx=2)
-             ttk.Button(nav_frame, text="Min", command=lambda: _show_agg('min')).pack(side='left', padx=2)
+            ttk.Button(nav_frame, text="< Prev", command=lambda: _step_time(-1)).pack(side='left', padx=2)
+            ttk.Button(nav_frame, text="Next >", command=lambda: _step_time(1)).pack(side='left', padx=2)
+            ttk.Button(nav_frame, text="Total", command=lambda: _show_agg('total')).pack(side='left', padx=5)
+            ttk.Button(nav_frame, text="Avg", command=lambda: _show_agg('avg')).pack(side='left', padx=2)
+            ttk.Button(nav_frame, text="Max", command=lambda: _show_agg('max')).pack(side='left', padx=2)
+            ttk.Button(nav_frame, text="Min", command=lambda: _show_agg('min')).pack(side='left', padx=2)
              
-             def _on_ts(mode):
-                 try:
-                     from ncf_processing import get_ncf_timeseries
-                 except ImportError:
-                     self._notify('ERROR', 'Time Series', 'Could not import NetCDF processing module.')
-                     return
+            def _on_ts(mode):
+                try:
+                    from ncf_processing import get_ncf_timeseries
+                except ImportError:
+                    self._notify('ERROR', 'Time Series', 'Could not import NetCDF processing module.')
+                    return
                  
-                 # 1. Get current bounds
-                 xmin, xmax = local_ax.get_xlim()
-                 ymin, ymax = local_ax.get_ylim()
+                # 1. Get current bounds
+                xmin, xmax = local_ax.get_xlim()
+                ymin, ymax = local_ax.get_ylim()
                  
-                 # 2. Filter gdf
-                 try:
-                     # merged_plot is in plot CRS, limits are in plot CRS
-                     # Filter by intersection
-                     from shapely.geometry import box
-                     bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
+                # 2. Filter gdf
+                try:
+                    # merged_plot is in plot CRS, limits are in plot CRS
+                    # Filter by intersection
+                    from shapely.geometry import box
+                    bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
                      
-                     sidx = merged_plot.sindex
-                     cand_idxs = list(sidx.intersection(bbox.bounds))
-                     subset = merged_plot.iloc[cand_idxs]
-                     subset = subset[subset.intersects(bbox)]
+                    sidx = merged_plot.sindex
+                    cand_idxs = list(sidx.intersection(bbox.bounds))
+                    subset = merged_plot.iloc[cand_idxs]
+                    subset = subset[subset.intersects(bbox)]
                      
-                     if subset.empty:
-                         self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
-                         return
+                    if subset.empty:
+                        self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
+                        return
                      
-                     # 3. Get indices
-                     # We need ROW and COL columns. 
-                     # They are 1-based in DF.
-                     # Handle overlap suffix from merge (_x from geom, _y from emis)
-                     r_col = 'ROW'
-                     c_col = 'COL'
-                     if 'ROW' not in subset.columns:
-                          if 'ROW_x' in subset.columns: r_col = 'ROW_x'
-                          else: r_col = None
-                     if 'COL' not in subset.columns:
-                          if 'COL_x' in subset.columns: c_col = 'COL_x'
-                          else: c_col = None
+                    # 3. Get indices
+                    # We need ROW and COL columns. 
+                    # They are 1-based in DF.
+                    # Handle overlap suffix from merge (_x from geom, _y from emis)
+                    r_col = 'ROW'
+                    c_col = 'COL'
+                    if 'ROW' not in subset.columns:
+                        if 'ROW_x' in subset.columns: r_col = 'ROW_x'
+                        else: r_col = None
+                    if 'COL' not in subset.columns:
+                        if 'COL_x' in subset.columns: c_col = 'COL_x'
+                        else: c_col = None
                           
-                     if not r_col or not c_col:
-                         if 'GRID_RC' in subset.columns:
-                             # Fallback: parse GRID_RC
-                             try:
-                                 # assuming R_C
-                                 subset['_TS_ROW'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[0]))
-                                 subset['_TS_COL'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[1]))
-                                 r_col = '_TS_ROW'
-                                 c_col = '_TS_COL'
-                             except:
-                                 self._notify('ERROR', 'Time Series', 'Grid ROW/COL could not be derived.')
-                                 return
-                         else:
-                             self._notify('ERROR', 'Time Series', 'Grid ROW/COL information missing from plot data.')
-                             return
+                    if not r_col or not c_col:
+                        if 'GRID_RC' in subset.columns:
+                            # Fallback: parse GRID_RC
+                            try:
+                                # assuming R_C
+                                subset['_TS_ROW'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[0]))
+                                subset['_TS_COL'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[1]))
+                                r_col = '_TS_ROW'
+                                c_col = '_TS_COL'
+                            except:
+                                self._notify('ERROR', 'Time Series', 'Grid ROW/COL could not be derived.')
+                                return
+                        else:
+                            self._notify('ERROR', 'Time Series', 'Grid ROW/COL information missing from plot data.')
+                            return
                      
-                     rows_0 = subset[r_col].astype(int) - 1
-                     cols_0 = subset[c_col].astype(int) - 1
+                    rows_0 = subset[r_col].astype(int) - 1
+                    cols_0 = subset[c_col].astype(int) - 1
                      
-                     # Check bounds validity
-                     if (rows_0 < 0).any() or (cols_0 < 0).any():
-                          self._notify('ERROR', 'Time Series', 'Invalid grid indices found.')
-                          return
+                    # Check bounds validity
+                    if (rows_0 < 0).any() or (cols_0 < 0).any():
+                        self._notify('ERROR', 'Time Series', 'Invalid grid indices found.')
+                        return
                      
-                 except Exception as e:
-                     self._notify('ERROR', 'Time Series Prep', f"Failed to filter grid: {e}")
-                     return
+                except Exception as e:
+                    self._notify('ERROR', 'Time Series Prep', f"Failed to filter grid: {e}")
+                    return
 
-                 # 4. Get Layer info
-                 try:
-                     lay_setting = self.ncf_layer_var.get()
-                     l_idx = 0
-                     l_op = 'select'
-                     if 'Sum All' in lay_setting:
+                # 4. Get Layer info
+                try:
+                    lay_setting = self.ncf_layer_var.get()
+                    l_idx = 0
+                    l_op = 'select'
+                    if 'Sum All' in lay_setting:
                         l_idx = None
                         l_op = 'sum'
-                     elif 'Average' in lay_setting:
+                    elif 'Average' in lay_setting:
                         l_idx = None
                         l_op = 'mean'
-                     elif 'Layer' in lay_setting:
-                         try: l_idx = int(lay_setting.split()[-1]) - 1
-                         except: l_idx = 0
-                         l_op = 'select'
-                 except: # fallback
-                     l_idx = 0
-                     l_op = 'select'
+                    elif 'Layer' in lay_setting:
+                        try: l_idx = int(lay_setting.split()[-1]) - 1
+                        except: l_idx = 0
+                        l_op = 'select'
+                except: # fallback
+                    l_idx = 0
+                    l_op = 'select'
                  
-                 # 5. Call backend
-                 self._set_status("Extracting time series...", level="INFO")
+                # 5. Call backend
+                self._set_status("Extracting time series...", level="INFO")
 
-                 # Prepare arguments for Inline support
-                 stack_groups_path = None
-                 effective_path = self.inputfile_path
-                 try:
-                     stack_groups_path = merged_plot.attrs.get('stack_groups_path')
-                     if 'proxy_ncf_path' in merged_plot.attrs:
+                # Prepare arguments for Inline support
+                stack_groups_path = None
+                effective_path = self.inputfile_path
+                try:
+                    stack_groups_path = merged_plot.attrs.get('stack_groups_path')
+                    if 'proxy_ncf_path' in merged_plot.attrs:
                         effective_path = merged_plot.attrs['proxy_ncf_path']
-                     if 'original_ncf_path' in merged_plot.attrs:
+                    if 'original_ncf_path' in merged_plot.attrs:
                         effective_path = merged_plot.attrs['original_ncf_path']
-                 except Exception:
-                     pass
+                except Exception:
+                    pass
 
-                 try:
-                     result = get_ncf_timeseries(
-                         effective_path,
-                         pollutant,
-                         rows_0.tolist(),
-                         cols_0.tolist(),
-                         layer_idx=l_idx,
-                         layer_op=l_op,
-                         op=mode,
-                         stack_groups_path=stack_groups_path
-                     )
-                 except Exception as e:
-                     self._notify('ERROR', 'Extract Error', str(e))
-                     return
+                try:
+                    result = get_ncf_timeseries(
+                        effective_path,
+                        pollutant,
+                        rows_0.tolist(),
+                        cols_0.tolist(),
+                        layer_idx=l_idx,
+                        layer_op=l_op,
+                        op=mode,
+                        stack_groups_path=stack_groups_path
+                    )
+                except Exception as e:
+                    self._notify('ERROR', 'Extract Error', str(e))
+                    return
                      
-                 if not result:
-                     self._notify('WARNING', 'Time Series', 'Extraction returned no data.')
-                     return
+                if not result:
+                    self._notify('WARNING', 'Time Series', 'Extraction returned no data.')
+                    return
                  
-                 # 6. Plot
-                 ts_view = tk.Toplevel(self.root)
-                 ts_title = f"{pollutant} Time Series ({mode.title()}) - {len(subset)} Cells"
-                 ts_view.title(ts_title)
+                # 6. Plot
+                ts_view = tk.Toplevel(self.root)
+                ts_title = f"{pollutant} Time Series ({mode.title()}) - {len(subset)} Cells"
+                ts_view.title(ts_title)
                  
-                 import matplotlib.pyplot as plt
-                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                import matplotlib.pyplot as plt
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
                  
-                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
-                 times = result['times']
-                 vals = result['values']
-                 units = result['units']
+                fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
+                times = result['times']
+                vals = result['values']
+                units = result['units']
                  
-                 # Parse time labels? YYYYDDD_HHMMSS
-                 # Maybe simplify X axis labels
-                 if isinstance(vals, dict):
-                      # Multi-line plot (Inline Sources)
-                      for label, series in vals.items():
-                           lw = 2.5 if label == 'Total' else 1.0
-                           alpha = 1.0 if label == 'Total' else 0.6
-                           ms = 4 if label == 'Total' else 2
-                           ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                # Parse time labels? YYYYDDD_HHMMSS
+                # Maybe simplify X axis labels
+                if isinstance(vals, dict):
+                        # Multi-line plot (Inline Sources)
+                        for label, series in vals.items():
+                            lw = 2.5 if label == 'Total' else 1.0
+                            alpha = 1.0 if label == 'Total' else 0.6
+                            ms = 4 if label == 'Total' else 2
+                            ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
                       
-                      # Only show legend if reasonable number of items
-                      if len(vals) < 25:
-                           ax_ts.legend(fontsize='small', loc='upper right')
-                      else:
-                           # If too many, maybe just Total in legend?
-                           ax_ts.legend(['Total'], loc='upper right')
-                 else:
-                      ax_ts.plot(vals, marker='o', markersize=4)
+                        # Only show legend if reasonable number of items
+                        if len(vals) < 25:
+                            ax_ts.legend(fontsize='small', loc='upper right')
+                        else:
+                            # If too many, maybe just Total in legend?
+                            ax_ts.legend(['Total'], loc='upper right')
+                else:
+                        ax_ts.plot(vals, marker='o', markersize=4)
                       
-                 u_str = str(units or '').strip()
-                 y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
-                 ax_ts.set_ylabel(y_lbl)
-                 ax_ts.set_xlabel("Time Step")
-                 ax_ts.grid(True, linestyle='--', alpha=0.7)
+                u_str = str(units or '').strip()
+                y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
+                ax_ts.set_ylabel(y_lbl)
+                ax_ts.set_xlabel("Time Step")
+                ax_ts.grid(True, linestyle='--', alpha=0.7)
                  
-                 if len(times) > 10:
-                      # Sparse ticks
-                      step = len(times) // 10
-                      ax_ts.set_xticks(range(0, len(times), step))
-                      ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
-                 else:
-                      ax_ts.set_xticks(range(len(times)))
-                      ax_ts.set_xticklabels(times, rotation=30, ha='right')
+                if len(times) > 10:
+                        # Sparse ticks
+                        step = len(times) // 10
+                        ax_ts.set_xticks(range(0, len(times), step))
+                        ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
+                else:
+                        ax_ts.set_xticks(range(len(times)))
+                        ax_ts.set_xticklabels(times, rotation=30, ha='right')
                  
-                 fig_ts.tight_layout()
+                fig_ts.tight_layout()
                  
-                 cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
-                 cv.draw()
-                 cv.get_tk_widget().pack(side='top', fill='both', expand=True)
+                cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
+                cv.draw()
+                cv.get_tk_widget().pack(side='top', fill='both', expand=True)
                  
-                 tb = NavigationToolbar2Tk(cv, ts_view)
-                 tb.update()
-                 tb.pack(side='top', fill='x')
+                tb = NavigationToolbar2Tk(cv, ts_view)
+                tb.update()
+                tb.pack(side='top', fill='x')
                  
-                 self._set_status("Time series extracted.", level="INFO")
+                self._set_status("Time series extracted.", level="INFO")
              
-             ttk.Button(ts_frame, text="Time_Series_Total", command=lambda: _on_ts('sum')).pack(side='left', padx=4)
-             ttk.Button(ts_frame, text="Time_Series_Averaged", command=lambda: _on_ts('mean')).pack(side='left', padx=4)
+            ttk.Button(ts_frame, text="Time_Series_Total", command=lambda: _on_ts('sum')).pack(side='left', padx=4)
+            ttk.Button(ts_frame, text="Time_Series_Averaged", command=lambda: _on_ts('mean')).pack(side='left', padx=4)
 
-             def _display_ts_window(result, title_msg):
-                 ts_view = tk.Toplevel(self.root)
-                 ts_view.title(title_msg)
-                 import matplotlib.pyplot as plt
-                 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            def _display_ts_window(result, title_msg):
+                ts_view = tk.Toplevel(self.root)
+                ts_view.title(title_msg)
+                import matplotlib.pyplot as plt
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
                  
-                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
-                 times = result['times']
-                 vals = result['values']
-                 units = result['units']
+                fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
+                times = result['times']
+                vals = result['values']
+                units = result['units']
                  
-                 if isinstance(vals, dict):
-                      # Multi-line plot (Inline Sources)
-                      for label, series in vals.items():
-                           lw = 2.5 if label == 'Total' else 1.0
-                           alpha = 1.0 if label == 'Total' else 0.6
-                           ms = 4 if label == 'Total' else 2
-                           ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                if isinstance(vals, dict):
+                        # Multi-line plot (Inline Sources)
+                        for label, series in vals.items():
+                            lw = 2.5 if label == 'Total' else 1.0
+                            alpha = 1.0 if label == 'Total' else 0.6
+                            ms = 4 if label == 'Total' else 2
+                            ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
                       
-                      if len(vals) < 25:
-                           ax_ts.legend(fontsize='small', loc='upper right')
-                      else:
-                           ax_ts.legend(['Total'], loc='upper right')
-                 else:
-                      ax_ts.plot(vals, marker='o', markersize=4)
+                        if len(vals) < 25:
+                            ax_ts.legend(fontsize='small', loc='upper right')
+                        else:
+                            ax_ts.legend(['Total'], loc='upper right')
+                else:
+                        ax_ts.plot(vals, marker='o', markersize=4)
 
-                 u_str = str(units or '').strip()
-                 y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
-                 ax_ts.set_ylabel(y_lbl)
-                 ax_ts.set_xlabel("Time Step")
-                 ax_ts.grid(True, linestyle='--', alpha=0.7)
+                u_str = str(units or '').strip()
+                y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
+                ax_ts.set_ylabel(y_lbl)
+                ax_ts.set_xlabel("Time Step")
+                ax_ts.grid(True, linestyle='--', alpha=0.7)
                  
-                 if len(times) > 10:
-                      step = max(1, len(times) // 10)
-                      ax_ts.set_xticks(range(0, len(times), step))
-                      ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
-                 else:
-                      ax_ts.set_xticks(range(len(times)))
-                      ax_ts.set_xticklabels(times, rotation=30, ha='right')
+                if len(times) > 10:
+                        step = max(1, len(times) // 10)
+                        ax_ts.set_xticks(range(0, len(times), step))
+                        ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
+                else:
+                        ax_ts.set_xticks(range(len(times)))
+                        ax_ts.set_xticklabels(times, rotation=30, ha='right')
                  
-                 fig_ts.tight_layout()
+                fig_ts.tight_layout()
                  
-                 cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
-                 cv.draw()
-                 cv.get_tk_widget().pack(side='top', fill='both', expand=True)
+                cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
+                cv.draw()
+                cv.get_tk_widget().pack(side='top', fill='both', expand=True)
                  
-                 tb = NavigationToolbar2Tk(cv, ts_view)
-                 tb.update()
-                 tb.pack(side='top', fill='x')
+                tb = NavigationToolbar2Tk(cv, ts_view)
+                tb.update()
+                tb.pack(side='top', fill='x')
 
-             def _on_click(event):
-                 # Click-to-plot logic
-                 if event.inaxes != local_ax: return
-                 if getattr(toolbar, 'mode', '') != '': return
-                 if event.button != 1: return
+            def _on_click(event):
+                # Click-to-plot logic
+                if event.inaxes != local_ax: return
+                if getattr(toolbar, 'mode', '') != '': return
+                if event.button != 1: return
                  
-                 try:
-                     from shapely.geometry import Point
-                     x, y = event.xdata, event.ydata
-                     pt = Point(x, y)
+                try:
+                    from shapely.geometry import Point
+                    x, y = event.xdata, event.ydata
+                    pt = Point(x, y)
                      
-                     target = None
-                     # Optimization: use sindex
-                     if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                         cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                         for idx in cands:
-                             row = merged_plot.iloc[idx]
-                             if row.geometry.contains(pt):
-                                 target = row
-                                 break
-                     else:
-                         matches = merged_plot[merged_plot.intersects(pt)]
-                         if not matches.empty:
-                             target = matches.iloc[0]
+                    target = None
+                    # Optimization: use sindex
+                    if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
+                        cands = list(merged_plot.sindex.intersection((x, y, x, y)))
+                        for idx in cands:
+                            row = merged_plot.iloc[idx]
+                            if row.geometry.contains(pt):
+                                target = row
+                                break
+                    else:
+                        matches = merged_plot[merged_plot.intersects(pt)]
+                        if not matches.empty:
+                            target = matches.iloc[0]
                          
-                     if target is None: return
+                    if target is None: return
 
-                     # Extract R/C
-                     r = None; c = None
-                     if 'ROW' in target: r = target['ROW']
-                     elif 'ROW_x' in target: r = target['ROW_x']
+                    # Extract R/C
+                    r = None; c = None
+                    if 'ROW' in target: r = target['ROW']
+                    elif 'ROW_x' in target: r = target['ROW_x']
                      
-                     if 'COL' in target: c = target['COL']
-                     elif 'COL_x' in target: c = target['COL_x']
+                    if 'COL' in target: c = target['COL']
+                    elif 'COL_x' in target: c = target['COL_x']
                      
-                     if (r is None or c is None) and 'GRID_RC' in target:
-                          try:
-                              parts = str(target['GRID_RC']).split('_')
-                              r = int(parts[0])
-                              c = int(parts[1])
-                          except: pass
+                    if (r is None or c is None) and 'GRID_RC' in target:
+                        try:
+                                parts = str(target['GRID_RC']).split('_')
+                                r = int(parts[0])
+                                c = int(parts[1])
+                        except: pass
                           
-                     if r is None or c is None: return
+                    if r is None or c is None: return
 
-                     l_idx = 0; l_op = 'select'
-                     try: 
-                         if hasattr(self, 'ncf_layer_var'):
-                             l_sel = self.ncf_layer_var.get()
-                             if "Sum" in l_sel: l_op = 'sum'
-                             elif "Avg" in l_sel: l_op = 'mean'
-                             else:
-                                 parts = l_sel.split()
-                                 if len(parts) > 1 and parts[-1].isdigit():
-                                     l_idx = int(parts[-1]) - 1
-                     except: pass
+                    l_idx = 0; l_op = 'select'
+                    try: 
+                        if hasattr(self, 'ncf_layer_var'):
+                            l_sel = self.ncf_layer_var.get()
+                            if "Sum" in l_sel: l_op = 'sum'
+                            elif "Avg" in l_sel: l_op = 'mean'
+                            else:
+                                parts = l_sel.split()
+                                if len(parts) > 1 and parts[-1].isdigit():
+                                    l_idx = int(parts[-1]) - 1
+                    except: pass
                      
-                     from ncf_processing import get_ncf_timeseries
-                     self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
+                    from ncf_processing import get_ncf_timeseries
+                    self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
                      
-                     attrs = getattr(merged_plot, 'attrs', {})
-                     effective_path = self.inputfile_path
-                     if 'proxy_ncf_path' in attrs:
+                    attrs = getattr(merged_plot, 'attrs', {})
+                    effective_path = self.inputfile_path
+                    if 'proxy_ncf_path' in attrs:
                         effective_path = attrs['proxy_ncf_path']
-                     if 'original_ncf_path' in attrs:
+                    if 'original_ncf_path' in attrs:
                         effective_path = attrs['original_ncf_path']
 
-                     stack_groups_path = None
-                     if 'stack_groups_path' in attrs:
-                          stack_groups_path = attrs['stack_groups_path']
+                    stack_groups_path = None
+                    if 'stack_groups_path' in attrs:
+                        stack_groups_path = attrs['stack_groups_path']
                           
-                     res = get_ncf_timeseries(
-                         effective_path,
-                         pollutant,
-                         [int(r)-1],
-                         [int(c)-1],
-                         layer_idx=l_idx,
-                         layer_op=l_op,
-                         op='mean',
-                         stack_groups_path=stack_groups_path
-                     )
+                    res = get_ncf_timeseries(
+                        effective_path,
+                        pollutant,
+                        [int(r)-1],
+                        [int(c)-1],
+                        layer_idx=l_idx,
+                        layer_op=l_op,
+                        op='mean',
+                        stack_groups_path=stack_groups_path
+                    )
                      
-                     if res:
-                         _display_ts_window(res, f"{pollutant} Time Series Cell ({r}, {c})")
-                         self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
+                    if res:
+                        _display_ts_window(res, f"{pollutant} Time Series Cell ({r}, {c})")
+                        self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
                      
-                 except Exception as e:
-                     print(f"Click handler failed: {e}")
+                except Exception as e:
+                    print(f"Click handler failed: {e}")
              
-             ts_click_handler = _on_click
+            ts_click_handler = _on_click
 
         local_ax.set_title("\n".join(title_lines))
         # Install hover/status text formatter with emission values and WGS84 lon/lat
@@ -3662,7 +3787,7 @@ class EmissionGUI:
                 zoom_press['state'] = None
                 if abs(xmax - xmin) < 1e-12 or abs(ymax - ymin) < 1e-12:
                     if ts_click_handler:
-                         ts_click_handler(event)
+                        ts_click_handler(event)
                     return
                 try:
                     toolbar.push_current()  # type: ignore[attr-defined]
@@ -3763,7 +3888,7 @@ class EmissionGUI:
             fill_active = False
             try:
                 if getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get():
-                   fill_active = True
+                    fill_active = True
                 else:
                     arg = getattr(self, 'fill_nan_arg', None)
                     if arg is not None and str(arg).lower() != 'false':
@@ -3936,51 +4061,18 @@ class EmissionGUI:
                 except Exception:
                     pass
             # Connect to axis limit changes
-            cbids = []
+            # Connect to axis limit changes
+            plot_state['stats_cbids'] = []
             try:
-                cbids.append(local_ax.callbacks.connect('xlim_changed', lambda ax: _update_stats_for_view()))
+                plot_state['stats_cbids'].append(local_ax.callbacks.connect('xlim_changed', lambda ax: _update_stats_for_view()))
             except Exception:
                 pass
             try:
-                cbids.append(local_ax.callbacks.connect('ylim_changed', lambda ax: _update_stats_for_view()))
+                plot_state['stats_cbids'].append(local_ax.callbacks.connect('ylim_changed', lambda ax: _update_stats_for_view()))
             except Exception:
                 pass
             # Run once initially
             _update_stats_for_view()
-            # Ensure cleanup on window close
-            try:
-                if hasattr(win, '_zoom_cids'):
-                    # We already have a close handler; wrap it to include stats disconnect
-                    old_handler = win.protocol("WM_DELETE_WINDOW")
-                else:
-                    old_handler = None
-            except Exception:
-                old_handler = None
-            def _close_with_stats_cleanup():
-                try:
-                    for cid in cbids:
-                        try:
-                            local_ax.callbacks.disconnect(cid)
-                        except Exception:
-                            pass
-                finally:
-                    if callable(old_handler):
-                        try:
-                            old_handler()
-                        except Exception:
-                            try:
-                                win.destroy()
-                            except Exception:
-                                pass
-                    else:
-                        try:
-                            win.destroy()
-                        except Exception:
-                            pass
-            try:
-                win.protocol("WM_DELETE_WINDOW", _close_with_stats_cleanup)
-            except Exception:
-                pass
         except Exception:
             pass
         # Finalize window title

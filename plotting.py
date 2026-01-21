@@ -2,7 +2,9 @@
 
 import logging
 import copy
+import functools
 import numpy as np
+
 import pandas as pd
 import geopandas as gpd
 import pyproj
@@ -13,6 +15,172 @@ from matplotlib.figure import Figure
 from typing import Optional, List, Dict, Any, Tuple
 
 from config import USE_SPHERICAL_EARTH
+
+
+# Module-level constant for dark colormaps to avoid recreation
+_DARK_CMAPS = {
+    'viridis', 'plasma', 'inferno', 'magma', 'cividis', 
+    'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'
+}
+
+
+def _resolve_cmap_and_theme(cmap_input: Any) -> Tuple[Any, Dict[str, Any]]:
+    """Determine colormap and associated styling theme. Accepts name (str) or Colormap object."""
+    cmap = None
+    if isinstance(cmap_input, str):
+        try:
+            if hasattr(plt, 'colormaps'):
+                cmap = plt.colormaps.get_cmap(cmap_input)
+            else:
+                cmap = mplcm.get_cmap(cmap_input)
+        except (AttributeError, ValueError, ImportError):
+            pass
+    else:
+        # Assume it's a colormap object
+        cmap = cmap_input
+
+    if cmap is None:
+        try:
+            cmap = plt.get_cmap('jet')
+        except (AttributeError, ValueError):
+            cmap = mplcm.get_cmap('jet')
+
+    # Determine theme from name
+    c_name = getattr(cmap, 'name', str(cmap_input))
+    _cmap_lower = str(c_name).lower()
+
+    if _cmap_lower in _DARK_CMAPS:
+        theme = {
+            'county_color': '#333333',
+            'overlay_color': 'cyan',
+            'county_lw': 0.4,
+            'overlay_lw': 0.8
+        }
+    else:
+        theme = {
+            'county_color': '#000000',
+            'overlay_color': 'black',
+            'county_lw': 0.4,
+            'overlay_lw': 0.8
+        }
+    return cmap, theme
+
+
+def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Dict[str, Any]:
+    """Construct argument dictionary for geopandas plot function."""
+    kwargs = dict(
+        column=column,
+        legend=True,
+        cmap=cmap,
+        linewidth=0,
+        edgecolor='none',
+        missing_kwds={'color': '#f0f0f0', 'edgecolor': 'none', 'label': 'No Data'},
+    )
+    if user_kwargs:
+        kwargs.update(user_kwargs)
+
+    if bins and len(bins) >= 2:
+        try:
+            # Update cmap to support transparency for values below first bin
+            cmap = copy.copy(cmap)
+            cmap.set_under('none')
+            try:
+                cmap.set_over(cmap(cmap.N - 1))
+            except Exception:
+                pass
+                
+            kwargs['cmap'] = cmap
+            kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
+            kwargs['legend_kwds'] = {'ticks': bins, 'format': '%.10g'} 
+        except (ValueError, AttributeError) as e:
+            logging.warning("Failed to configure custom bins/norm: %s", e)
+    else:
+        data = gdf[column]
+        use_log = log_scale and (data > 0).any()
+        if use_log:
+            positive = data[data > 0]
+            if not positive.empty:
+                kwargs['norm'] = LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
+                
+    return kwargs
+
+
+def _label_colorbar(ax: plt.Axes, label: str):
+    """Attempt to find and label the colorbar associated with the axes."""
+    if not label:
+        return
+        
+    cb_ax = None
+    if ax.figure:
+        for cand in ax.figure.axes:
+            if cand is not ax and cand.get_label() == '<colorbar>':
+                cb_ax = cand
+                break
+        if not cb_ax:
+            for cand in ax.figure.axes:
+                if cand is not ax:
+                    cb_ax = cand
+                    break
+                     
+    if cb_ax:
+        try:
+            bbox = cb_ax.get_position()
+            orient_vertical = (bbox.height >= bbox.width)
+            if orient_vertical:
+                cb_ax.set_ylabel(label)
+            else:
+                cb_ax.set_xlabel(label)
+        except (AttributeError, ValueError):
+            logging.debug("Could not set label on colorbar axis.")
+
+
+def _add_overlays(ax: plt.Axes, overlay_counties, overlay_shape, crs_proj, theme):
+    """Draw optional boundary layers."""
+    if overlay_counties is not None:
+        try:
+            if crs_proj is not None and getattr(overlay_counties, 'crs', None) is not None:
+                trunc_overlay = overlay_counties.to_crs(crs_proj)
+            else:
+                trunc_overlay = overlay_counties
+            trunc_overlay.boundary.plot(
+                ax=ax, 
+                color=theme['county_color'], 
+                linewidth=theme['county_lw'], 
+                alpha=0.7
+            )
+        except Exception as e:
+            logging.warning("Failed to overlay county shapefile: %s", e)
+            
+    if overlay_shape is not None:
+        try:
+            if crs_proj is not None and getattr(overlay_shape, 'crs', None) is not None:
+                shape_overlay = overlay_shape.to_crs(crs_proj)
+            else:
+                shape_overlay = overlay_shape
+            shape_overlay.boundary.plot(
+                ax=ax, 
+                color=theme['overlay_color'], 
+                linewidth=theme['overlay_lw'], 
+                alpha=0.9, 
+                linestyle='--'
+            )
+        except Exception as e:
+            logging.warning("Failed to overlay auxiliary shapefile: %s", e)
+
+
+def _zoom_to_extent(ax: plt.Axes, gdf, column: str, zoom_pad: float):
+    """Zoom map extent to valid data bounds."""
+    try:
+        valid = gdf[gdf[column].notna()]
+        if not valid.empty:
+            minx, miny, maxx, maxy = valid.total_bounds
+            pad = max(0.0, min(0.25, zoom_pad))
+            dx = (maxx - minx) * pad if maxx > minx else 0.1
+            dy = (maxy - miny) * pad if maxy > miny else 0.1
+            ax.set_xlim(minx - dx, maxx + dx)
+            ax.set_ylim(miny - dy, maxy + dy)
+    except Exception:
+        pass
 
 
 def create_map_plot(
@@ -27,152 +195,68 @@ def create_map_plot(
     overlay_counties: Optional[gpd.GeoDataFrame] = None,
     overlay_shape: Optional[gpd.GeoDataFrame] = None,
     crs_proj=None,
+    tf_fwd=None,
+    tf_inv=None,
     zoom_to_data: bool = True,
     zoom_pad: float = 0.05,
+    **kwargs
 ):
     """
     Shared logic to render an emissions map plot on a given Axes.
     Returns the collection (artist) representing the main data plot.
     """
-    
-    # 1. Colormap Resolution ---------------------------------------------------
-    try:
-        if hasattr(plt, 'colormaps'):
-            cmap = plt.colormaps.get_cmap(cmap_name)
-        else:
-             # Fallback for older matplotlib
-             cmap = mplcm.get_cmap(cmap_name)
-    except Exception:
-        try:
-            cmap = plt.get_cmap('jet')
-        except:
-            cmap = mplcm.get_cmap('jet')
-    
-    # Auto-contrast settings based on 'dark' colormaps
-    _cmap_lower = str(cmap_name).lower()
-    _dark_cmaps = {'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'}
-    if _cmap_lower in _dark_cmaps:
-         county_color = '#aaaaaa' 
-         overlay_color = 'cyan'
-         county_lw = 0.3
-         overlay_lw = 0.8
-    else:
-         county_color = '#555555'
-         overlay_color = 'black'
-         county_lw = 0.3
-         overlay_lw = 0.8
+    # 1. Resolve Style
+    cmap, theme = _resolve_cmap_and_theme(cmap_name)
 
-    # 2. Plotting Arguments (Norm/Bins) ----------------------------------------
-    plot_kwargs = dict(
-        column=column,
-        ax=ax,
-        legend=True,  # Default legend (can be customized later)
-        cmap=cmap,
-        linewidth=0.05,
-        edgecolor='black',
-        missing_kwds={'color': '#f0f0f0', 'edgecolor': 'none', 'label': 'No Data'},
-    )
-    
-    data = gdf[column]
-    
-    if bins and len(bins) >= 2:
-        try:
-            # Update cmap to support transparency for values below first bin
-            cmap = copy.copy(cmap)
-            cmap.set_under('none')
-            try:
-                cmap.set_over(cmap(cmap.N - 1))
-            except Exception:
-                pass
-                
-            plot_kwargs['cmap'] = cmap
-            plot_kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
-        except Exception:
-            pass
-    else:
-        use_log = log_scale and (data > 0).any()
-        if use_log:
-            positive = data[data > 0]
-            if not positive.empty:
-                plot_kwargs['norm'] = LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
-    
-    # 3. Main Plot -------------------------------------------------------------
+    # 2. Build Arguments
+    plot_kwargs = _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=kwargs)
+    plot_kwargs['ax'] = ax  # Ensure ax is passed explicitly
+
+    # 3. Plot Data
+    collection = None
     try:
-        # returns axes usually, but if cbar is off... geopandas returns Axes
-        # Use plot directly
+        # GeoPandas plot returns the axes, but assumes collection is added
         gdf.plot(**plot_kwargs)
+        if ax.collections:
+            collection = ax.collections[-1]
     except Exception as e:
-        logging.warning(f"Plotting failed: {e}")
-        return
+        logging.error("Map plotting failed for column '%s': %s", column, e)
+        return None
 
     ax.set_title(title, fontsize=10)
-    ax.axis('off')
+    
+    # Enable border (spines) but hide ticks
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(1.0)
+        spine.set_color('black')
 
-    # 4. Colorbar Labeling -----------------------------------------------------
-    if unit_label:
-        # Find the colorbar axes attached to this axes
-        cb_ax = None
-        if ax.figure:
-             for cand in ax.figure.axes:
-                 if cand is not ax and cand.get_label() == '<colorbar>': # Heuristic
-                     cb_ax = cand
-                     break
-             # Fallback heuristic: check position
-             if not cb_ax:
-                 for cand in ax.figure.axes:
-                     if cand is not ax:
-                         cb_ax = cand
-                         break
-                         
-        if cb_ax:
-            try:
-                bbox = cb_ax.get_position()
-                orient_vertical = (bbox.height >= bbox.width)
-                if orient_vertical:
-                    cb_ax.set_ylabel(unit_label)
-                else:
-                    cb_ax.set_xlabel(unit_label)
-            except Exception:
-                pass
+    # 4. Label Colorbar
+    _label_colorbar(ax, unit_label)
 
-    # 5. Overlays (Counties / Shapes) ------------------------------------------
-    if overlay_counties is not None:
-        try:
-            if crs_proj is not None and getattr(overlay_counties, 'crs', None) is not None:
-                trunc_overlay = overlay_counties.to_crs(crs_proj)
-            else:
-                trunc_overlay = overlay_counties
-            trunc_overlay.boundary.plot(ax=ax, color=county_color, linewidth=county_lw, alpha=0.7)
-        except Exception:
-            logging.exception("Failed to overlay county shapefile")
-            
-    if overlay_shape is not None:
-        try:
-             if crs_proj is not None and getattr(overlay_shape, 'crs', None) is not None:
-                 shape_overlay = overlay_shape.to_crs(crs_proj)
-             else:
-                 shape_overlay = overlay_shape
-             shape_overlay.boundary.plot(ax=ax, color=overlay_color, linewidth=overlay_lw, alpha=0.9, linestyle='--')
-        except Exception:
-             logging.exception("Failed to overlay auxiliary shapefile")
+    # 5. Overlays
+    _add_overlays(ax, overlay_counties, overlay_shape, crs_proj, theme)
 
-    # 6. Zoom ------------------------------------------------------------------
+    # 6. Graticule
+
+
+    # 7. Zoom
     if zoom_to_data:
-        try:
-            valid = gdf[gdf[column].notna()]
-            if not valid.empty:
-                minx, miny, maxx, maxy = valid.total_bounds
-                pad = max(0.0, min(0.25, zoom_pad))
-                dx = (maxx - minx) * pad if maxx > minx else 0.1
-                dy = (maxy - miny) * pad if maxy > miny else 0.1
-                ax.set_xlim(minx - dx, maxx + dx)
-                ax.set_ylim(miny - dy, maxy + dy)
-        except Exception:
-             pass
+        _zoom_to_extent(ax, gdf, column, zoom_pad)
+        
+    # 6. Graticule (Draw AFTER zoom to ensure grid matches visible extent)
+    if crs_proj is not None and tf_fwd and tf_inv:
+        _draw_graticule(ax, tf_fwd, tf_inv, lon_step=None, lat_step=None)
+    return collection
 
+
+@functools.lru_cache(maxsize=1)
 def _default_conus_lcc_crs():
     """Return a default CONUS Lambert Conformal Conic CRS and transformers.
     Uses standard parallels 33/45 and center 40N, 96W. Honors USE_SPHERICAL_EARTH.
+    Cached to avoid re-initializing transformers.
     """
     try:
         a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
@@ -189,8 +273,11 @@ def _default_conus_lcc_crs():
         tf = pyproj.Transformer.from_crs(c, c, always_xy=True)
         return c, tf, tf
 
+@functools.lru_cache(maxsize=32)
 def _lcc_from_griddesc(griddesc_path, grid_name):
-    """Build an LCC CRS from the current GRIDDESC selection if available."""
+    """Build an LCC CRS from the current GRIDDESC selection if available.
+    Cached to avoid repeated file I/O on GRIDDESC.
+    """
     try:
         from .data_processing import extract_grid
         coord_params, _ = extract_grid(griddesc_path, grid_name)
@@ -211,9 +298,8 @@ def _plot_crs(griddesc_path, grid_name):
     """Return (crs, forward_transformer, inverse_transformer) for plotting.
 
     New behavior: ONLY use an LCC projection when a GRIDDESC file is provided AND a valid
-    grid name is selected. Otherwise, fall back to WGS84 (EPSG:4326) so maps render in
-    geographic coordinates. This improves interpretability for county-only plots or when
-    the user has not supplied grid context.
+    grid name is selected. Otherwise, fall back to WGS84 (EPSG:4326) so maps render        geographic coordinates. This ensures layout stability when multiple
+        grids are not specified.
     """
     try:
         # Require explicit grid specification for LCC
@@ -221,8 +307,11 @@ def _plot_crs(griddesc_path, grid_name):
             lcc = _lcc_from_griddesc(griddesc_path, grid_name)
             if lcc:  # (crs, tf_fwd, tf_inv)
                 return lcc
-    except Exception:
-        pass
+    except ImportError:
+        logging.debug("Data Processing utilities not available for LCC grid extraction.")
+    except Exception as e:
+        logging.warning("Failed to derive LCC from GRIDDESC (%s/%s): %s", griddesc_path, grid_name, e)
+
     # Fallback: geographic WGS84 with identity transformers
     try:
         crs = pyproj.CRS.from_epsg(4326)
@@ -231,9 +320,10 @@ def _plot_crs(griddesc_path, grid_name):
     except Exception:
         return None, None, None
 
-def _draw_graticule(ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, lon_step=5, lat_step=5, with_labels=True):
+def _draw_graticule(ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, lon_step=None, lat_step=None, with_labels=True):
     """Draw longitude/latitude grid lines (in degrees) using the supplied transformers.
 
+    Optimized to use vectorized pyproj transformations.
     Returns a dictionary with lists of created Line2D and Text artists for optional cleanup/redraw.
     """
     artists = {'lines': [], 'texts': []}
@@ -242,111 +332,172 @@ def _draw_graticule(ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, 
     try:
         x0, x1 = ax.get_xlim()
         y0, y1 = ax.get_ylim()
-        # Sample corners plus midpoints to estimate the current lon/lat bounds
-        sample_x = [x0, x1, x1, x0, 0.5 * (x0 + x1), x1, 0.5 * (x0 + x1), x0]
-        sample_y = [y0, y0, y1, y1, y0, 0.5 * (y0 + y1), y1, 0.5 * (y0 + y1)]
-        lons = []
-        lats = []
-        for X, Y in zip(sample_x, sample_y):
-            try:
-                lon, lat = tf_inv.transform(X, Y)
-                if abs(lon) < 1e6 and abs(lat) < 1e6:
-                    lons.append(lon)
-                    lats.append(lat)
-            except Exception:
-                pass
-        if not lons or not lats:
-            return artists
-        lon_min = max(-180.0, min(lons)) - 1.0
-        lon_max = min(180.0, max(lons)) + 1.0
-        lat_min = max(-90.0, min(lats)) - 1.0
-        lat_max = min(90.0, max(lats)) + 1.0
-        if lon_min >= lon_max or lat_min >= lat_max:
+
+
+        # 1. Estimate Lat/Lon bounds from view extent
+        # Vectorized inverse transform on boundary points
+        sx = np.array([x0, x1, x1, x0, 0.5 * (x0 + x1), x1, 0.5 * (x0 + x1), x0])
+        sy = np.array([y0, y0, y1, y1, y0, 0.5 * (y0 + y1), y1, 0.5 * (y0 + y1)])
+
+        try:
+            sample_lons, sample_lats = tf_inv.transform(sx, sy)
+            # Filter out potentially infinite/failed transforms
+            valid_mask = (np.abs(sample_lons) < 1e6) & (np.abs(sample_lats) < 1e6)
+            lons = sample_lons[valid_mask]
+            lats = sample_lats[valid_mask]
+        except Exception:
             return artists
 
+        if lons.size == 0 or lats.size == 0:
+            return artists
+
+        lon_min = max(-180.0, lons.min()) - 1.0
+        lon_max = min(180.0, lons.max()) + 1.0
+        lat_min = max(-90.0, lats.min()) - 1.0
+        lat_max = min(90.0, lats.max()) + 1.0
+
+        if lon_min >= lon_max or lat_min >= lat_max:
+            return artists
+            
+        # Determine appropriate step size if not fixed
+        # Logic: aim for ~4-8 lines in the view
+        
+        def _nice_step(span):
+            if span <= 0: return 1.0
+            # Rough target step
+            target = span / 5.0
+            # Snap to 1, 5, 10 or 0.1, 0.5 etc.
+            power = 10 ** np.floor(np.log10(target))
+            base = target / power
+            # nice bases: 1, 2, 5
+            if base < 1.5: step = 1.0 * power
+            elif base < 3.5: step = 2.0 * power
+            else: step = 5.0 * power
+            return max(step, 1e-5) # Safety floor
+
+        lon_span = lons.max() - lons.min()
+        lat_span = lats.max() - lats.min()
+        
+        # Use provided step unless it's too sparse for the current view (zoom handling)
+        actual_lon_step = lon_step
+        if actual_lon_step is None or (lon_step > lon_span and lon_span > 0):
+             actual_lon_step = _nice_step(lon_span)
+             
+        actual_lat_step = lat_step
+        if actual_lat_step is None or (lat_step > lat_span and lat_span > 0):
+             actual_lat_step = _nice_step(lat_span)
+
+        # Pre-calculate precise sampling arrays
         lats_samp = np.linspace(lat_min, lat_max, 200)
         lons_samp = np.linspace(lon_min, lon_max, 200)
 
-        def _lon_label(v: float) -> str:
-            v_r = round(v)
-            return f"{abs(int(v_r))}°{'W' if v_r < 0 else 'E'}"
+        # Helpers for labels
+        def _fmt_deg(v, step):
+            prec = 0
+            if step < 1: prec = 1
+            if step < 0.1: prec = 2
+            if step < 0.01: prec = 3
+            if step < 0.001: prec = 4
+            
+            val = abs(v)
+            if prec == 0:
+                s = f"{int(round(val))}"
+            else:
+                s = f"{val:.{prec}f}"
+            return s
 
-        def _lat_label(v: float) -> str:
-            v_r = round(v)
-            return f"{abs(int(v_r))}°{'S' if v_r < 0 else 'N'}"
+        def _lon_label(v):
+            s = _fmt_deg(v, actual_lon_step)
+            return f"{s}°{'W' if v < 0 else 'E'}"
+            
+        def _lat_label(v):
+            s = _fmt_deg(v, actual_lat_step)
+            return f"{s}°{'S' if v < 0 else 'N'}"
 
-        w = x1 - x0
-        h = y1 - y0
-        pad_y = 0.012 * h
-        pad_x = 0.012 * w
+        pad_y = 0.012 * (y1 - y0)
+        pad_x = 0.012 * (x1 - x0)
 
-        for lon in np.arange(np.floor(lon_min / lon_step) * lon_step, lon_max + lon_step, lon_step):
+        # 2. Draw Longitude Lines (constant Lon, varying Lat)
+        # Determine start/end aligned to step
+        l_start = np.floor(lon_min / actual_lon_step) * actual_lon_step
+        l_end = lon_max + actual_lon_step
+        lon_range = np.arange(l_start, l_end, actual_lon_step)
+        
+        for lon in lon_range:
             try:
-                xs = []
-                ys = []
-                for lat in lats_samp:
-                    x, y = tf_fwd.transform(lon, float(lat))
-                    xs.append(x)
-                    ys.append(y)
+                # Vectorized transform: one lon repeated, many lats
+                xs, ys = tf_fwd.transform(np.full_like(lats_samp, lon), lats_samp)
+
+                # Plot line
                 lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.8, zorder=10)
                 artists['lines'].extend(lines)
+
+                # Labeling
                 if with_labels:
-                    arr_x = np.array(xs)
-                    arr_y = np.array(ys)
-                    mask = (arr_x >= x0) & (arr_x <= x1)
-                    if mask.any():
-                        idx = np.argmin(np.abs(arr_y[mask] - y0))
-                        x_lab = arr_x[mask][idx]
-                        y_lab = y0 + pad_y
-                        if x0 <= x_lab <= x1 and y0 <= y_lab <= y1:
+                    mask = (xs >= x0) & (xs <= x1)
+                    if np.any(mask):
+
+                        # Find point closest to bottom edge y0
+                        valid_ys = ys[mask]
+                        valid_xs = xs[mask]
+                        idx_b = np.argmin(np.abs(valid_ys - y0))
+
+                        x_b = valid_xs[idx_b]
+                        y_b = y0 + pad_y
+
+                        if x0 <= x_b <= x1 and y0 <= y_b <= y1:
                             txt = ax.text(
-                                x_lab,
-                                y_lab,
-                                _lon_label(lon),
-                                color='#666666',
-                                fontsize=8,
-                                ha='center',
-                                va='bottom',
-                                zorder=11,
-                                bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.5),
+                                x_b, y_b, _lon_label(lon),
+                                color='#333333', fontsize=8,
+                                ha='center', va='bottom', zorder=12,
+                                bbox=dict(facecolor='white', edgecolor='none', alpha=0.7, pad=0.3)
                             )
                             artists['texts'].append(txt)
-            except Exception:
-                pass
 
-        for lat in np.arange(np.floor(lat_min / lat_step) * lat_step, lat_max + lat_step, lat_step):
+
+            except Exception as e:
+                logging.warning(f"Graticule Lon Error: {e}")
+
+        # 3. Draw Latitude Lines (constant Lat, varying Lon)
+        l_start = np.floor(lat_min / actual_lat_step) * actual_lat_step
+        l_end = lat_max + actual_lat_step
+        lat_range = np.arange(l_start, l_end, actual_lat_step)
+        
+        for lat in lat_range:
             try:
-                xs = []
-                ys = []
-                for lon in lons_samp:
-                    x, y = tf_fwd.transform(float(lon), lat)
-                    xs.append(x)
-                    ys.append(y)
+                # Vectorized transform: many lons, one lat repeated
+                xs, ys = tf_fwd.transform(lons_samp, np.full_like(lons_samp, lat))
+
+                # Plot line
                 lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.8, zorder=10)
                 artists['lines'].extend(lines)
+
+                # Labeling
                 if with_labels:
-                    arr_x = np.array(xs)
-                    arr_y = np.array(ys)
-                    mask = (arr_y >= y0) & (arr_y <= y1)
-                    if mask.any():
-                        idx = np.argmin(np.abs(arr_x[mask] - x0))
-                        y_lab = arr_y[mask][idx]
+                    mask = (ys >= y0) & (ys <= y1)
+                    if np.any(mask):
+                        # Find point closest to left edge x0
+                        valid_xs = xs[mask]
+                        valid_ys = ys[mask]
+                        idx = np.argmin(np.abs(valid_xs - x0))
+
                         x_lab = x0 + pad_x
+                        y_lab = valid_ys[idx]
+
                         if x0 <= x_lab <= x1 and y0 <= y_lab <= y1:
                             txt = ax.text(
-                                x_lab,
-                                y_lab,
-                                _lat_label(lat),
-                                color='#666666',
-                                fontsize=8,
-                                ha='left',
-                                va='center',
-                                zorder=11,
-                                bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.5),
+                                x_lab, y_lab, _lat_label(lat),
+                                color='#666666', fontsize=8,
+                                ha='left', va='center', zorder=11,
+                                bbox=dict(facecolor='white', edgecolor='none', alpha=0.6, pad=0.5)
                             )
                             artists['texts'].append(txt)
-            except Exception:
-                pass
-    except Exception:
-        pass
+
+
+            except Exception as e:
+                logging.warning(f"Graticule Line Error: {e}")
+
+    except Exception as e:
+        logging.warning("Graticule drawing failed: %s", e)
+
     return artists

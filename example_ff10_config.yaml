@@ -1,0 +1,51 @@
+timestamp_utc: '2025-12-23T22:34:25.342588Z'
+arguments:
+  filepath: ./npOG_2022v2.lst
+  sector: npOG_2022v2
+  filter_col: null
+  filter_start: null
+  filter_end: null
+  filter_val: null
+  delim: null
+  county_shapefile: /proj/ie/proj/staff/tranhuy/python/GIS/tl_2020_us_county_CONUS.gpkg # Path to county boundary shapefile
+  overlay_shapefile: 
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/Permian_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/SanJuan_Basin_Extent.gpkg
+  filtered_by_overlay: false
+  griddesc: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/griddesc_simplified.txt
+  gridname: 12US1_459X299
+  pltyp: county
+  force_lcc: false
+  projection: lcc
+  pollutant: CO, CH4, CO2, NH3, NOX,PM10-PRI, PM25-PRI,SO2,VOC
+  zoom_to_data: true
+  zoom_pad: 0.05
+  bins: null
+  cmap: jet
+  fill_nan: 0.0
+  workers: 0
+  outdir: /proj/ie/proj/Wellcome-Methane/utils/tranhuy/outputs
+  log_scale: true
+  export_csv: true
+  run_mode: batch
+  units_map:
+      CH4: tons/yr
+      CO: tons/yr
+      CO2: tons/yr
+      EC: tons/yr
+      N2O: tons/yr
+      N590: tons/yr
+      NH3: tons/yr
+      NO3: tons/yr
+      NOX: tons/yr
+      OC: tons/yr
+      PM-CON: tons/yr
+      PM10-FIL: tons/yr
+      PM10-PRI: tons/yr
+      PM25-FIL: tons/yr
+      PM25-PRI: tons/yr
+      PMFINE: tons/yr
+      SO2: tons/yr
+      SO4: tons/yr
+      VOC: tons/yr
+outputs:

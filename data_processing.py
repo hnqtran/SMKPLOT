@@ -54,6 +54,7 @@ from config import (
     COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, UNIT_COLS, REL_COLS,
     EMIS_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS, COUNTRY_CODE_MAPPINGS
 )
+from utils import normalize_delim, coerce_merge_key
 
 def _spatial_filter_chunk(gdf_chunk: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
     """Helper for parallel spatial filtering."""
@@ -62,17 +63,50 @@ def _spatial_filter_chunk(gdf_chunk: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame
         
     if mode == 'clipped':
         try:
-             # Reduce overlay to bounding box of chunk first for speed? 
-             # Only if overlay is complex. For now, trust rtree.
             return gpd.overlay(gdf_chunk, overlay, how='intersection', keep_geom_type=True)
         except TypeError:
             return gpd.overlay(gdf_chunk, overlay, how='intersection')
     elif mode == 'intersect':
         joined = gpd.sjoin(gdf_chunk, overlay, how='inner', predicate='intersects')
+        if joined.empty:
+            return gdf_chunk.iloc[:0]
         return gdf_chunk.loc[gdf_chunk.index.isin(joined.index)]
     elif mode == 'within':
-        joined = gpd.sjoin(gdf_chunk, overlay, how='inner', predicate='within')
-        return gdf_chunk.loc[gdf_chunk.index.isin(joined.index)]
+        # Use BOTH centroid and representative_point to capture all valid features.
+        # Centroid is robust for general shapes; Representative Point handles concave/coastal (zigzag) shapes.
+        valid_indices = set()
+        
+        # Check 1: Centroid
+        temp = gdf_chunk[['geometry']].copy()
+        if temp.crs and temp.crs.is_geographic:
+            try:
+                c_proj = temp['geometry'].to_crs('EPSG:3857').centroid
+                temp['geometry'] = c_proj.to_crs(temp.crs)
+            except Exception:
+                temp['geometry'] = temp.geometry.centroid
+        else:
+             temp['geometry'] = temp.geometry.centroid
+             
+        joined = gpd.sjoin(temp, overlay, how='inner', predicate='intersects')
+        valid_indices.update(joined.index.tolist())
+        
+        # Check 2: Representative Point
+        temp = gdf_chunk[['geometry']].copy() 
+        if temp.crs and temp.crs.is_geographic:
+            try:
+                c_proj = temp['geometry'].to_crs('EPSG:3857').representative_point()
+                temp['geometry'] = c_proj.to_crs(temp.crs)
+            except Exception:
+                temp['geometry'] = temp.geometry.representative_point()
+        else:
+             temp['geometry'] = temp.geometry.representative_point()
+             
+        joined = gpd.sjoin(temp, overlay, how='inner', predicate='intersects')
+        valid_indices.update(joined.index.tolist())
+
+        if not valid_indices:
+            return gdf_chunk.iloc[:0]
+        return gdf_chunk.loc[sorted(list(valid_indices))]
     return gdf_chunk
 
 
@@ -84,29 +118,35 @@ def apply_spatial_filter(gdf: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode:
         gdf: Source GeoDataFrame to filter.
         overlay: Overlay geometry to filter against.
         mode: Filtering mode:
-              - 'clipped': Geometrically clip features (intersection).
-              - 'intersect': Keep features that intersect the overlay (Spatial Join).
-              - 'within': Keep features entirely within the overlay (Spatial Join).
+                - 'clipped': Geometrically clip features (intersection).
+                - 'intersect': Keep features that intersect the overlay (Spatial Join).
+                - 'within': Keep features entirely within the overlay (Spatial Join).
     
     Returns:
         Filtered GeoDataFrame.
     """
-    if gdf is None or gdf.empty:
+    if gdf is None:
+        return gdf
+    if gdf.empty:
         return gdf
 
-    if gdf.crs and overlay.crs and (gdf.crs != overlay.crs):
-        overlay = overlay.to_crs(gdf.crs)
+    try:
+        if gdf.crs and overlay.crs and (gdf.crs != overlay.crs):
+            overlay = overlay.to_crs(gdf.crs)
+    except Exception:
+        pass  # CRS conversion failed, proceed with original CRS
 
     # Parallelize for large datasets
-    # Explicit threshold 10,000 features
-    max_workers = min(16, max(1, multiprocessing.cpu_count() - 1))
-    if len(gdf) > 10000 and max_workers > 1:
+    # NOTE: Multiprocessing is currently disabled for spatial filtering to ensure 
+    # stability against pickling overhead with GeoDataFrames. Sequential processing 
+    # is verified as efficient for standard datasets.
+    max_workers = 1 
+    if len(gdf) > 1000000 and max_workers > 1: # Increased threshold to basically disable it unless forced
         logging.info(f"Applying spatial filter '{mode}' on {len(gdf)} features using {max_workers} workers...")
         
-        # Split into chunks
-        chunk_size = max(1, len(gdf) // max_workers)
-        # Using numpy array_split is efficient for DataFrames/GeoDataFrames
-        chunks = np.array_split(gdf, max_workers)
+        # Split into chunks manually to avoid numpy deprecated 'swapaxes' warning
+        chunk_size = int(np.ceil(len(gdf) / max_workers))
+        chunks = [gdf.iloc[i : i + chunk_size] for i in range(0, len(gdf), chunk_size)]
         
         # Process chunks
         results = []
@@ -124,13 +164,11 @@ def apply_spatial_filter(gdf: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode:
                     logging.warning(f"Parallel spatial filter chunk failed: {e}")
                     
         if results:
-             # Combine results. use ignore_index=False to preserve original indices if needed?
-             # But overlay usually returns new geometries.
-             # pandas concat handles GeoDataFrames correctly usually.
-             return pd.concat(results, ignore_index=(mode == 'clipped')) # Clipped crates new geom, so re-index logic applies
+            # Combine results. 'ignore_index' depends on whether clipped mode created new geometries.
+            return pd.concat(results, ignore_index=(mode == 'clipped'))
         else:
-             # Return empty GDF with same columns/crs
-             return gdf.iloc[:0]
+            # Return empty GDF with same columns/crs
+            return gdf.iloc[:0]
 
     # Sequential fallback for small data
     return _spatial_filter_chunk(gdf, overlay, mode)
@@ -194,111 +232,6 @@ def _memoize(maxsize: int = 4):
     return decorator
 
 
-def _coerce_merge_key(series: pd.Series, pad: Optional[int] = None) -> pd.Series:
-    """Standardize merge keys to strings with optional zero-padding.
-
-    The implementation favors vectorized operations for common cases to
-    avoid the per-row Python ``apply`` that can stall large merges. We fall
-    back to a safe row-wise conversion only when necessary (mixed dtypes,
-    exotic objects, etc.).
-    """
-
-    if not isinstance(series, pd.Series):  # defensive; should not happen
-        series = pd.Series(series)
-
-    original = series
-    pad_len = pad or 0
-
-    def _finalize(s: pd.Series) -> pd.Series:
-        if pad_len > 0:
-            try:
-                obj = s.astype('string')
-                obj = obj.mask(obj.isna(), None)
-                padded = obj.fillna('').str.zfill(pad_len)
-                padded = padded.mask(obj.isna(), None)
-                return padded.astype('object')
-            except Exception:
-                pass
-        return s
-
-    # Fast path: already string-like or simple
-    # If no padding and already object/string, check if we need to do anything
-    if pad_len == 0 and pd.api.types.is_string_dtype(series):
-         return series
-
-    if pd.api.types.is_string_dtype(series) or series.dtype == 'object':
-        try:
-            # If large series, check duplication? 
-            # Optim: if no padding required, simple astr
-            if pad_len == 0:
-                 return series.astype(str)
-            
-            sample = series.dropna().head(32)
-            if sample.empty or sample.map(lambda v: isinstance(v, str)).all():
-                coerced = series.astype('string').str.strip()
-                coerced = coerced.mask(coerced == '', None)
-                coerced = coerced.astype('object')
-                return _finalize(coerced)
-        except Exception:
-            pass
-
-    # Integer dtypes (including pandas nullable ints)
-    if pd.api.types.is_integer_dtype(series):
-        try:
-            coerced = series.astype('Int64').astype(str)
-            coerced = coerced.where(series.notna(), None)
-            return _finalize(coerced.astype('object'))
-        except Exception:
-            pass
-
-    # Floating point: preserve integral values when possible
-    if pd.api.types.is_float_dtype(series):
-        try:
-            arr = series.to_numpy(copy=False)
-            mask = np.isfinite(arr)
-            int_mask = mask & np.isclose(arr, np.round(arr))
-            str_series = series.astype(str)
-            if int_mask.any():
-                ints = pd.Series(np.round(arr[int_mask]).astype(np.int64), index=series.index[int_mask])
-                str_series.loc[int_mask] = ints.astype(str)
-            coerced = str_series.where(series.notna(), None)
-            return _finalize(coerced.astype('object'))
-        except Exception:
-            pass
-
-    # Fallback: row-wise conversion
-    def _convert(val):
-        if pd.isna(val):
-            return None
-        try:
-            if isinstance(val, (int, np.integer)):
-                s_val = str(int(val))
-            elif isinstance(val, (float, np.floating)):
-                if np.isfinite(val) and float(val).is_integer():
-                    s_val = str(int(val))
-                else:
-                    s_val = str(float(val))
-            else:
-                s_val = str(val).strip()
-                if not s_val:
-                    return None
-        except Exception:
-            s_val = str(val).strip()
-            if not s_val:
-                return None
-        if pad_len:
-            try:
-                num = int(float(s_val))
-                return f"{num:0{pad_len}d}"
-            except Exception:
-                pass
-        return s_val
-
-    try:
-        return original.apply(_convert)
-    except Exception:
-        return original
-
 
 def merge_emissions_with_geometry(
     emis_df: pd.DataFrame,
@@ -348,7 +281,7 @@ def merge_emissions_with_geometry(
 
     if isinstance(emis_prepped, pd.DataFrame):
         try:
-            coerced = _coerce_merge_key(emis_prepped[merge_on], pad_len)
+            coerced = coerce_merge_key(emis_prepped[merge_on], pad_len)
         except Exception:
             coerced = emis_prepped[merge_on]
         needs_update = False
@@ -371,7 +304,7 @@ def merge_emissions_with_geometry(
         geom_series = None
     if geom_series is not None:
         try:
-            coerced_geom = _coerce_merge_key(geom_series, pad_len)
+            coerced_geom = coerce_merge_key(geom_series, pad_len)
         except Exception:
             coerced_geom = geom_series
         needs_geom_update = False
@@ -380,10 +313,10 @@ def merge_emissions_with_geometry(
         except Exception:
             needs_geom_update = True
         if copy_geometry:
-             geom_prepped = base_geom.copy()
+            geom_prepped = base_geom.copy()
         elif needs_geom_update:
-             if geom_prepped is base_geom:
-                 geom_prepped = base_geom.copy()
+            if geom_prepped is base_geom:
+                geom_prepped = base_geom.copy()
         
         if needs_geom_update:
             try:
@@ -400,45 +333,41 @@ def merge_emissions_with_geometry(
     right_has_geom = isinstance(emis_prepped, gpd.GeoDataFrame) and 'geometry' in emis_prepped.columns
     
     if left_has_geom and right_has_geom:
-         keep_right = False
+        keep_right = False
          
-         # Check optimization flags
-         is_lazy = False
-         try:
+        # Check optimization flags
+        is_lazy = False
+        try:
             st = emis_prepped.attrs.get('source_type')
             if st and str(st) in ('gridded_lazy', 'inline_point_lazy'):
                 is_lazy = True
-         except Exception:
+        except Exception:
             pass
 
-         # Check CRS
-         if geom_prepped.crs is None and emis_prepped.crs is not None:
-              keep_right = True
-         elif is_lazy:
-              keep_right = True
+        # Check CRS
+        if geom_prepped.crs is None and emis_prepped.crs is not None:
+                keep_right = True
+        elif is_lazy:
+                keep_right = True
          
-         if keep_right:
-              # Drop geometry from left (convert to DataFrame)
-              geom_prepped = pd.DataFrame(geom_prepped).drop(columns=['geometry'])
-         else:
-              # Drop geometry from right
-              emis_prepped = pd.DataFrame(emis_prepped).drop(columns=['geometry'])
+        if keep_right:
+                # Drop geometry from left (convert to DataFrame)
+                geom_prepped = pd.DataFrame(geom_prepped).drop(columns=['geometry'])
+        else:
+                # Drop geometry from right
+                emis_prepped = pd.DataFrame(emis_prepped).drop(columns=['geometry'])
 
     if not sort:
         merged = geom_prepped.merge(emis_prepped, on=merge_on, how='left', sort=False)
     else:
         merged = geom_prepped.merge(emis_prepped, on=merge_on, how='left')
     
-    # If we converted left to DF, merged is DF. If right was GDF, merged is GDF (if not suffixed).
-    # ensure it is GDF if geometry present
+    # If merging a DF and GDF, ensure the final result is a GeoDataFrame if geometry exists.
     if 'geometry' in merged.columns and not isinstance(merged, gpd.GeoDataFrame):
-         merged = gpd.GeoDataFrame(merged, geometry='geometry')
-         # If we kept right geometry, copy CRS
-         if right_has_geom and not left_has_geom: 
-              pass # handled by merge? No, merge of DF+GDF -> GDF usually?
-         # Restore CRS if needed
-         if isinstance(emis_prepped, gpd.GeoDataFrame) and emis_prepped.crs:
-             if merged.crs is None: merged.crs = emis_prepped.crs
+        merged = gpd.GeoDataFrame(merged, geometry='geometry')
+        # Restore CRS if needed
+        if isinstance(emis_prepped, gpd.GeoDataFrame) and emis_prepped.crs:
+            if merged.crs is None: merged.crs = emis_prepped.crs
     
     try:  # attach helper attrs for downstream consumers (stats, caches)
         merged.attrs['__prepared_emis'] = emis_prepped
@@ -519,10 +448,9 @@ def remap_columns(df: pd.DataFrame, src_type: str):
         
         # Helper: get the new name if renamed, else old name
         def _get_new_name(old_name):
-             return rename_map.get(old_name, old_name)
+            return rename_map.get(old_name, old_name)
         
-        # Reconstruct col_lst to include all columns in the dataframe (preserving their new names)
-        # This ensures specific hardcoded list doesn't drop user data.
+        # Reconstruct full column list to ensure processing preserves all input columns.
         full_col_lst = list(df.columns)
         return df, full_col_lst
 
@@ -607,21 +535,21 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
                         pass
                 
         else:
-             # Simple case: only 1 index column
-             pivot = df_agg.pivot(index=index_cols[0], columns=pol_col, values=emis_col).fillna(0)
-             result = pivot.reset_index()
+            # Simple case: only 1 index column
+            pivot = df_agg.pivot(index=index_cols[0], columns=pol_col, values=emis_col).fillna(0)
+            result = pivot.reset_index()
              
-             # If empty, ensure column name is restored from index name
-             if result.empty and index_cols[0] not in result.columns:
-                 result[index_cols[0]] = []
+            # If empty, ensure column name is restored from index name
+            if result.empty and index_cols[0] not in result.columns:
+                result[index_cols[0]] = []
              
-             # Restore dtype for single column if needed
-             col0 = index_cols[0]
-             if col0 in result.columns and original_dtypes[col0] != result[col0].dtype:
-                 try:
-                     result[col0] = result[col0].astype(original_dtypes[col0])
-                 except Exception:
-                     pass
+            # Restore dtype for single column if needed
+            col0 = index_cols[0]
+            if col0 in result.columns and original_dtypes[col0] != result[col0].dtype:
+                try:
+                    result[col0] = result[col0].astype(original_dtypes[col0])
+                except Exception:
+                    pass
 
         result.columns.name = None
         return result
@@ -629,7 +557,7 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
     except Exception as e:
         logging.getLogger().info(f"Optimized pivot failed ({e}); falling back to standard pivot_table.")
         try:
-           return df.pivot_table(
+            return df.pivot_table(
                 index=index_cols,
                 columns=pol_col,
                 values=emis_col,
@@ -656,23 +584,6 @@ def _categorize_columns(df: pd.DataFrame, columns: List[str]) -> None:
         except Exception:
             continue
 
-
-def _normalize_delim(d: Optional[str]) -> Optional[str]:
-    """Normalize common delimiter tokens to actual characters."""
-    if d is None:
-        return None
-    if d == '\\t':  # literal backslash t from shell
-        return '\t'
-    low = d.lower()
-    mapping = {
-        'tab': '\t',
-        'comma': ',',
-        'semicolon': ';',
-        'pipe': '|',
-        'space': ' ',
-        'whitespace': ' ',
-    }
-    return mapping.get(low, d)
 
 # Robust coordinate parsing: try common column names and coerce to float when possible
 def _parse_coord(val):
@@ -820,14 +731,14 @@ def read_inputfile(
 ):
     """Check file format identifier to select appropriate parser.
     Rules:
-      * Check if 1st line of file contains "#FORMAT=FF10_NONPOINT" or "#FORMAT=FF10_POINT", if so, treat as FF10 format and call read_ff10().
-      * If 1st line has #LIST, treat as list file of multiple FF10 files
-      * else, treat as smkreport and call read_smkreport().
+        * Check if 1st line of file contains "#FORMAT=FF10_NONPOINT" or "#FORMAT=FF10_POINT", if so, treat as FF10 format and call read_ff10().
+        * If 1st line has #LIST, treat as list file of multiple FF10 files
+        * else, treat as smkreport and call read_smkreport().
     """
     # NetCDF Support
     if isinstance(fpath, str) and (fpath.lower().endswith('.ncf') or fpath.lower().endswith('.nc')):
         try:
-             # Lazy import to avoid circular dependency
+            # Lazy import to avoid circular dependency
             from ncf_processing import read_ncf_emissions
             _emit_user_message(notify, 'INFO', "Detected NetCDF extension. Reading as IOAPI NetCDF...")
             
@@ -888,12 +799,12 @@ def read_inputfile(
                     _emit_user_message(notify, 'ERROR', f"Failed reading {p}: {e}")
                     raise e
         else:
-             _emit_user_message(notify, 'INFO', f"Reading {len(paths)} files using {max_workers} parallel workers...")
-             # Since read_inputfile is not a simple function (it's recursive), we need a wrapper
-             # But passing 'notify' (callback) to a subprocess is tricky/impossible if it's not picklable.
-             # We will pass notify=None to workers.
+            _emit_user_message(notify, 'INFO', f"Reading {len(paths)} files using {max_workers} parallel workers...")
+            # Since read_inputfile is not a simple function (it's recursive), we need a wrapper
+            # But passing 'notify' (callback) to a subprocess is tricky/impossible if it's not picklable.
+            # We will pass notify=None to workers.
              
-             with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 # We need to wrap the arguments
                 futures = {}
                 for p in paths:
@@ -951,71 +862,71 @@ def read_inputfile(
     # If the file path indicates it's a pivoted output or contains known columns, skip heavy processing.
     if isinstance(fpath, str) and (fpath.endswith('.csv') or fpath.endswith('.txt')):
         try:
-             # Peek at columns
-             peek_df = pd.read_csv(fpath, nrows=5, sep=delim or ',', comment=comment or '#')
-             cols_upper = [c.upper() for c in peek_df.columns]
+            # Peek at columns
+            peek_df = pd.read_csv(fpath, nrows=5, sep=delim or ',', comment=comment or '#')
+            cols_upper = [c.upper() for c in peek_df.columns]
              
-             # Heuristic: If we have GRID_RC or FIPS, and it looks like a pivoted file, load directly.
-             if 'GRID_RC' in cols_upper or 'FIPS' in cols_upper:
-                  _emit_user_message(notify, 'INFO', "Detected pre-processed CSV with key columns (GRID_RC/FIPS). Loading directly...")
-                  # Ensure FIPS and other potential identifiers are read as strings to preserve formatting
-                  # We use the peek_df to identify object-like columns or specific known identifiers
-                  from config import key_cols
-                  dtype_map = {'FIPS': object, 'GRID_RC': object}
+            # Heuristic: If we have GRID_RC or FIPS, and it looks like a pivoted file, load directly.
+            if 'GRID_RC' in cols_upper or 'FIPS' in cols_upper:
+                _emit_user_message(notify, 'INFO', "Detected pre-processed CSV with key columns (GRID_RC/FIPS). Loading directly...")
+                # Ensure FIPS and other potential identifiers are read as strings to preserve formatting
+                # We use the peek_df to identify object-like columns or specific known identifiers
+                from config import key_cols
+                dtype_map = {'FIPS': object, 'GRID_RC': object}
                   
-                  # Add all configured key columns to dtype map to ensure they are read as strings
-                  if key_cols:
-                      for kc in key_cols:
-                          dtype_map[kc] = object
+                # Add all configured key columns to dtype map to ensure they are read as strings
+                if key_cols:
+                    for kc in key_cols:
+                        dtype_map[kc] = object
                   
-                  # Inspect peek_df to find other object columns and preserve them
-                  for col in peek_df.columns:
-                       if peek_df[col].dtype == 'object':
-                           dtype_map[col] = object
+                # Inspect peek_df to find other object columns and preserve them
+                for col in peek_df.columns:
+                        if peek_df[col].dtype == 'object':
+                            dtype_map[col] = object
                   
-                  df = pd.read_csv(fpath, sep=delim or ',', comment=comment or '#', low_memory=False, dtype=dtype_map)
+                df = pd.read_csv(fpath, sep=delim or ',', comment=comment or '#', low_memory=False, dtype=dtype_map)
                   
-                  # Flag as pre-processed so batch logic knows to filter pollutants on re-export
-                  df.attrs['is_preprocessed'] = True
+                # Flag as pre-processed so batch logic knows to filter pollutants on re-export
+                df.attrs['is_preprocessed'] = True
                   
-                  # Restore attributes if possible (infer from columns)
-                  if sector:
-                      df.attrs['source_name'] = sector
+                # Restore attributes if possible (infer from columns)
+                if sector:
+                        df.attrs['source_name'] = sector
                   
-                  # Detect pollutants (numeric columns that aren't metadata)
-                  # We rely on configured metadata cols to exclude them
-                  from config import (
-                      COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, 
-                      UNIT_COLS, REL_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS
-                  )
-                  all_meta = set(COUNTRY_COLS + TRIBAL_COLS + REGION_COLS + FACILITY_COLS + 
-                                 UNIT_COLS + REL_COLS + SCC_COLS + POL_COLS + LAT_COLS + LON_COLS + 
-                                 ['GRID_RC', 'FIPS', 'X', 'Y', 'ROW', 'COL'])
+                # Detect pollutants (numeric columns that aren't metadata)
+                # We rely on configured metadata cols to exclude them
+                from config import (
+                        COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, 
+                        UNIT_COLS, REL_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS
+                )
+                all_meta = set(COUNTRY_COLS + TRIBAL_COLS + REGION_COLS + FACILITY_COLS + 
+                                UNIT_COLS + REL_COLS + SCC_COLS + POL_COLS + LAT_COLS + LON_COLS + 
+                                ['GRID_RC', 'FIPS', 'X', 'Y', 'ROW', 'COL'])
                   
-                  detected_pols = []
-                  for c in df.columns:
-                      if c.upper() not in [x.upper() for x in all_meta] and pd.api.types.is_numeric_dtype(df[c]):
-                           detected_pols.append(c)
+                detected_pols = []
+                for c in df.columns:
+                        if c.upper() not in [x.upper() for x in all_meta] and pd.api.types.is_numeric_dtype(df[c]):
+                            detected_pols.append(c)
                   
-                  if detected_pols:
-                       df.attrs['_detected_pollutants'] = tuple(detected_pols)
+                if detected_pols:
+                        df.attrs['_detected_pollutants'] = tuple(detected_pols)
 
-                  logging.info(f"Loaded DataFrame shape: {df.shape}")
-                  logging.info(f"Filtering request: col={flter_col}, val_count={len(flter_val) if flter_val else 0}")
+                logging.info(f"Loaded DataFrame shape: {df.shape}")
+                logging.info(f"Filtering request: col={flter_col}, val_count={len(flter_val) if flter_val else 0}")
 
-                  # Apply filtering if requested (since we skipped the chunk processor)
-                  if flter_col:
-                      df = filter_dataframe_by_values(df, flter_col, flter_val)
-                      logging.info(f"After value filter: {df.shape}")
-                      df = filter_dataframe_by_range(df, flter_col, flter_start, flter_end)
-                      logging.info(f"After range filter: {df.shape}")
+                # Apply filtering if requested (since we skipped the chunk processor)
+                if flter_col:
+                        df = filter_dataframe_by_values(df, flter_col, flter_val)
+                        logging.info(f"After value filter: {df.shape}")
+                        df = filter_dataframe_by_range(df, flter_col, flter_start, flter_end)
+                        logging.info(f"After range filter: {df.shape}")
 
-                  if not return_raw:
-                      return df, None
-                  return df, df.copy()
+                if not return_raw:
+                        return df, None
+                return df, df.copy()
         except Exception:
-             # Fallthrough to standard logic if peek fails
-             pass
+            # Fallthrough to standard logic if peek fails
+            pass
 
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
@@ -1064,9 +975,9 @@ def read_inputfile(
         )
     else:
         if "#Label" in first_line or "# County" in first_line:
-             _emit_user_message(notify, 'INFO', "Detected SMKREPORT header in first line. Reading as SMKREPORT format...")
+            _emit_user_message(notify, 'INFO', "Detected SMKREPORT header in first line. Reading as SMKREPORT format...")
         else:
-             _emit_user_message(notify, 'INFO', "Could not determine file format. Reading as SMKREPORT format...")
+            _emit_user_message(notify, 'INFO', "Could not determine file format. Reading as SMKREPORT format...")
         result = read_smkreport(
             fpath=fpath,
             delim=delim,
@@ -1181,7 +1092,7 @@ def read_ff10(
     header_idx = None
     
     # Normalize passed delimiter
-    passed_sep = _normalize_delim(delim)
+    passed_sep = normalize_delim(delim)
     # If passed_sep is just default comma, we might want to allow autodetection if implicit
     # But for now let's respect it if provided.
     
@@ -1284,10 +1195,10 @@ def read_ff10(
         needed_standards = set(['pollutant', 'emission']) # Internal placeholders
         
         if key_cols:
-             needed_standards.update(key_cols)
+            needed_standards.update(key_cols)
         else:
-             # Default if no key_cols provided
-             needed_standards.update(['region_cd', 'scc', 'country_cd'])
+            # Default if no key_cols provided
+            needed_standards.update(['region_cd', 'scc', 'country_cd'])
 
         # Iterate file columns and decide to keep
         for col in file_cols:
@@ -1315,9 +1226,9 @@ def read_ff10(
     has_pol = any(c.lower() in POL_COLS for c in use_cols)
     
     if not (has_emis and has_pol) and use_cols:
-         # _emit_user_message not available here easily (inside worker?)
-         # Just reset use_cols to empty to force full read
-         use_cols = []
+        # _emit_user_message not available here easily (inside worker?)
+        # Just reset use_cols to empty to force full read
+        use_cols = []
 
     read_kwargs = {
         'filepath_or_buffer': fpath,
@@ -1330,10 +1241,10 @@ def read_ff10(
     }
     
     if use_cols:
-         read_kwargs['usecols'] = use_cols
-         # Remove dtypes for columns we are NOT reading to prevent error
-         clean_dtypes = {k: v for k, v in dtype_map.items() if k in use_cols}
-         read_kwargs['dtype'] = clean_dtypes
+        read_kwargs['usecols'] = use_cols
+        # Remove dtypes for columns we are NOT reading to prevent error
+        clean_dtypes = {k: v for k, v in dtype_map.items() if k in use_cols}
+        read_kwargs['dtype'] = clean_dtypes
     
     # Capture necessary context for the chunk processor
     # We need to extract the processed column list from at least one chunk
@@ -1493,7 +1404,7 @@ def read_listfile(
                     if src_type is None:
                         src_type = f_type
                     elif src_type != f_type:
-                         raise ValueError(f"File {fp} has inconsistent source type {f_type} (expected {src_type})")
+                        raise ValueError(f"File {fp} has inconsistent source type {f_type} (expected {src_type})")
                          
                     df_list.append(df_part)
                     _emit_user_message(notify, 'INFO', f'Finished reading: {fp}')
@@ -1635,7 +1546,7 @@ def read_smkreport(
                     break
         
         if header_idx == -1:
-             raise ValueError("No valid header line found in file (neither '#Label'/'# County' nor generic CSV header).")
+            raise ValueError("No valid header line found in file (neither '#Label'/'# County' nor generic CSV header).")
     
     # Delimiter selection
     sep = delim
@@ -1691,17 +1602,17 @@ def read_smkreport(
     }
 
     if sep == ' ':
-         # Use delim_whitespace=True to allow C engine for space separated files
-         read_kwargs['delim_whitespace'] = True
-         read_kwargs['engine'] = 'c'
-         read_kwargs['low_memory'] = False
+        # Use delim_whitespace=True to allow C engine for space separated files
+        read_kwargs['delim_whitespace'] = True
+        read_kwargs['engine'] = 'c'
+        read_kwargs['low_memory'] = False
     elif sep:
-         read_kwargs['sep'] = sep
-         read_kwargs['engine'] = 'c'
-         read_kwargs['low_memory'] = False
+        read_kwargs['sep'] = sep
+        read_kwargs['engine'] = 'c'
+        read_kwargs['low_memory'] = False
     else:
-         read_kwargs['sep'] = None
-         read_kwargs['engine'] = 'python'
+        read_kwargs['sep'] = None
+        read_kwargs['engine'] = 'python'
     
     def _process_rpt_chunk(chunk):
         if flter_col:
@@ -2354,7 +2265,7 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
     # Prepare Grid
     grid_subset = base_geom[['GRID_RC', 'geometry']]
     if grid_subset.crs is None:
-         grid_subset.set_crs('EPSG:4326', inplace=True)
+        grid_subset.set_crs('EPSG:4326', inplace=True)
          
     # Prepare Points
     pts = gpd.GeoDataFrame(

@@ -3,9 +3,168 @@
 import os
 import sys
 import traceback
-from typing import Optional
+import json
+from functools import lru_cache
+from typing import Optional, List, Dict, Any, Union, Tuple
 import matplotlib
 
+import numpy as np
+import pandas as pd
+
+# ---- Moved from data_processing.py ----
+
+def normalize_delim(d: Optional[str]) -> Optional[str]:
+    """Normalize common delimiter tokens to actual characters."""
+    if d is None:
+        return None
+    if d == '\\t':  # literal backslash t from shell
+        return '\t'
+    low = d.lower()
+    mapping = {
+        'tab': '\t',
+        'comma': ',',
+        'semicolon': ';',
+        'pipe': '|',
+        'space': ' ',
+        'whitespace': ' ',
+        'csv': ',',
+        'tsv': '\t',
+    }
+    return mapping.get(low, d)
+
+
+def coerce_merge_key(series: pd.Series, pad: Optional[int] = None) -> pd.Series:
+    """Standardize merge keys to strings with optional zero-padding.
+
+    The implementation favors vectorized operations for common cases to
+    avoid the per-row Python ``apply`` that can stall large merges. We fall
+    back to a safe row-wise conversion only when necessary (mixed dtypes,
+    exotic objects, etc.).
+    """
+
+    if not isinstance(series, pd.Series):  # defensive; should not happen
+        series = pd.Series(series)
+
+    original = series
+    pad_len = pad or 0
+
+    def _finalize(s: pd.Series) -> pd.Series:
+        if pad_len > 0:
+            try:
+                obj = s.astype('string')
+                obj = obj.mask(obj.isna(), None)
+                padded = obj.fillna('').str.zfill(pad_len)
+                padded = padded.mask(obj.isna(), None)
+                return padded.astype('object')
+            except Exception:
+                pass
+        return s
+
+    # Fast path: already string-like or simple
+    # If no padding and already object/string, check if we need to do anything
+    if pad_len == 0 and pd.api.types.is_string_dtype(series):
+        return series
+
+    if pd.api.types.is_string_dtype(series) or series.dtype == 'object':
+        try:
+            # If large series, check duplication? 
+            # Optim: if no padding required, simple astr
+            if pad_len == 0:
+                return series.astype(str)
+            
+            sample = series.dropna().head(32)
+            if sample.empty or sample.map(lambda v: isinstance(v, str)).all():
+                coerced = series.astype('string').str.strip()
+                coerced = coerced.mask(coerced == '', None)
+                coerced = coerced.astype('object')
+                return _finalize(coerced)
+        except Exception:
+            pass
+
+    # Integer dtypes (including pandas nullable ints)
+    if pd.api.types.is_integer_dtype(series):
+        try:
+            coerced = series.astype('Int64').astype(str)
+            coerced = coerced.where(series.notna(), None)
+            return _finalize(coerced.astype('object'))
+        except Exception:
+            pass
+
+    # Floating point: preserve integral values when possible
+    if pd.api.types.is_float_dtype(series):
+        try:
+            arr = series.to_numpy(copy=False)
+            mask = np.isfinite(arr)
+            int_mask = mask & np.isclose(arr, np.round(arr))
+            str_series = series.astype(str)
+            if int_mask.any():
+                ints = pd.Series(np.round(arr[int_mask]).astype(np.int64), index=series.index[int_mask])
+                str_series.loc[int_mask] = ints.astype(str)
+            coerced = str_series.where(series.notna(), None)
+            return _finalize(coerced.astype('object'))
+        except Exception:
+            pass
+
+    # Fallback: row-wise conversion
+    def _convert(val):
+        if pd.isna(val):
+            return None
+        try:
+            if isinstance(val, (int, np.integer)):
+                s_val = str(int(val))
+            elif isinstance(val, (float, np.floating)):
+                if np.isfinite(val) and float(val).is_integer():
+                    s_val = str(int(val))
+                else:
+                    s_val = str(float(val))
+            else:
+                s_val = str(val).strip()
+                if not s_val:
+                    return None
+        except Exception:
+            s_val = str(val).strip()
+            if not s_val:
+                return None
+        if pad_len:
+            try:
+                num = int(float(s_val))
+                return f"{num:0{pad_len}d}"
+            except Exception:
+                pass
+        return s_val
+
+    try:
+        return original.apply(_convert)
+    except Exception:
+        return original
+
+
+# ---- Moved from batch.py ----
+
+def safe_sector_slug(sector: Optional[str]) -> str:
+    """Generate a filename-safe slug from a sector name."""
+    text = str(sector or 'default')
+    slug = ''.join(ch if (ch.isalnum() or ch in {'-', '_'}) else '_' for ch in text)
+    slug = slug.strip('_') or 'default'
+    return slug
+
+
+def serialize_attrs(attrs) -> dict:
+    """Safely serialize a dictionary of attributes to JSON-compatible dict."""
+    if not isinstance(attrs, dict):
+        return {}
+    result = {}
+    for key, value in attrs.items():
+        safe_key = str(key)
+        try:
+            json.dumps(value)
+            result[safe_key] = value
+        except TypeError:
+            result[safe_key] = repr(value)
+    return result
+
+
+# ---- Original utils content (preserved) ----
 
 def _prune_incompatible_bundled_libs() -> None:
     """Drop PyInstaller-bundled glibc toolchain libs that require newer glibc.
@@ -95,7 +254,6 @@ def _config_file() -> str:
 
 def load_settings() -> dict:
     """Load the entire settings dictionary from the JSON config file."""
-    import json
     try:
         cfg = _config_file()
         if not os.path.exists(cfg):
@@ -108,7 +266,6 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> None:
     """Collect and save current GUI settings to the JSON config file."""
-    import json
     try:
         cfg = _config_file()
         with open(cfg, 'w') as f:

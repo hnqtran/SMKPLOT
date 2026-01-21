@@ -63,27 +63,27 @@ def _process_inline_chunk(inln_path, vars_to_process, t_start, t_end, valid_indi
         
     try:
         with netCDF4.Dataset(inln_path, 'r') as nc_in:
-             for i, t in enumerate(t_indices):
-                 for vname in vars_to_process:
-                     data_in = nc_in.variables[vname][t]
+            for i, t in enumerate(t_indices):
+                for vname in vars_to_process:
+                    data_in = nc_in.variables[vname][t]
                      
-                     # Reshape logic
-                     if data_in.ndim > 2:
-                          data_in = data_in.reshape(data_in.shape[0], -1)
-                     elif data_in.ndim == 1:
-                          data_in = data_in.reshape(1, -1)
+                    # Reshape logic
+                    if data_in.ndim > 2:
+                        data_in = data_in.reshape(data_in.shape[0], -1)
+                    elif data_in.ndim == 1:
+                        data_in = data_in.reshape(1, -1)
                      
-                     if data_in.shape[1] != src_count:
-                          if data_in.shape[0] == src_count:
-                               data_in = data_in.T
+                    if data_in.shape[1] != src_count:
+                        if data_in.shape[0] == src_count:
+                                data_in = data_in.T
                                
-                     # Subset Valid
-                     if valid_indices.size > 0:
-                          data_valid = data_in[:, valid_indices]
+                    # Subset Valid
+                    if valid_indices.size > 0:
+                        data_valid = data_in[:, valid_indices]
                           
-                          # Accumulate
-                          for L in range(n_lay):
-                               np.add.at(res_data[vname][i, L, :, :], (v_rows, v_cols), data_valid[L, :])
+                        # Accumulate
+                        for L in range(n_lay):
+                                np.add.at(res_data[vname][i, L, :, :], (v_rows, v_cols), data_valid[L, :])
     except Exception as e:
         # Returning Exception for main process to handle
         return e
@@ -124,55 +124,55 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
             if hasattr(nc_in, 'GDNAM'):
                 grid_name = str(nc_in.GDNAM).strip()
             else:
-                 grid_name = 'UNKNOWN'
+                grid_name = 'UNKNOWN'
         
         # Grid Definition
         gi = None
         if griddesc_path and os.path.exists(griddesc_path):
-             try:
-                 coord_params, grid_params = extract_grid(griddesc_path, grid_name)
-                 gi = {
-                     'proj_type': int(coord_params[0]),
-                     'p_alp': float(coord_params[1]),
-                     'p_bet': float(coord_params[2]),
-                     'p_gam': float(coord_params[3]),
-                     'xcent': float(coord_params[4]),
-                     'ycent': float(coord_params[5]),
-                     'xorig': float(grid_params[1]),
-                     'yorig': float(grid_params[2]),
-                     'xcell': float(grid_params[3]),
-                     'ycell': float(grid_params[4]),
-                     'ncols': int(grid_params[5]),
-                     'nrows': int(grid_params[6])
-                 }
-             except Exception:
-                 pass
+            try:
+                coord_params, grid_params = extract_grid(griddesc_path, grid_name)
+                gi = {
+                    'proj_type': int(coord_params[0]),
+                    'p_alp': float(coord_params[1]),
+                    'p_bet': float(coord_params[2]),
+                    'p_gam': float(coord_params[3]),
+                    'xcent': float(coord_params[4]),
+                    'ycent': float(coord_params[5]),
+                    'xorig': float(grid_params[1]),
+                    'yorig': float(grid_params[2]),
+                    'xcell': float(grid_params[3]),
+                    'ycell': float(grid_params[4]),
+                    'ncols': int(grid_params[5]),
+                    'nrows': int(grid_params[6])
+                }
+            except Exception:
+                pass
         
         if gi is None:
-             try:
-                 gi = {}
-                 gi['xorig'] = float(getattr(nc_in, 'XORIG') or 0)
-                 gi['yorig'] = float(getattr(nc_in, 'YORIG') or 0)
-                 gi['xcell'] = float(getattr(nc_in, 'XCELL') or 0)
-                 gi['ycell'] = float(getattr(nc_in, 'YCELL') or 0)
-                 gi['ncols'] = int(getattr(nc_in, 'NCOLS') or 1)
-                 gi['nrows'] = int(getattr(nc_in, 'NROWS') or 1)
-                 gi['proj_type'] = int(getattr(nc_in, 'GDTYP') or 2)
-                 gi['p_alp'] = float(getattr(nc_in, 'P_ALP') or 0)
-                 gi['p_bet'] = float(getattr(nc_in, 'P_BET') or 0)
-                 gi['p_gam'] = float(getattr(nc_in, 'P_GAM') or 0)
-                 gi['xcent'] = float(getattr(nc_in, 'XCENT') or 0)
-                 gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
+            try:
+                gi = {}
+                gi['xorig'] = float(getattr(nc_in, 'XORIG') or 0)
+                gi['yorig'] = float(getattr(nc_in, 'YORIG') or 0)
+                gi['xcell'] = float(getattr(nc_in, 'XCELL') or 0)
+                gi['ycell'] = float(getattr(nc_in, 'YCELL') or 0)
+                gi['ncols'] = int(getattr(nc_in, 'NCOLS') or 1)
+                gi['nrows'] = int(getattr(nc_in, 'NROWS') or 1)
+                gi['proj_type'] = int(getattr(nc_in, 'GDTYP') or 2)
+                gi['p_alp'] = float(getattr(nc_in, 'P_ALP') or 0)
+                gi['p_bet'] = float(getattr(nc_in, 'P_BET') or 0)
+                gi['p_gam'] = float(getattr(nc_in, 'P_GAM') or 0)
+                gi['xcent'] = float(getattr(nc_in, 'XCENT') or 0)
+                gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
                  
-                 if gi['ncols'] == 1 or gi['nrows'] == 1:
-                      gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
-                      import re
-                      match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
-                      if match:
-                           gi['ncols'] = int(match.group(1))
-                           gi['nrows'] = int(match.group(2))
-             except AttributeError:
-                 raise ValueError("Could not determine grid parameters.")
+                if gi['ncols'] == 1 or gi['nrows'] == 1:
+                        gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
+                        import re
+                        match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
+                        if match:
+                            gi['ncols'] = int(match.group(1))
+                            gi['nrows'] = int(match.group(2))
+            except AttributeError:
+                raise ValueError("Could not determine grid parameters.")
 
     # Read STACK_GROUPS
     with netCDF4.Dataset(stack_groups_path) as nc_stack:
@@ -184,7 +184,7 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
     xx, yy = proj(lons, lats)
     
     if gi['xcell'] == 0 or gi['ycell'] == 0:
-         raise ValueError("Grid cell size is zero.")
+        raise ValueError("Grid cell size is zero.")
          
     cols = np.floor((xx - gi['xorig']) / gi['xcell']).astype(int)
     rows = np.floor((yy - gi['yorig']) / gi['ycell']).astype(int)
@@ -214,75 +214,75 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
             if hasattr(nc_in, 'GDNAM'):
                 grid_name = str(nc_in.GDNAM).strip()
             else:
-                 # If no GDNAM, we might proceed if we don't strictly need it (e.g. if using heuristics), but usually IOAPI has it.
-                 # Warn and use placeholder if missing?
-                 logging.warning("GRID_NAME not set and GDNAM attribute missing in INLN file. Using 'UNKNOWN'.")
-                 grid_name = 'UNKNOWN'
+                # If no GDNAM, we might proceed if we don't strictly need it (e.g. if using heuristics), but usually IOAPI has it.
+                # Warn and use placeholder if missing?
+                logging.warning("GRID_NAME not set and GDNAM attribute missing in INLN file. Using 'UNKNOWN'.")
+                grid_name = 'UNKNOWN'
         
         # Grid Definition
         gi = None
         if griddesc_path and os.path.exists(griddesc_path):
-             try:
-                 # Reuse existing centralized logic
-                 coord_params, grid_params = extract_grid(griddesc_path, grid_name)
-                 # Map to dictionary structure used below
-                 gi = {
-                     'proj_type': int(coord_params[0]),
-                     'p_alp': float(coord_params[1]),
-                     'p_bet': float(coord_params[2]),
-                     'p_gam': float(coord_params[3]),
-                     'xcent': float(coord_params[4]),
-                     'ycent': float(coord_params[5]),
-                     'xorig': float(grid_params[1]),
-                     'yorig': float(grid_params[2]),
-                     'xcell': float(grid_params[3]),
-                     'ycell': float(grid_params[4]),
-                     'ncols': int(grid_params[5]),
-                     'nrows': int(grid_params[6])
-                 }
-             except Exception:
-                 pass
+            try:
+                # Reuse existing centralized logic
+                coord_params, grid_params = extract_grid(griddesc_path, grid_name)
+                # Map to dictionary structure used below
+                gi = {
+                    'proj_type': int(coord_params[0]),
+                    'p_alp': float(coord_params[1]),
+                    'p_bet': float(coord_params[2]),
+                    'p_gam': float(coord_params[3]),
+                    'xcent': float(coord_params[4]),
+                    'ycent': float(coord_params[5]),
+                    'xorig': float(grid_params[1]),
+                    'yorig': float(grid_params[2]),
+                    'xcell': float(grid_params[3]),
+                    'ycell': float(grid_params[4]),
+                    'ncols': int(grid_params[5]),
+                    'nrows': int(grid_params[6])
+                }
+            except Exception:
+                pass
         
         # If GRIDDESC failed or not provided, try to extract from NC header
         if gi is None:
-             # Try to construct 'gi' from NC global attributes if they exist
-             try:
-                 gi = {}
-                 gi['xorig'] = float(getattr(nc_in, 'XORIG') or 0)
-                 gi['yorig'] = float(getattr(nc_in, 'YORIG') or 0)
-                 gi['xcell'] = float(getattr(nc_in, 'XCELL') or 0)
-                 gi['ycell'] = float(getattr(nc_in, 'YCELL') or 0)
-                 gi['ncols'] = int(getattr(nc_in, 'NCOLS') or 1)
-                 gi['nrows'] = int(getattr(nc_in, 'NROWS') or 1)
+            # Try to construct 'gi' from NC global attributes if they exist
+            try:
+                gi = {}
+                gi['xorig'] = float(getattr(nc_in, 'XORIG') or 0)
+                gi['yorig'] = float(getattr(nc_in, 'YORIG') or 0)
+                gi['xcell'] = float(getattr(nc_in, 'XCELL') or 0)
+                gi['ycell'] = float(getattr(nc_in, 'YCELL') or 0)
+                gi['ncols'] = int(getattr(nc_in, 'NCOLS') or 1)
+                gi['nrows'] = int(getattr(nc_in, 'NROWS') or 1)
                  
-                 gi['proj_type'] = int(getattr(nc_in, 'GDTYP') or 2)
-                 gi['p_alp'] = float(getattr(nc_in, 'P_ALP') or 0)
-                 gi['p_bet'] = float(getattr(nc_in, 'P_BET') or 0)
-                 gi['p_gam'] = float(getattr(nc_in, 'P_GAM') or 0)
-                 gi['xcent'] = float(getattr(nc_in, 'XCENT') or 0)
-                 gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
+                gi['proj_type'] = int(getattr(nc_in, 'GDTYP') or 2)
+                gi['p_alp'] = float(getattr(nc_in, 'P_ALP') or 0)
+                gi['p_bet'] = float(getattr(nc_in, 'P_BET') or 0)
+                gi['p_gam'] = float(getattr(nc_in, 'P_GAM') or 0)
+                gi['xcent'] = float(getattr(nc_in, 'XCENT') or 0)
+                gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
                  
-                 # Fix for Inline files where NCOLS/NROWS describe list size (e.g. 1 x NSRC)
-                 # We need the spatial grid dimensions. Try to parse from GDNAM.
-                 if gi['ncols'] == 1 or gi['nrows'] == 1:
-                      gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
-                      import re
-                      # Look for _NNNxMMM pattern at end of string
-                      match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
-                      if match:
-                           gi['ncols'] = int(match.group(1))
-                           gi['nrows'] = int(match.group(2))
-                           logging.info(f"Inferred spatial grid dimensions from GDNAM '{gdnam}': {gi['ncols']}x{gi['nrows']}")
-                      else:
-                           logging.warning(f"Inline file has 1D dimensions ({gi['ncols']}x{gi['nrows']}) and GDNAM '{gdnam}' does not contain explicit dimensions. Plotting may be incorrect without GRIDDESC.")
+                # Fix for Inline files where NCOLS/NROWS describe list size (e.g. 1 x NSRC)
+                # We need the spatial grid dimensions. Try to parse from GDNAM.
+                if gi['ncols'] == 1 or gi['nrows'] == 1:
+                        gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
+                        import re
+                        # Look for _NNNxMMM pattern at end of string
+                        match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
+                        if match:
+                            gi['ncols'] = int(match.group(1))
+                            gi['nrows'] = int(match.group(2))
+                            logging.info(f"Inferred spatial grid dimensions from GDNAM '{gdnam}': {gi['ncols']}x{gi['nrows']}")
+                        else:
+                            logging.warning(f"Inline file has 1D dimensions ({gi['ncols']}x{gi['nrows']}) and GDNAM '{gdnam}' does not contain explicit dimensions. Plotting may be incorrect without GRIDDESC.")
 
-             except AttributeError:
-                 raise ValueError(f"Could not determine grid parameters from INLN header or GRIDDESC for '{grid_name}'.")
+            except AttributeError:
+                raise ValueError(f"Could not determine grid parameters from INLN header or GRIDDESC for '{grid_name}'.")
 
         # Read STACK_GROUPS
         with netCDF4.Dataset(stack_groups_path) as nc_stack:
             if 'LATITUDE' not in nc_stack.variables or 'LONGITUDE' not in nc_stack.variables:
-                 raise ValueError("STACK_GROUPS file must contain LATITUDE and LONGITUDE variables.")
+                raise ValueError("STACK_GROUPS file must contain LATITUDE and LONGITUDE variables.")
             
             lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
             lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
@@ -294,7 +294,7 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
         # Calculate Grid Indices (0-based)
         # Avoid division by zero if xcell/ycell are 0 (bad header)
         if gi['xcell'] == 0 or gi['ycell'] == 0:
-             raise ValueError("Grid cell size (XCELL/YCELL) is zero. Invalid grid definition.")
+            raise ValueError("Grid cell size (XCELL/YCELL) is zero. Invalid grid definition.")
              
         cols = np.floor((xx - gi['xorig']) / gi['xcell']).astype(int)
         rows = np.floor((yy - gi['yorig']) / gi['ycell']).astype(int)
@@ -380,63 +380,63 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                     nc_in.variables[vars_to_process[0]].shape[0] if vars_to_process else 1
                 )
                 if tstep_dim and tstep_dim.isunlimited():
-                     # Check actual size from a variable
-                     if vars_to_process:
-                          n_tsteps = nc_in.variables[vars_to_process[0]].shape[0]
+                    # Check actual size from a variable
+                    if vars_to_process:
+                        n_tsteps = nc_in.variables[vars_to_process[0]].shape[0]
 
                 # Process
                 cpu_count = os.cpu_count() or 1
                 should_parallel = (n_tsteps >= 24) and (cpu_count > 1) 
                 
                 if should_parallel:
-                     logging.info(f"Processing {n_tsteps} time steps in parallel using {cpu_count} workers.")
-                     chunk_size = max(12, n_tsteps // (cpu_count * 2))
+                    logging.info(f"Processing {n_tsteps} time steps in parallel using {cpu_count} workers.")
+                    chunk_size = max(12, n_tsteps // (cpu_count * 2))
                      
-                     # Create batches of (start, end)
-                     batches = []
-                     for i in range(0, n_tsteps, chunk_size):
-                         batches.append((i, min(i + chunk_size, n_tsteps)))
+                    # Create batches of (start, end)
+                    batches = []
+                    for i in range(0, n_tsteps, chunk_size):
+                        batches.append((i, min(i + chunk_size, n_tsteps)))
                      
-                     with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_count) as executor:
-                         futures = {
-                             executor.submit(
-                                 _process_inline_chunk,
-                                 inln_path, 
-                                 vars_to_process, 
-                                 b[0], b[1], # start, end
-                                 valid_indices, 
-                                 v_rows, 
-                                 v_cols, 
-                                 gi['nrows'], 
-                                 gi['ncols'], 
-                                 n_lay, 
-                                 len(lats)
-                             ): b for b in batches
-                         }
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=cpu_count) as executor:
+                        futures = {
+                            executor.submit(
+                                _process_inline_chunk,
+                                inln_path, 
+                                vars_to_process, 
+                                b[0], b[1], # start, end
+                                valid_indices, 
+                                v_rows, 
+                                v_cols, 
+                                gi['nrows'], 
+                                gi['ncols'], 
+                                n_lay, 
+                                len(lats)
+                            ): b for b in batches
+                        }
                          
-                         for future in concurrent.futures.as_completed(futures):
-                             res = future.result()
-                             if isinstance(res, Exception):
-                                  raise res
-                             if res is None:
-                                  raise RuntimeError("Parallel worker failed silently.")
+                        for future in concurrent.futures.as_completed(futures):
+                            res = future.result()
+                            if isinstance(res, Exception):
+                                raise res
+                            if res is None:
+                                raise RuntimeError("Parallel worker failed silently.")
                                   
-                             start_t, end_t, chunk_res = res
+                            start_t, end_t, chunk_res = res
                              
-                             # 1. Copy TFLAG for this chunk
-                             if 'TFLAG' in nc_in.variables:
-                                 tf_slice = nc_in.variables['TFLAG'][start_t:end_t]
-                                 if tf_out.shape[1] == tf_slice.shape[1]:
-                                     tf_out[start_t:end_t, :, :] = tf_slice
-                                 else:
-                                     m = min(tf_out.shape[1], tf_slice.shape[1])
-                                     tf_out[start_t:end_t, :m, :] = tf_slice[:, :m, :]
+                            # 1. Copy TFLAG for this chunk
+                            if 'TFLAG' in nc_in.variables:
+                                tf_slice = nc_in.variables['TFLAG'][start_t:end_t]
+                                if tf_out.shape[1] == tf_slice.shape[1]:
+                                    tf_out[start_t:end_t, :, :] = tf_slice
+                                else:
+                                    m = min(tf_out.shape[1], tf_slice.shape[1])
+                                    tf_out[start_t:end_t, :m, :] = tf_slice[:, :m, :]
                                      
-                             # 2. Write Data
-                             for vname, data in chunk_res.items():
-                                 out_vars[vname][start_t:end_t, ...] = data
+                            # 2. Write Data
+                            for vname, data in chunk_res.items():
+                                out_vars[vname][start_t:end_t, ...] = data
                              
-                             logging.info(f"Processed batch steps {start_t}-{end_t-1}")
+                            logging.info(f"Processed batch steps {start_t}-{end_t-1}")
 
                 else:
                     # Sequential Fallback
@@ -447,8 +447,8 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                             if tf_out.shape[1] == tf_in_data.shape[0]:
                                 tf_out[t, :, :] = tf_in_data
                             else:
-                                 min_var = min(tf_out.shape[1], tf_in_data.shape[0])
-                                 tf_out[t, :min_var, :] = tf_in_data[:min_var, :]
+                                min_var = min(tf_out.shape[1], tf_in_data.shape[0])
+                                tf_out[t, :min_var, :] = tf_in_data[:min_var, :]
 
                         for vname in vars_to_process:
                             # shape: (T, LAY, NSRC) or (T, LAY, 1, NSRC) etc.
@@ -456,15 +456,15 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                             
                             # Flatten to (LAY, NSRC)
                             if data_in.ndim > 2:
-                                 data_in = data_in.reshape(data_in.shape[0], -1)
+                                data_in = data_in.reshape(data_in.shape[0], -1)
                             elif data_in.ndim == 1:
-                                 data_in = data_in.reshape(1, -1)
+                                data_in = data_in.reshape(1, -1)
                             
                             # Fix Case: (LAY, 1) if NSRC=1
                             if data_in.shape[1] != len(lats):
-                                 # Try transpose?
-                                 if data_in.shape[0] == len(lats):
-                                      data_in = data_in.T
+                                # Try transpose?
+                                if data_in.shape[0] == len(lats):
+                                        data_in = data_in.T
                             
                             # Prepare grid: (LAY, R, C)
                             grid_data = np.zeros((n_lay, gi['nrows'], gi['ncols']), dtype=np.float32)
@@ -527,11 +527,11 @@ def read_ncf_grid_params(ncf_path: str):
 
         # Fix for Inline files where NCOLS/NROWS describe list size
         if ncols == 1 or nrows == 1:
-             import re
-             match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
-             if match:
-                   ncols = int(match.group(1))
-                   nrows = int(match.group(2)) 
+            import re
+            match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
+            if match:
+                    ncols = int(match.group(1))
+                    nrows = int(match.group(2)) 
         
         grid_params = (gdnam, xorig, yorig, xcell, ycell, ncols, nrows, nthik)
         
@@ -547,34 +547,34 @@ def get_ncf_dims(ncf_path: str):
         'tflag_values': []
     }
     with netCDF4.Dataset(ncf_path, 'r') as ds:
-         dims = ds.dimensions
-         if 'TSTEP' in dims:
-             info['n_tsteps'] = dims['TSTEP'].size
-         if 'LAY' in dims:
-             info['n_layers'] = dims['LAY'].size
+        dims = ds.dimensions
+        if 'TSTEP' in dims:
+            info['n_tsteps'] = dims['TSTEP'].size
+        if 'LAY' in dims:
+            info['n_layers'] = dims['LAY'].size
              
-         # Try to read TFLAG key if available to get dates/times
-         if 'TFLAG' in ds.variables:
-             try:
-                 tf = ds.variables['TFLAG']
-                 # Shape usually (TSTEP, VAR, DATE-TIME). DATE-TIME is dim 2 (indices 0=date, 1=time)
-                 # We take all time steps, first variable (0), both date and time components
-                 if tf.ndim >= 2:
-                     # Get array. If massive, this might be slow, but TSTEP usually < 8760
-                     # Use numpy slicing. tf[:, 0, :] -> Shape (TSTEP, 2) if 3D
-                     # If 2D (TSTEP, DATE-TIME), then tf[:]
-                     if tf.ndim == 3:
-                         tflags = tf[:, 0, :] 
-                     else:
-                         tflags = tf[:]
+        # Try to read TFLAG key if available to get dates/times
+        if 'TFLAG' in ds.variables:
+            try:
+                tf = ds.variables['TFLAG']
+                # Shape usually (TSTEP, VAR, DATE-TIME). DATE-TIME is dim 2 (indices 0=date, 1=time)
+                # We take all time steps, first variable (0), both date and time components
+                if tf.ndim >= 2:
+                    # Get array. If massive, this might be slow, but TSTEP usually < 8760
+                    # Use numpy slicing. tf[:, 0, :] -> Shape (TSTEP, 2) if 3D
+                    # If 2D (TSTEP, DATE-TIME), then tf[:]
+                    if tf.ndim == 3:
+                        tflags = tf[:, 0, :] 
+                    else:
+                        tflags = tf[:]
                      
-                     for i in range(tflags.shape[0]):
-                         # TFLAG is usually int32
-                         yd = int(tflags[i, 0]) # YYYYDDD
-                         hms = int(tflags[i, 1]) # HHMMSS
-                         info['tflag_values'].append(f"{yd} {hms:06d}")
-             except Exception:
-                 pass
+                    for i in range(tflags.shape[0]):
+                        # TFLAG is usually int32
+                        yd = int(tflags[i, 0]) # YYYYDDD
+                        hms = int(tflags[i, 1]) # HHMMSS
+                        info['tflag_values'].append(f"{yd} {hms:06d}")
+            except Exception:
+                pass
                  
     return info
 
@@ -705,36 +705,36 @@ def read_ncf_emissions(
     
     # If standard inln pattern detected but STACK_GROUPS missing, try to auto-locate
     if 'inln' in base_name:
-         import re
-         parent_dir = os.path.dirname(os.path.abspath(ncf_path))
-         found_specific = False
+        import re
+        parent_dir = os.path.dirname(os.path.abspath(ncf_path))
+        found_specific = False
          
-         # Strategy 1: Look for date-specific match (YYYYMMDD or YYYYJJJ)
-         # Using regex (20\d{6}|20\d{5}) to catch 8-digit Gregorian or 7-digit Julian dates
-         match_date = re.search(r'(20\d{6}|20\d{5})', base_name)
-         if match_date:
-             date_str = match_date.group(1)
-             try:
-                 candidates = [f for f in os.listdir(parent_dir) 
-                               if 'stack_groups' in f.lower() 
-                               and date_str in f 
-                               and (f.endswith('.nc') or f.endswith('.ncf'))]
-                 if candidates:
-                     stack_groups = os.path.join(parent_dir, candidates[0])
-                     _notify('INFO', f"Auto-detected date-matched STACK_GROUPS file: {stack_groups}")
-                     found_specific = True
-             except Exception:
-                 pass
+        # Strategy 1: Look for date-specific match (YYYYMMDD or YYYYJJJ)
+        # Using regex (20\d{6}|20\d{5}) to catch 8-digit Gregorian or 7-digit Julian dates
+        match_date = re.search(r'(20\d{6}|20\d{5})', base_name)
+        if match_date:
+            date_str = match_date.group(1)
+            try:
+                candidates = [f for f in os.listdir(parent_dir) 
+                                if 'stack_groups' in f.lower() 
+                                and date_str in f 
+                                and (f.endswith('.nc') or f.endswith('.ncf'))]
+                if candidates:
+                    stack_groups = os.path.join(parent_dir, candidates[0])
+                    _notify('INFO', f"Auto-detected date-matched STACK_GROUPS file: {stack_groups}")
+                    found_specific = True
+            except Exception:
+                pass
          
-         # Strategy 2: Fallback to any stack_groups file if specific not found AND no global provided
-         if not found_specific and not stack_groups:
-             try:
-                 candidates = [f for f in os.listdir(parent_dir) if 'stack_groups' in f.lower() and (f.endswith('.nc') or f.endswith('.ncf'))]
-                 if candidates:
-                     stack_groups = os.path.join(parent_dir, candidates[0])
-                     _notify('INFO', f"Auto-detected STACK_GROUPS file (fallback): {stack_groups}")
-             except Exception:
-                 pass
+        # Strategy 2: Fallback to any stack_groups file if specific not found AND no global provided
+        if not found_specific and not stack_groups:
+            try:
+                candidates = [f for f in os.listdir(parent_dir) if 'stack_groups' in f.lower() and (f.endswith('.nc') or f.endswith('.ncf'))]
+                if candidates:
+                    stack_groups = os.path.join(parent_dir, candidates[0])
+                    _notify('INFO', f"Auto-detected STACK_GROUPS file (fallback): {stack_groups}")
+            except Exception:
+                pass
 
     # We can also detect inline by shape in the dataset
     is_inline_candidate = False
@@ -803,14 +803,14 @@ def read_ncf_emissions(
                 pass
             
             if df.empty:
-                 _notify('WARNING', "Inline processing resulted in empty dataframe (no non-zero emissions).")
-                 return gpd.GeoDataFrame({'geometry': []}, crs='EPSG:4326')
+                _notify('WARNING', "Inline processing resulted in empty dataframe (no non-zero emissions).")
+                return gpd.GeoDataFrame({'geometry': []}, crs='EPSG:4326')
 
             # Re-get 'gi' from cache or re-call
             _, _, _, gi = _get_inline_mapping(ncf_path, stack_groups, griddesc, None)
             
             if gi['xcell'] == 0:
-                 _notify('ERROR', "Grid XCELL is 0. Map coordinates will be invalid.")
+                _notify('ERROR', "Grid XCELL is 0. Map coordinates will be invalid.")
                  
             # Create Grid Polygons
             from shapely.geometry import box
@@ -825,7 +825,17 @@ def read_ncf_emissions(
             x1 = x0 + gi['xcell']
             y1 = y0 + gi['ycell']
             
-            geoms = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(df))]
+            # Vectorized geometry (Shapely 2.0+) with timing
+            import time
+            _t_geom = time.time()
+            try:
+                import shapely
+                geoms = shapely.box(x0, y0, x1, y1) if hasattr(shapely, 'box') else None
+                if geoms is None: raise AttributeError()
+            except:
+                from shapely.geometry import box
+                geoms = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(df))]
+            _notify('INFO', f"Inline geometry: {time.time()-_t_geom:.2f}s for {len(df)} cells")
             
             gdf = gpd.GeoDataFrame(df, geometry=geoms)
             
@@ -935,25 +945,25 @@ def read_ncf_emissions(
             
             # Handle Time Slice
             if 'TSTEP' in dims:
-                 axis_idx = dims.index('TSTEP')
-                 if tstep_idx is not None:
-                     ts_target = tstep_idx
-                     if ts_target >= var_obj.shape[axis_idx]:
-                          ts_target = 0
-                     slices[axis_idx] = ts_target
+                axis_idx = dims.index('TSTEP')
+                if tstep_idx is not None:
+                    ts_target = tstep_idx
+                    if ts_target >= var_obj.shape[axis_idx]:
+                        ts_target = 0
+                    slices[axis_idx] = ts_target
 
             # Handle Layer Slice
             if 'LAY' in dims:
-                 axis_idx = dims.index('LAY')
-                 if layer_idx is not None:
-                     # If layer_op is select, we slice. If sum/mean, we might slice if logic implies single layer
-                     # But current API implies layer_idx is used unless None.
-                     # If layer_idx is provided, we use it. Aggregation happens if layer_idx is None.
-                     if var_obj.shape[axis_idx] <= layer_idx:
-                          layer_idx_act = 0
-                     else:
-                          layer_idx_act = layer_idx
-                     slices[axis_idx] = layer_idx_act
+                axis_idx = dims.index('LAY')
+                if layer_idx is not None:
+                    # If layer_op is select, we slice. If sum/mean, we might slice if logic implies single layer
+                    # But current API implies layer_idx is used unless None.
+                    # If layer_idx is provided, we use it. Aggregation happens if layer_idx is None.
+                    if var_obj.shape[axis_idx] <= layer_idx:
+                        layer_idx_act = 0
+                    else:
+                        layer_idx_act = layer_idx
+                    slices[axis_idx] = layer_idx_act
 
             # Read data subset
             try:
@@ -973,35 +983,35 @@ def read_ncf_emissions(
 
             # Reduce Time (if not sliced)
             if 'TSTEP' in current_dims:
-                 axis_idx = current_dims.index('TSTEP')
-                 if tstep_op == 'mean':
-                     data = np.mean(data, axis=axis_idx)
-                 elif tstep_op == 'max':
-                     data = np.max(data, axis=axis_idx)
-                 elif tstep_op == 'min':
-                     data = np.min(data, axis=axis_idx)
-                 else:
-                     data = np.sum(data, axis=axis_idx)
-                 # Shift dims
-                 current_dims.pop(axis_idx)
+                axis_idx = current_dims.index('TSTEP')
+                if tstep_op == 'mean':
+                    data = np.mean(data, axis=axis_idx)
+                elif tstep_op == 'max':
+                    data = np.max(data, axis=axis_idx)
+                elif tstep_op == 'min':
+                    data = np.min(data, axis=axis_idx)
+                else:
+                    data = np.sum(data, axis=axis_idx)
+                # Shift dims
+                current_dims.pop(axis_idx)
             
             # Reduce Layer (if not sliced)
             if 'LAY' in current_dims:
-                 try:
-                     axis_idx = current_dims.index('LAY')
-                     if layer_op == 'mean':
-                         data = np.mean(data, axis=axis_idx)
-                     elif layer_op == 'sum':
-                         data = np.sum(data, axis=axis_idx)
-                     elif layer_op == 'max':
-                         data = np.max(data, axis=axis_idx)
-                     elif layer_op == 'min':
-                         data = np.min(data, axis=axis_idx)
-                     else: 
-                         # Default to layer 0 if op is confusing
-                         data = np.take(data, 0, axis=axis_idx)
-                 except ValueError:
-                     pass
+                try:
+                    axis_idx = current_dims.index('LAY')
+                    if layer_op == 'mean':
+                        data = np.mean(data, axis=axis_idx)
+                    elif layer_op == 'sum':
+                        data = np.sum(data, axis=axis_idx)
+                    elif layer_op == 'max':
+                        data = np.max(data, axis=axis_idx)
+                    elif layer_op == 'min':
+                        data = np.min(data, axis=axis_idx)
+                    else: 
+                        # Default to layer 0 if op is confusing
+                        data = np.take(data, 0, axis=axis_idx)
+                except ValueError:
+                    pass
 
             # Now data should be (ROW, COL) - or (ROW, COL) depending on dim order
             # IOAPI is usually (TSTEP, LAY, ROW, COL).
@@ -1011,10 +1021,10 @@ def read_ncf_emissions(
             if data.shape != (nrows, ncols):
                 # Try transpose if shape is (ncols, nrows) which shouldn't happen for standard IOAPI
                 if data.shape == (ncols, nrows):
-                     data = data.T
+                    data = data.T
                 else:
-                     logging.warning(f"Variable {pol} shape mismatch: {data.shape} vs ({nrows}, {ncols})")
-                     continue
+                    logging.warning(f"Variable {pol} shape mismatch: {data.shape} vs ({nrows}, {ncols})")
+                    continue
             
             # Use float32 to save memory
             data_dict[pol] = data.astype(np.float32).flatten()
@@ -1028,88 +1038,98 @@ def read_ncf_emissions(
     # Try Lazy/Sparse Grid Generation for Standard NetCDF (Speeds up initial loading)
     try:
         if data_dict:
-             coord_params_lz, grid_params_lz = read_ncf_grid_params(ncf_path)
-             # grid_params: (gdnam, xorig, yorig, xcell, ycell, ncols, nrows, nthik)
-             xorig_lz, yorig_lz, xcell_lz, ycell_lz = grid_params_lz[1], grid_params_lz[2], grid_params_lz[3], grid_params_lz[4]
+            coord_params_lz, grid_params_lz = read_ncf_grid_params(ncf_path)
+            # grid_params: (gdnam, xorig, yorig, xcell, ycell, ncols, nrows, nthik)
+            xorig_lz, yorig_lz, xcell_lz, ycell_lz = grid_params_lz[1], grid_params_lz[2], grid_params_lz[3], grid_params_lz[4]
              
-             if xcell_lz > 0 and ycell_lz > 0:
-                 flat_rows_lz = row_idx.flatten()
-                 flat_cols_lz = col_idx.flatten()
+            if xcell_lz > 0 and ycell_lz > 0:
+                flat_rows_lz = row_idx.flatten()
+                flat_cols_lz = col_idx.flatten()
                  
-                 full_data_lz = {'ROW': flat_rows_lz, 'COL': flat_cols_lz}
-                 full_data_lz.update(data_dict)
-                 df_lz = pd.DataFrame(full_data_lz)
+                full_data_lz = {'ROW': flat_rows_lz, 'COL': flat_cols_lz}
+                full_data_lz.update(data_dict)
+                df_lz = pd.DataFrame(full_data_lz)
                  
-                 # Filter Non-Zero (Sparse optimization)
-                 # DISABLED: User requested to keep zero-value cells for correct domain average calculations.
-                 # Previously we pruned cells where all pollutants were 0.
-                 _notify('INFO', f"Lazy Grid Load: keeping all {len(df_lz)} cells (including zeros).")
+                # Filter Non-Zero (Sparse optimization)
+                # DISABLED: User requested to keep zero-value cells for correct domain average calculations.
+                # Previously we pruned cells where all pollutants were 0.
+                _notify('INFO', f"Lazy Grid Load: keeping all {len(df_lz)} cells (including zeros).")
                  
-                 # pol_cols_lz = list(data_dict.keys())
-                 # if pol_cols_lz:
-                 #      # Use ANY non-zero check instead of SUM > 0 to preserve negative emissions and avoid cancellation
-                 #      mask_lz = (df_lz[pol_cols_lz] != 0).any(axis=1)
-                 #      
-                 #      # Debug Logging for specific cells if needed (e.g. 50_175)
-                 #      # row_target, col_target = 50, 175
-                 #      # if 'ROW' in df_lz.columns:
-                 #      #     chk = df_lz[(df_lz['ROW']==row_target) & (df_lz['COL']==col_target)]
-                 #      #     if not chk.empty:
-                 #      #          chk_vals = chk[pol_cols_lz].values
-                 #      #          logging.info(f"DEBUG: Cell {row_target}_{col_target} Values: {chk_vals} Mask: {mask_lz.loc[chk.index].values}")
-                 #
-                 #      df_lz = df_lz[mask_lz].copy()
+                # pol_cols_lz = list(data_dict.keys())
+                # if pol_cols_lz:
+                #      # Use ANY non-zero check instead of SUM > 0 to preserve negative emissions and avoid cancellation
+                #      mask_lz = (df_lz[pol_cols_lz] != 0).any(axis=1)
+                #      
+                #      # Debug Logging for specific cells if needed (e.g. 50_175)
+                #      # row_target, col_target = 50, 175
+                #      # if 'ROW' in df_lz.columns:
+                #      #     chk = df_lz[(df_lz['ROW']==row_target) & (df_lz['COL']==col_target)]
+                #      #     if not chk.empty:
+                #      #          chk_vals = chk[pol_cols_lz].values
+                #      #          logging.info(f"DEBUG: Cell {row_target}_{col_target} Values: {chk_vals} Mask: {mask_lz.loc[chk.index].values}")
+                #
+                #      df_lz = df_lz[mask_lz].copy()
 
-                 # n_pruned = len(flat_rows_lz) - len(df_lz)
-                 # if n_pruned > 0:
-                 #     _notify('INFO', f"Sparse Grid: Pruned {n_pruned} empty cells (zeros). Keeping {len(df_lz)} cells.")
+                # n_pruned = len(flat_rows_lz) - len(df_lz)
+                # if n_pruned > 0:
+                #     _notify('INFO', f"Sparse Grid: Pruned {n_pruned} empty cells (zeros). Keeping {len(df_lz)} cells.")
                  
-                 if df_lz.empty:
-                      return gpd.GeoDataFrame(df_lz, geometry=[], crs=None)
+                if df_lz.empty:
+                        return gpd.GeoDataFrame(df_lz, geometry=[], crs=None)
                  
-                 # Generate Geometry
-                 r_0 = df_lz['ROW'].values - 1
-                 c_0 = df_lz['COL'].values - 1
+                # Generate Geometry
+                r_0 = df_lz['ROW'].values - 1
+                c_0 = df_lz['COL'].values - 1
                  
-                 x0 = xorig_lz + c_0 * xcell_lz
-                 y0 = yorig_lz + r_0 * ycell_lz
-                 x1 = x0 + xcell_lz
-                 y1 = y0 + ycell_lz
+                x0 = xorig_lz + c_0 * xcell_lz
+                y0 = yorig_lz + r_0 * ycell_lz
+                x1 = x0 + xcell_lz
+                y1 = y0 + ycell_lz
                  
-                 from shapely.geometry import box
-                 geoms = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(df_lz))]
+                from shapely.geometry import box
+                # Vectorized geometry (Shapely 2.0+) with timing
+                import time
+                _t_geom = time.time()
+                try:
+                    import shapely
+                    geoms = shapely.box(x0, y0, x1, y1) if hasattr(shapely, 'box') else None
+                    if geoms is None: raise AttributeError()
+                except:
+                    from shapely.geometry import box
+                    geoms = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(df_lz))]
+                _notify('INFO', f"Grid geometry: {time.time()-_t_geom:.2f}s for {len(df_lz)} cells")
                  
-                 gi_lz = {
-                     'proj_type': coord_params_lz[0],
-                     'p_alp': coord_params_lz[1],
-                     'p_bet': coord_params_lz[2],
-                     'p_gam': coord_params_lz[3],
-                     'xcent': coord_params_lz[4],
-                     'ycent': coord_params_lz[5]
-                 }
-                 try:
-                     proj_obj_lz = get_proj_object_from_info(gi_lz)
-                     crs_lz = proj_obj_lz.srs
-                 except:
-                     crs_lz = None
+                gi_lz = {
+                    'proj_type': coord_params_lz[0],
+                    'p_alp': coord_params_lz[1],
+                    'p_bet': coord_params_lz[2],
+                    'p_gam': coord_params_lz[3],
+                    'xcent': coord_params_lz[4],
+                    'ycent': coord_params_lz[5]
+                }
+                try:
+                    proj_obj_lz = get_proj_object_from_info(gi_lz)
+                    crs_lz = proj_obj_lz.srs
+                except:
+                    crs_lz = None
 
-                 gdf_lz = gpd.GeoDataFrame(df_lz, geometry=geoms, crs=crs_lz)
+                gdf_lz = gpd.GeoDataFrame(df_lz, geometry=geoms, crs=crs_lz)
                  
-                 # Standard GRID_RC creation
-                 try:
+                # Standard GRID_RC creation
+                try:
                     gdf_lz['GRID_RC'] = gdf_lz['ROW'].astype(str) + '_' + gdf_lz['COL'].astype(str)
-                 except:
+                except:
                     gdf_lz['GRID_RC'] = [f"{r:d}_{c:d}" for r, c in zip(gdf_lz['ROW'], gdf_lz['COL'])]
                  
-                 gdf_lz.attrs['variable_metadata'] = var_metadata
-                 gdf_lz.attrs['source_type'] = 'gridded_lazy'
+                gdf_lz.attrs['variable_metadata'] = var_metadata
+                gdf_lz.attrs['source_type'] = 'gridded_lazy'
                  
-                 _notify('INFO', f"Lazy Grid Load (Standard): {len(gdf_lz)} active cells.")
-                 return gdf_lz
+                _notify('INFO', f"Lazy Grid Load (Standard): {len(gdf_lz)} active cells.")
+                return gdf_lz
 
     except Exception as e:
-         pass
-         # Fallback to original logic
+        pass
+        # Fallback to original logic
 
     # Optimize DataFrame creation
     flat_rows = row_idx.flatten()
@@ -1155,136 +1175,136 @@ def get_ncf_timeseries(
     if stack_groups_path and os.path.exists(stack_groups_path):
         # Use cached mapping directly
         try:
-             # Need griddesc? Or use ncf header?
-             # _get_inline_mapping takes griddesc_path. Usually passed as None here if unknown.
-             # We rely on previous caching or header inference.
-             valid_indices, v_rows, v_cols, gi = _get_inline_mapping(ncf_path, stack_groups_path, None, None)
+            # Need griddesc? Or use ncf header?
+            # _get_inline_mapping takes griddesc_path. Usually passed as None here if unknown.
+            # We rely on previous caching or header inference.
+            valid_indices, v_rows, v_cols, gi = _get_inline_mapping(ncf_path, stack_groups_path, None, None)
              
-             # Calculate source mask for requested cells
-             # v_rows/v_cols align with valid_indices.
-             # We want sources where (row, col) in requested list.
+            # Calculate source mask for requested cells
+            # v_rows/v_cols align with valid_indices.
+            # We want sources where (row, col) in requested list.
              
-             # Convert request to set of (r, c)
-             req_cells = set(zip(row_indices, col_indices))
+            # Convert request to set of (r, c)
+            req_cells = set(zip(row_indices, col_indices))
              
-             # Find matching indices in the valid_sources arrays
-             # Iterate raw
-             match_mask = []
-             for r, c in zip(v_rows, v_cols):
-                  if (r, c) in req_cells:
-                      match_mask.append(True)
-                  else:
-                      match_mask.append(False)
-             match_mask = np.array(match_mask, dtype=bool)
+            # Find matching indices in the valid_sources arrays
+            # Iterate raw
+            match_mask = []
+            for r, c in zip(v_rows, v_cols):
+                if (r, c) in req_cells:
+                        match_mask.append(True)
+                else:
+                        match_mask.append(False)
+            match_mask = np.array(match_mask, dtype=bool)
              
-             target_src_indices = valid_indices[match_mask]
+            target_src_indices = valid_indices[match_mask]
              
-             if len(target_src_indices) == 0:
-                  return None
+            if len(target_src_indices) == 0:
+                return None
                   
-             # Read from INLN
-             with netCDF4.Dataset(ncf_path, 'r') as ds:
-                  # Get Time
-                  tflag_vals = []
-                  if 'TFLAG' in ds.variables:
+            # Read from INLN
+            with netCDF4.Dataset(ncf_path, 'r') as ds:
+                # Get Time
+                tflag_vals = []
+                if 'TFLAG' in ds.variables:
                         tf = ds.variables['TFLAG']
                         if tf.ndim == 3: raw_t = tf[:, 0, :]
                         else: raw_t = tf[:]
                         for i in range(raw_t.shape[0]):
                             tflag_vals.append(f"{int(raw_t[i,0])}_{int(raw_t[i, 1]):06d}")
                   
-                  if pollutant not in ds.variables: return None
-                  var = ds.variables[pollutant]
-                  units = getattr(var, 'units', '')
+                if pollutant not in ds.variables: return None
+                var = ds.variables[pollutant]
+                units = getattr(var, 'units', '')
                   
-                  # Read only target sources across all time
-                  # Shape (T, LAY, NSRC) or similar
-                  # Optimization: Read only columns?
-                  # NetCDF4 supports boolean indexing? No, but integer indexing yes.
+                # Read only target sources across all time
+                # Shape (T, LAY, NSRC) or similar
+                # Optimization: Read only columns?
+                # NetCDF4 supports boolean indexing? No, but integer indexing yes.
                   
-                  # We need to handle layers too.
-                  # Slicing for layers:
-                  slices = [slice(None)] * var.ndim
-                  l_axis = var.dimensions.index('LAY') if 'LAY' in var.dimensions else -1
+                # We need to handle layers too.
+                # Slicing for layers:
+                slices = [slice(None)] * var.ndim
+                l_axis = var.dimensions.index('LAY') if 'LAY' in var.dimensions else -1
                   
-                  if l_axis >= 0:
-                       if layer_idx is not None:
-                           slices[l_axis] = layer_idx
-                       elif layer_op == 'select':
-                           slices[l_axis] = 0
-                       # else: keep all layers, reduce later.
+                if l_axis >= 0:
+                        if layer_idx is not None:
+                            slices[l_axis] = layer_idx
+                        elif layer_op == 'select':
+                            slices[l_axis] = 0
+                        # else: keep all layers, reduce later.
                   
-                  # Slicing columns (Source Dimension)
-                  # Identify the source dimension (ROW or COL usually)
-                  src_dim_idx = -1
-                  dims_list = var.dimensions
+                # Slicing columns (Source Dimension)
+                # Identify the source dimension (ROW or COL usually)
+                src_dim_idx = -1
+                dims_list = var.dimensions
                   
-                  # Debugging
-                  logging.info(f"TS Extraction. Pollutant: {pollutant}, Dims: {dims_list}")
-                  for d in dims_list:
-                       logging.info(f"Dim {d}: {ds.dimensions[d].size}")
+                # Debugging
+                logging.info(f"TS Extraction. Pollutant: {pollutant}, Dims: {dims_list}")
+                for d in dims_list:
+                        logging.info(f"Dim {d}: {ds.dimensions[d].size}")
 
-                  # Strategy: Find dimension that is not TSTEP/LAY and has size > 1
-                  # Or strict check for ROW/COL
-                  for i, dname in enumerate(dims_list):
+                # Strategy: Find dimension that is not TSTEP/LAY and has size > 1
+                # Or strict check for ROW/COL
+                for i, dname in enumerate(dims_list):
                         if dname in ['TSTEP', 'LAY', 'TFLAG', 'DATE-TIME']:
-                             continue
+                            continue
                         # If known source dim candidates
                         if dname in ['ROW', 'COL', 'SRC', 'NSRC']:
-                             if ds.dimensions[dname].isunlimited() or ds.dimensions[dname].size >= 1:
-                                  # Prefer the one that is > 1 if multiple match? 
-                                  # If COL=1 and ROW=N, we want ROW.
-                                  if ds.dimensions[dname].size > 1:
-                                       src_dim_idx = i
-                                       break
-                                  # If both are 1 (1 source), picking either is fine if index is 0. 
-                                  # But valid_indices will be [0].
-                                  if src_dim_idx == -1: src_dim_idx = i
+                            if ds.dimensions[dname].isunlimited() or ds.dimensions[dname].size >= 1:
+                                # Prefer the one that is > 1 if multiple match? 
+                                # If COL=1 and ROW=N, we want ROW.
+                                if ds.dimensions[dname].size > 1:
+                                        src_dim_idx = i
+                                        break
+                                # If both are 1 (1 source), picking either is fine if index is 0. 
+                                # But valid_indices will be [0].
+                                if src_dim_idx == -1: src_dim_idx = i
                   
-                  # Fallback: Last dimension
-                  if src_dim_idx == -1:
+                # Fallback: Last dimension
+                if src_dim_idx == -1:
                         src_dim_idx = var.ndim - 1
                   
-                  logging.info(f"Selected Source Dim Index: {src_dim_idx} ({dims_list[src_dim_idx]})")
-                  slices[src_dim_idx] = target_src_indices
+                logging.info(f"Selected Source Dim Index: {src_dim_idx} ({dims_list[src_dim_idx]})")
+                slices[src_dim_idx] = target_src_indices
                   
-                  # Read
-                  data = var[tuple(slices)]
+                # Read
+                data = var[tuple(slices)]
                   
-                  # Reduce Layer if needed
-                  if l_axis >= 0 and layer_idx is None and layer_op != 'select':
-                      # data has layer dim. Where is it now?
-                      # It wasn't removed.
-                      # Index in data might have shifted if dims removed? No.
-                      l_axis_now = l_axis
-                      if layer_op == 'mean': data = np.mean(data, axis=l_axis_now)
-                      elif layer_op == 'max': data = np.max(data, axis=l_axis_now)
-                      elif layer_op == 'min': data = np.min(data, axis=l_axis_now)
-                      else: data = np.sum(data, axis=l_axis_now)
+                # Reduce Layer if needed
+                if l_axis >= 0 and layer_idx is None and layer_op != 'select':
+                        # data has layer dim. Where is it now?
+                        # It wasn't removed.
+                        # Index in data might have shifted if dims removed? No.
+                        l_axis_now = l_axis
+                        if layer_op == 'mean': data = np.mean(data, axis=l_axis_now)
+                        elif layer_op == 'max': data = np.max(data, axis=l_axis_now)
+                        elif layer_op == 'min': data = np.min(data, axis=l_axis_now)
+                        else: data = np.sum(data, axis=l_axis_now)
 
-                  # Now data is (T, N_Selected_Sources)
-                  # Handle singleton dimensions (e.g. COL=1)
-                  if data.ndim > 2:
-                       # Flatten trailing singletons
-                       if data.shape[-1] == 1:
+                # Now data is (T, N_Selected_Sources)
+                # Handle singleton dimensions (e.g. COL=1)
+                if data.ndim > 2:
+                        # Flatten trailing singletons
+                        if data.shape[-1] == 1:
                             data = data.reshape(data.shape[0], -1)
                   
-                  # If op is 'mean', we likely want mean of total? Or mean of individual?
-                  # Standard logic was just to return aggregated line.
-                  # New logic: Return Total PLUS Individual components if feasible.
+                # If op is 'mean', we likely want mean of total? Or mean of individual?
+                # Standard logic was just to return aggregated line.
+                # New logic: Return Total PLUS Individual components if feasible.
                   
-                  series_total = np.sum(data, axis=-1)
+                series_total = np.sum(data, axis=-1)
                   
-                  # Create result structure
-                  # To avoid breaking existing consumers, we can return 'values' as the total, 
-                  # and add a new key 'components' or just return a dict in 'values' 
-                  # (consumer must handle)
+                # Create result structure
+                # To avoid breaking existing consumers, we can return 'values' as the total, 
+                # and add a new key 'components' or just return a dict in 'values' 
+                # (consumer must handle)
                   
-                  # The user specifically requested multiple lines.
-                  # Let's read metadata for labels
-                  components = {}
-                  try:
-                       with netCDF4.Dataset(stack_groups_path, 'r') as sg:
+                # The user specifically requested multiple lines.
+                # Let's read metadata for labels
+                components = {}
+                try:
+                        with netCDF4.Dataset(stack_groups_path, 'r') as sg:
                             # Slicing: [0, 0, indices, 0] typically for (T, L, R, C)
                             # Or check TSTEP size
                             t_idx = 0
@@ -1293,75 +1313,75 @@ def get_ncf_timeseries(
                             
                             # Read ISTACK
                             if 'ISTACK' in sg.variables:
-                                 istack_var = sg.variables['ISTACK']
-                                 # Assuming (T, L, R, C)
-                                 # We need to slice orthogonal? target_src_indices is list of ints.
-                                 # NetCDF4 supports v[0, 0, [list], 0]
+                                istack_var = sg.variables['ISTACK']
+                                # Assuming (T, L, R, C)
+                                # We need to slice orthogonal? target_src_indices is list of ints.
+                                # NetCDF4 supports v[0, 0, [list], 0]
                                  
-                                 # Build slice
-                                 sg_slices = [0] * istack_var.ndim
-                                 # Find ROW dim
-                                 row_dim_idx = -2 # default heuristic
-                                 for i, d in enumerate(istack_var.dimensions):
-                                      if d == 'ROW': row_dim_idx = i; break
+                                # Build slice
+                                sg_slices = [0] * istack_var.ndim
+                                # Find ROW dim
+                                row_dim_idx = -2 # default heuristic
+                                for i, d in enumerate(istack_var.dimensions):
+                                        if d == 'ROW': row_dim_idx = i; break
                                  
-                                 sg_slices[row_dim_idx] = target_src_indices
+                                sg_slices[row_dim_idx] = target_src_indices
                                  
-                                 # Ensure others are 0 or slice(None) if singleton?
-                                 # Better to read carefully.
-                                 # If we just assume standard structure:
-                                 vals_istack = istack_var[0, 0, target_src_indices, 0]
+                                # Ensure others are 0 or slice(None) if singleton?
+                                # Better to read carefully.
+                                # If we just assume standard structure:
+                                vals_istack = istack_var[0, 0, target_src_indices, 0]
                             else:
-                                 vals_istack = target_src_indices # fallback
+                                vals_istack = target_src_indices # fallback
                             
                             # Read IFIP if available
                             vals_ifip = None
                             if 'IFIP' in sg.variables:
-                                 vals_ifip = sg.variables['IFIP'][0, 0, target_src_indices, 0]
+                                vals_ifip = sg.variables['IFIP'][0, 0, target_src_indices, 0]
                                  
                             # Construct labels
                             # data shape (T, N_srcs)
                             if data.ndim == 2 and data.shape[1] == len(target_src_indices):
-                                 for i in range(len(target_src_indices)):
-                                      stk = vals_istack[i]
-                                      fip = vals_ifip[i] if vals_ifip is not None else '?'
-                                      label = f"Stk {stk} (FIPS {fip})"
-                                      components[label] = data[:, i].tolist()
+                                for i in range(len(target_src_indices)):
+                                        stk = vals_istack[i]
+                                        fip = vals_ifip[i] if vals_ifip is not None else '?'
+                                        label = f"Stk {stk} (FIPS {fip})"
+                                        components[label] = data[:, i].tolist()
                                       
-                  except Exception as e:
-                       logging.warning(f"Could not read stack details: {e}")
-                       # Fallback: labeled by index
-                       for i in range(data.shape[1]):
+                except Exception as e:
+                        logging.warning(f"Could not read stack details: {e}")
+                        # Fallback: labeled by index
+                        for i in range(data.shape[1]):
                             components[f"Source {i+1}"] = data[:, i].tolist()
 
-                  # Combine into 'values' as a dict, including Total
-                  values_out = {'Total': series_total.tolist()}
-                  values_out.update(components)
+                # Combine into 'values' as a dict, including Total
+                values_out = {'Total': series_total.tolist()}
+                values_out.update(components)
                        
-                  return {'times': tflag_vals, 'values': values_out, 'units': units}
+                return {'times': tflag_vals, 'values': values_out, 'units': units}
 
         except Exception as e:
-             logging.error(f"Inline TS failed: {e}")
-             return None
+            logging.error(f"Inline TS failed: {e}")
+            return None
 
     # --- Standard NetCDF ---
     with netCDF4.Dataset(ncf_path, 'r') as ds:
         # Get TFLAG
         tflag_vals = []
         if 'TFLAG' in ds.variables:
-             tf = ds.variables['TFLAG']
-             if tf.ndim == 3:
-                  # (TSTEP, VAR, DATE-TIME)
-                  raw_t = tf[:, 0, :]
-             else:
-                  raw_t = tf[:]
-             for i in range(raw_t.shape[0]):
-                  yd = int(raw_t[i, 0])
-                  hms = int(raw_t[i, 1])
-                  tflag_vals.append(f"{yd}_{hms:06d}")
+            tf = ds.variables['TFLAG']
+            if tf.ndim == 3:
+                # (TSTEP, VAR, DATE-TIME)
+                raw_t = tf[:, 0, :]
+            else:
+                raw_t = tf[:]
+            for i in range(raw_t.shape[0]):
+                yd = int(raw_t[i, 0])
+                hms = int(raw_t[i, 1])
+                tflag_vals.append(f"{yd}_{hms:06d}")
         
         if pollutant not in ds.variables:
-             return None
+            return None
         var = ds.variables[pollutant]
         dims = var.dimensions
         try:
@@ -1378,36 +1398,36 @@ def get_ncf_timeseries(
         
         reduce_layer_later = False
         if l_axis is not None:
-             # If specific layer requested (and not aggregating over layers)
-             if layer_idx is not None:
-                  target = layer_idx
-                  if target >= var.shape[l_axis]: target = 0
-                  slices[l_axis] = target
-             elif layer_op == 'select':
-                  # Default layer 0
-                  slices[l_axis] = 0
-             else:
-                  # Need to sum/mean over all layers -> must read all (or loop)
-                  reduce_layer_later = True
+            # If specific layer requested (and not aggregating over layers)
+            if layer_idx is not None:
+                target = layer_idx
+                if target >= var.shape[l_axis]: target = 0
+                slices[l_axis] = target
+            elif layer_op == 'select':
+                # Default layer 0
+                slices[l_axis] = 0
+            else:
+                # Need to sum/mean over all layers -> must read all (or loop)
+                reduce_layer_later = True
         
         full_data = var[tuple(slices)]
         
         # Reduce Layer first if we read all layers
         if reduce_layer_later:
-             # The data still HAS the layer dimension which is now possibly shifted if TSTEP was sliced (it wasn't here)
-             # Slicing preserved rank only if slice(None) used. Integer indexing removed rank.
-             # We need to find which axis corresponds to LAY in 'full_data'
-             # Since we didn't index TSTEP or ROW/COL, the relative order is preserved.
-             # We need to find the index of 'LAY' in 'dims'
-             axis_idx = dims.index('LAY') # This assumes other dims were not integer-indexed.
-             # But wait, did we integer-index anything? NO, slices was all slice(None).
+            # The data still HAS the layer dimension which is now possibly shifted if TSTEP was sliced (it wasn't here)
+            # Slicing preserved rank only if slice(None) used. Integer indexing removed rank.
+            # We need to find which axis corresponds to LAY in 'full_data'
+            # Since we didn't index TSTEP or ROW/COL, the relative order is preserved.
+            # We need to find the index of 'LAY' in 'dims'
+            axis_idx = dims.index('LAY') # This assumes other dims were not integer-indexed.
+            # But wait, did we integer-index anything? NO, slices was all slice(None).
              
-             if layer_op == 'sum':
-                  full_data = np.sum(full_data, axis=axis_idx)
-             elif layer_op == 'mean':
-                  full_data = np.mean(full_data, axis=axis_idx)
-             else:
-                  full_data = np.take(full_data, 0, axis=axis_idx)
+            if layer_op == 'sum':
+                full_data = np.sum(full_data, axis=axis_idx)
+            elif layer_op == 'mean':
+                full_data = np.mean(full_data, axis=axis_idx)
+            else:
+                full_data = np.take(full_data, 0, axis=axis_idx)
         
         # Now we usually have (TSTEP, ROW, COL) order. TSTEP might not exist if data is 2D.
         # But if we want time series, we need TSTEP.
@@ -1447,7 +1467,7 @@ def get_ncf_timeseries(
                 logging.error(f"Time series extraction failed: {e}")
                 return None
         else:
-             return None
+            return None
 
 def get_ncf_animation_data(
     ncf_path: str,
@@ -1469,202 +1489,202 @@ def get_ncf_animation_data(
     # --- INLINE Support ---
     if stack_groups_path and os.path.exists(stack_groups_path):
         try:
-             valid_indices, v_rows, v_cols, gi = _get_inline_mapping(ncf_path, stack_groups_path, None, None)
+            valid_indices, v_rows, v_cols, gi = _get_inline_mapping(ncf_path, stack_groups_path, None, None)
              
-             # Vectorization Strategy:
-             # 1. Build a map of Requested Cells -> Output Index (0..N-1)
-             #    This allows O(1) lookups to see if a source contributes to our output.
-             #    Crucially, this is built ONCE, not iterated per frame.
-             cell_out_map = { (int(r), int(c)): i for i, (r, c) in enumerate(zip(row_indices, col_indices)) }
+            # Vectorization Strategy:
+            # 1. Build a map of Requested Cells -> Output Index (0..N-1)
+            #    This allows O(1) lookups to see if a source contributes to our output.
+            #    Crucially, this is built ONCE, not iterated per frame.
+            cell_out_map = { (int(r), int(c)): i for i, (r, c) in enumerate(zip(row_indices, col_indices)) }
              
-             # 2. Identify Sources that fall into ANY requested cell
-             #    and map them to their target output indices.
-             #    one source -> one cell (usually)
-             needed_src_indices = []
-             # Map Global_Source_Index -> List of [Output_Cell_Indices]
-             # (Allows for sources contributing to multiple cells if logic ever changed, though standard point is 1:1)
-             src_to_out_map = {} 
+            # 2. Identify Sources that fall into ANY requested cell
+            #    and map them to their target output indices.
+            #    one source -> one cell (usually)
+            needed_src_indices = []
+            # Map Global_Source_Index -> List of [Output_Cell_Indices]
+            # (Allows for sources contributing to multiple cells if logic ever changed, though standard point is 1:1)
+            src_to_out_map = {} 
              
-             # Iterate all sources in the file (or valid subset)
-             # This loop scale is N_Sources (e.g. 5000 to 1M), not N_GridCells (150k).
-             # Efficient if N_Sources isn't massive. If Massive, typically blocked by IO anyway.
-             for g_idx, r, c in zip(valid_indices, v_rows, v_cols):
-                 target = cell_out_map.get((int(r), int(c)))
-                 if target is not None:
-                     needed_src_indices.append(g_idx)
-                     if g_idx not in src_to_out_map:
-                         src_to_out_map[g_idx] = []
-                     src_to_out_map[g_idx].append(target)
+            # Iterate all sources in the file (or valid subset)
+            # This loop scale is N_Sources (e.g. 5000 to 1M), not N_GridCells (150k).
+            # Efficient if N_Sources isn't massive. If Massive, typically blocked by IO anyway.
+            for g_idx, r, c in zip(valid_indices, v_rows, v_cols):
+                target = cell_out_map.get((int(r), int(c)))
+                if target is not None:
+                    needed_src_indices.append(g_idx)
+                    if g_idx not in src_to_out_map:
+                        src_to_out_map[g_idx] = []
+                    src_to_out_map[g_idx].append(target)
              
-             all_needed_srcs = sorted(list(set(needed_src_indices)))
+            all_needed_srcs = sorted(list(set(needed_src_indices)))
              
-             logging.info(f"Inline Animation: Found {len(all_needed_srcs)} contributing sources for requested cells.")
+            logging.info(f"Inline Animation: Found {len(all_needed_srcs)} contributing sources for requested cells.")
 
-             if not all_needed_srcs:
-                 logging.warning("Inline Animation: No matching sources found for requested cells.")
-                 # Return Zeroes with correct shape
-                 # Read time dims for shape
-                 with netCDF4.Dataset(ncf_path, 'r') as ds:
-                      tflag_vals = []
-                      if 'TFLAG' in ds.variables:
+            if not all_needed_srcs:
+                logging.warning("Inline Animation: No matching sources found for requested cells.")
+                # Return Zeroes with correct shape
+                # Read time dims for shape
+                with netCDF4.Dataset(ncf_path, 'r') as ds:
+                        tflag_vals = []
+                        if 'TFLAG' in ds.variables:
                             tf = ds.variables['TFLAG']
                             if tf.ndim == 3: raw_t = tf[:, 0, :]
                             else: raw_t = tf[:]
                             for i in range(raw_t.shape[0]):
                                 tflag_vals.append(f"{int(raw_t[i,0])}_{int(raw_t[i, 1]):06d}")
-                      else:
+                        else:
                             dim_t = ds.dimensions.get('TSTEP')
                             if dim_t: tflag_vals = [f"T{i}" for i in range(dim_t.size)]
                       
-                      n_times = len(tflag_vals) if tflag_vals else (ds.dimensions['TSTEP'].size if 'TSTEP' in ds.dimensions else 0)
-                      if n_times == 0: return None
+                        n_times = len(tflag_vals) if tflag_vals else (ds.dimensions['TSTEP'].size if 'TSTEP' in ds.dimensions else 0)
+                        if n_times == 0: return None
                  
-                 res_arr = np.zeros((n_times, len(row_indices)))
-                 return {'times': tflag_vals, 'values': res_arr, 'units': ''}
+                res_arr = np.zeros((n_times, len(row_indices)))
+                return {'times': tflag_vals, 'values': res_arr, 'units': ''}
              
-             # 3. Batch Read Data for identified sources
-             with netCDF4.Dataset(ncf_path, 'r') as ds:
-                  # Time Metadata
-                  tflag_vals = []
-                  if 'TFLAG' in ds.variables:
+            # 3. Batch Read Data for identified sources
+            with netCDF4.Dataset(ncf_path, 'r') as ds:
+                # Time Metadata
+                tflag_vals = []
+                if 'TFLAG' in ds.variables:
                         tf = ds.variables['TFLAG']
                         if tf.ndim == 3: raw_t = tf[:, 0, :]
                         else: raw_t = tf[:]
                         for i in range(raw_t.shape[0]):
                             tflag_vals.append(f"{int(raw_t[i,0])}_{int(raw_t[i, 1]):06d}")
-                  else:
+                else:
                         dim_t = ds.dimensions.get('TSTEP')
                         if dim_t: tflag_vals = [f"T{i}" for i in range(dim_t.size)]
                   
-                  if pollutant not in ds.variables: return None
-                  var = ds.variables[pollutant]
-                  units = getattr(var, 'units', '')
+                if pollutant not in ds.variables: return None
+                var = ds.variables[pollutant]
+                units = getattr(var, 'units', '')
                   
-                  # Identify Source Dim
-                  src_dim_idx = -1
-                  dims_list = var.dimensions
-                  for i, dname in enumerate(dims_list):
+                # Identify Source Dim
+                src_dim_idx = -1
+                dims_list = var.dimensions
+                for i, dname in enumerate(dims_list):
                         if dname in ['TSTEP', 'LAY', 'TFLAG', 'DATE-TIME']: continue
                         if dname in ['ROW', 'COL', 'SRC', 'NSRC']:
-                             if ds.dimensions[dname].size > 1:
-                                  src_dim_idx = i
-                                  break
-                  if src_dim_idx == -1: src_dim_idx = var.ndim - 1
+                            if ds.dimensions[dname].size > 1:
+                                src_dim_idx = i
+                                break
+                if src_dim_idx == -1: src_dim_idx = var.ndim - 1
                   
-                  # Slice Construction
-                  slices = [slice(None)] * var.ndim
-                  l_axis = var.dimensions.index('LAY') if 'LAY' in var.dimensions else -1
-                  if l_axis >= 0:
-                       if layer_idx is not None:
-                           slices[l_axis] = layer_idx
-                       elif layer_op == 'select':
-                           slices[l_axis] = 0
+                # Slice Construction
+                slices = [slice(None)] * var.ndim
+                l_axis = var.dimensions.index('LAY') if 'LAY' in var.dimensions else -1
+                if l_axis >= 0:
+                        if layer_idx is not None:
+                            slices[l_axis] = layer_idx
+                        elif layer_op == 'select':
+                            slices[l_axis] = 0
                   
-                  # Read ONLY needed columns
-                  slices[src_dim_idx] = all_needed_srcs
+                # Read ONLY needed columns
+                slices[src_dim_idx] = all_needed_srcs
                   
-                  # data => (T, [LAY?], N_Read_Srcs)
-                  data = var[tuple(slices)]
+                # data => (T, [LAY?], N_Read_Srcs)
+                data = var[tuple(slices)]
                   
-                  # Handle Layer Reduction (if aggregates)
-                  data_dims_map = [] 
-                  for i, sl in enumerate(slices):
-                      if isinstance(sl, slice): data_dims_map.append(i)
-                      else: 
-                           if isinstance(sl, (list, np.ndarray, tuple)): data_dims_map.append(i)
+                # Handle Layer Reduction (if aggregates)
+                data_dims_map = [] 
+                for i, sl in enumerate(slices):
+                        if isinstance(sl, slice): data_dims_map.append(i)
+                        else: 
+                            if isinstance(sl, (list, np.ndarray, tuple)): data_dims_map.append(i)
 
-                  if l_axis >= 0 and layer_idx is None and layer_op != 'select':
-                      try:
-                          ax_now = data_dims_map.index(l_axis)
-                          if layer_op == 'mean': data = np.mean(data, axis=ax_now)
-                          elif layer_op == 'max': data = np.max(data, axis=ax_now)
-                          elif layer_op == 'min': data = np.min(data, axis=ax_now)
-                          else: data = np.sum(data, axis=ax_now)
-                      except ValueError: pass
+                if l_axis >= 0 and layer_idx is None and layer_op != 'select':
+                    try:
+                        ax_now = data_dims_map.index(l_axis)
+                        if layer_op == 'mean': data = np.mean(data, axis=ax_now)
+                        elif layer_op == 'max': data = np.max(data, axis=ax_now)
+                        elif layer_op == 'min': data = np.min(data, axis=ax_now)
+                        else: data = np.sum(data, axis=ax_now)
+                    except ValueError: pass
                   
-                  # Flatten to (T, N_Read_Srcs)
-                  if data.ndim != 2:
-                      try: data = data.reshape(data.shape[0], -1)
-                      except: pass
+                # Flatten to (T, N_Read_Srcs)
+                if data.ndim != 2:
+                        try: data = data.reshape(data.shape[0], -1)
+                        except: pass
                   
-                  # 4. Vectorized Summation (Scatter Add)
+                # 4. Vectorized Summation (Scatter Add)
                   
-                  # Use float32 for result to save memory (cuts 5GB -> 2.5GB for 150k cells)
-                  n_times = data.shape[0]
-                  n_cells = len(row_indices)
+                # Use float32 for result to save memory (cuts 5GB -> 2.5GB for 150k cells)
+                n_times = data.shape[0]
+                n_cells = len(row_indices)
                   
-                  # Check total size before alloc
-                  total_elements = n_times * n_cells
-                  if total_elements > 5e8: # > 500 million floats (~2GB)
-                       logging.warning(f"Large animation data request: {total_elements} elements. Allocating ~{total_elements*4/1024/1024:.1f} MB.")
+                # Check total size before alloc
+                total_elements = n_times * n_cells
+                if total_elements > 5e8: # > 500 million floats (~2GB)
+                        logging.warning(f"Large animation data request: {total_elements} elements. Allocating ~{total_elements*4/1024/1024:.1f} MB.")
                   
-                  try:
-                       res_arr = np.zeros((n_times, n_cells), dtype=np.float32)
-                  except MemoryError:
-                       logging.error("OOM: Could not allocate animation array. Try reducing time steps or pruned mode.")
-                       return None
+                try:
+                        res_arr = np.zeros((n_times, n_cells), dtype=np.float32)
+                except MemoryError:
+                        logging.error("OOM: Could not allocate animation array. Try reducing time steps or pruned mode.")
+                        return None
                   
-                  # Map Global_ID -> Local_Data_Col_Index
-                  global_to_local = { gid: i for i, gid in enumerate(all_needed_srcs) }
+                # Map Global_ID -> Local_Data_Col_Index
+                global_to_local = { gid: i for i, gid in enumerate(all_needed_srcs) }
                   
-                  # Prepare index arrays for np.add.at
-                  # usage: np.add.at(target, indices, source_values)
-                  # Target: res_arr (T, N_Cells)
-                  # We operate on axis 1 (Cells).
+                # Prepare index arrays for np.add.at
+                # usage: np.add.at(target, indices, source_values)
+                # Target: res_arr (T, N_Cells)
+                # We operate on axis 1 (Cells).
                   
-                  # Unroll the mappings: [Local_Src_Idx] -> [Target_Cell_Idx]
-                  # Use numpy arrays for indices to ensure advanced indexing works
-                  # Pre-allocate lists
-                  count_ops = 0
-                  for gid, targets in src_to_out_map.items():
-                       count_ops += len(targets)
+                # Unroll the mappings: [Local_Src_Idx] -> [Target_Cell_Idx]
+                # Use numpy arrays for indices to ensure advanced indexing works
+                # Pre-allocate lists
+                count_ops = 0
+                for gid, targets in src_to_out_map.items():
+                        count_ops += len(targets)
                   
-                  op_src_indices = np.empty(count_ops, dtype=int)
-                  op_tgt_indices = np.empty(count_ops, dtype=int)
+                op_src_indices = np.empty(count_ops, dtype=int)
+                op_tgt_indices = np.empty(count_ops, dtype=int)
                   
-                  idx_ptr = 0
-                  for gid in all_needed_srcs:
-                       if gid in src_to_out_map:
+                idx_ptr = 0
+                for gid in all_needed_srcs:
+                        if gid in src_to_out_map:
                             targets = src_to_out_map[gid]
                             lid = global_to_local[gid]
                             for tid in targets:
-                                 op_src_indices[idx_ptr] = lid
-                                 op_tgt_indices[idx_ptr] = tid
-                                 idx_ptr += 1
+                                op_src_indices[idx_ptr] = lid
+                                op_tgt_indices[idx_ptr] = tid
+                                idx_ptr += 1
                   
-                  if count_ops > 0:
-                       # Advanced Indexing Source: (T, N_Ops)
-                       # Ensure data is float32 to match res_arr
-                       if data.dtype != np.float32:
+                if count_ops > 0:
+                        # Advanced Indexing Source: (T, N_Ops)
+                        # Ensure data is float32 to match res_arr
+                        if data.dtype != np.float32:
                             source_vals = data[:, op_src_indices].astype(np.float32)
-                       else:
+                        else:
                             source_vals = data[:, op_src_indices]
                        
-                       # Add to target
-                       # res_arr is (T, N_Cells). indices tuple must address dims.
-                       # (slice(None), op_tgt_indices) -> All times, Specific Cells.
-                       # source_vals is (T, N_Ops). Matches shape of target selection?
-                       # res_arr[:, op_tgt_indices] has shape (T, N_Ops). Yes.
+                        # Add to target
+                        # res_arr is (T, N_Cells). indices tuple must address dims.
+                        # (slice(None), op_tgt_indices) -> All times, Specific Cells.
+                        # source_vals is (T, N_Ops). Matches shape of target selection?
+                        # res_arr[:, op_tgt_indices] has shape (T, N_Ops). Yes.
                        
-                       np.add.at(res_arr, (slice(None), op_tgt_indices), source_vals)
+                        np.add.at(res_arr, (slice(None), op_tgt_indices), source_vals)
                        
-                  # Cleanup heavy arrays
-                  del data
-                  del source_vals
-                  del op_src_indices
-                  del op_tgt_indices
+                # Cleanup heavy arrays
+                del data
+                del source_vals
+                del op_src_indices
+                del op_tgt_indices
                        
-                  return {'times': tflag_vals, 'values': res_arr, 'units': units}
+                return {'times': tflag_vals, 'values': res_arr, 'units': units}
                   
         except Exception as e:
-             logging.error(f"Inline Animation data failed (Vectorized): {e}")
-             import traceback
-             traceback.print_exc()
-             return None
+            logging.error(f"Inline Animation data failed (Vectorized): {e}")
+            import traceback
+            traceback.print_exc()
+            return None
                   
         except Exception as e:
-             logging.error(f"Inline Animation data failed: {e}")
-             return None
+            logging.error(f"Inline Animation data failed: {e}")
+            return None
 
     with netCDF4.Dataset(ncf_path, 'r') as ds:
         tflag_vals = []
@@ -1696,9 +1716,9 @@ def get_ncf_animation_data(
             if 'LAY' in dims:
                 lay_dim_idx = dims.index('LAY')
                 if layer_op == 'select':
-                   # Select single layer
-                   idx = layer_idx if layer_idx < var_obj.shape[lay_dim_idx] else 0
-                   slices[lay_dim_idx] = idx
+                    # Select single layer
+                    idx = layer_idx if layer_idx < var_obj.shape[lay_dim_idx] else 0
+                    slices[lay_dim_idx] = idx
                 # If sum/mean, we must read all layers first (or loop)
                 # Reading all layers might be heavy. 
                 # For animation, memory is concern. But let's try reading all if aggregating.
@@ -1719,17 +1739,17 @@ def get_ncf_animation_data(
                 
                 # Now data is (T, ROW, COL)
                 if data.ndim == 3:
-                     # Select cells
-                     r_idx = np.array(row_indices, dtype=int)
-                     c_idx = np.array(col_indices, dtype=int)
+                    # Select cells
+                    r_idx = np.array(row_indices, dtype=int)
+                    c_idx = np.array(col_indices, dtype=int)
                      
-                     # Check bounds validity
-                     if len(r_idx) > 0 and (r_idx.max() >= data.shape[1] or c_idx.max() >= data.shape[2]):
-                          return None
+                    # Check bounds validity
+                    if len(r_idx) > 0 and (r_idx.max() >= data.shape[1] or c_idx.max() >= data.shape[2]):
+                        return None
 
-                     # Vectorized selection: data[:, r, c]
-                     result = data[:, r_idx, c_idx] # (T, N)
-                     return {'times': tflag_vals, 'values': result, 'units': units}
+                    # Vectorized selection: data[:, r, c]
+                    result = data[:, r_idx, c_idx] # (T, N)
+                    return {'times': tflag_vals, 'values': result, 'units': units}
                 
                 return None
             except Exception as e:
@@ -1743,15 +1763,15 @@ def read_inline_emissions_lazy(inln_path, stack_groups_path, pollutants, tstep_i
     data_dict = {}
     with netCDF4.Dataset(inln_path) as nc_in:
         if pollutants is None:
-             # Only pick float/int vars with appropriate dimensions (contain source dim?)
-             # Heuristic: must not be TFLAG, and must have at least one dim that is NOT TSTEP/LAY/DATE-TIME?
-             # Or just exclude char.
-             pollutants = []
-             for v in nc_in.variables:
-                 if v == 'TFLAG': continue
-                 if v not in nc_in.dimensions:
-                      if np.issubdtype(nc_in.variables[v].dtype, np.number):
-                           pollutants.append(v)
+            # Only pick float/int vars with appropriate dimensions (contain source dim?)
+            # Heuristic: must not be TFLAG, and must have at least one dim that is NOT TSTEP/LAY/DATE-TIME?
+            # Or just exclude char.
+            pollutants = []
+            for v in nc_in.variables:
+                if v == 'TFLAG': continue
+                if v not in nc_in.dimensions:
+                        if np.issubdtype(nc_in.variables[v].dtype, np.number):
+                            pollutants.append(v)
         
         for pol in pollutants:
             if pol not in nc_in.variables: continue
@@ -1770,46 +1790,46 @@ def read_inline_emissions_lazy(inln_path, stack_groups_path, pollutants, tstep_i
             reductions = []
             
             def get_current_axis(dim_name):
-                 if dim_name not in var.dimensions: return None
-                 idx = var.dimensions.index(dim_name)
-                 # Adjust for initial integer slicing
-                 axis = 0
-                 for i in range(idx):
-                      dn = var.dimensions[i]
-                      # Was this dimension removed by integer slicing?
-                      removed = False
-                      if dn == 'TSTEP' and tstep_idx is not None: removed = True
-                      if dn == 'LAY' and layer_idx is not None: removed = True
-                      if not removed: axis += 1
-                 return axis
+                if dim_name not in var.dimensions: return None
+                idx = var.dimensions.index(dim_name)
+                # Adjust for initial integer slicing
+                axis = 0
+                for i in range(idx):
+                        dn = var.dimensions[i]
+                        # Was this dimension removed by integer slicing?
+                        removed = False
+                        if dn == 'TSTEP' and tstep_idx is not None: removed = True
+                        if dn == 'LAY' and layer_idx is not None: removed = True
+                        if not removed: axis += 1
+                return axis
 
             if 'TSTEP' in var.dimensions and tstep_idx is None:
-                 ax = get_current_axis('TSTEP')
-                 reductions.append((ax, tstep_op))
+                ax = get_current_axis('TSTEP')
+                reductions.append((ax, tstep_op))
             
             if 'LAY' in var.dimensions and layer_idx is None:
-                 ax = get_current_axis('LAY')
-                 reductions.append((ax, layer_op))
+                ax = get_current_axis('LAY')
+                reductions.append((ax, layer_op))
             
             # Sort by axis descending to avoid shifting
             reductions.sort(key=lambda x: x[0], reverse=True)
             
             for ax, op in reductions:
-                 if op == 'mean': data = np.mean(data, axis=ax)
-                 elif op == 'max': data = np.max(data, axis=ax)
-                 elif op == 'min': data = np.min(data, axis=ax)
-                 else: data = np.sum(data, axis=ax)
+                if op == 'mean': data = np.mean(data, axis=ax)
+                elif op == 'max': data = np.max(data, axis=ax)
+                elif op == 'min': data = np.min(data, axis=ax)
+                else: data = np.sum(data, axis=ax)
             
             data = data.flatten()
             grid = np.zeros((gi['nrows'], gi['ncols']), dtype=np.float32)
             if valid_indices.size > 0:
                 if valid_indices.max() >= data.size:
-                     logging.error(f"Lazy Read Mismatch: Data size {data.size} <= Max Index {valid_indices.max()}. Check STACK_GROUPS vs INLN file compatibility.")
-                     # Prevent crash, but result will be wrong/partial
-                     # subset = data[valid_indices[valid_indices < data.size]]
-                     # Actually better to raise or return empty to signal issue
-                     # But for now let it crash or filter?
-                     pass
+                    logging.error(f"Lazy Read Mismatch: Data size {data.size} <= Max Index {valid_indices.max()}. Check STACK_GROUPS vs INLN file compatibility.")
+                    # Prevent crash, but result will be wrong/partial
+                    # subset = data[valid_indices[valid_indices < data.size]]
+                    # Actually better to raise or return empty to signal issue
+                    # But for now let it crash or filter?
+                    pass
                 subset = data[valid_indices]
                 np.add.at(grid, (v_rows, v_cols), subset)
             data_dict[pol] = grid.flatten()

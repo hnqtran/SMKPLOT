@@ -1,0 +1,55 @@
+# Example SMKPLOT configuration for NetCDF/IOAPI data
+# Run this using: ./smkplot.py -f example_netcdf_config.yaml
+
+arguments:
+  # Path to your NetCDF emissions file (e.g., CCTM_emissions.nc)
+  filepath: "/proj/ie/proj/Wellcome-Methane/SMOKE/from_aws/pt_oilgas/inln_mole_pt_oilgas_20221225_12US1_cmaq_cb6ae7_2022he_cb6_22m.ncf" #"/proj/ie/proj/Wellcome-Methane/SMOKE/from_aws/premerged_area/np_oilgas/emis_mole_np_oilgas_20220104_12US1_cmaq_cb6ae7_2022hd_cb6_22m.ncf"
+  
+  # Execution mode
+  run_mode: "batch"
+  
+  # Plot type must be 'grid' for standard NetCDF gridded data
+  pltyp: "grid"
+  
+  # Pollutant(s) to process (must match variable names in NetCDF)
+  # You can provide a single string or a comma-separated list
+  pollutant: "CH4"
+  
+  # Optional: STACK_GROUPS path if processing Inline Point Sources
+  # stack_groups: "STACK_GROUPS_etc.nc"
+  
+  # --- NetCDF Specific Options ---
+  
+  # Time Dimension Operation: 
+  # - 'avg': Average across all timesteps (default)
+  # - 'sum': Total sum of all timesteps
+  # - 'max' / 'min': Statistics across time
+  # - '0', '1', etc: Select a specific 0-based index
+  ncf_tdim: "avg"
+  
+  # Layer Dimension Operation:
+  # - '0': Surface layer (default)
+  # - 'avg', 'sum', etc: Statistics across altitude
+  # - '1', '2', etc: Select a specific 0-based level
+  ncf_zdim: "0"
+  
+  # --- Plot Aesthetics ---
+  county_shapefile: /proj/ie/proj/staff/tranhuy/python/GIS/tl_2020_us_county_CONUS.gpkg # Path to county boundary shapefile
+  overlay_shapefile: 
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/Permian_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/SanJuan_Basin_Extent.gpkg
+
+  cmap: "viridis"
+  log_scale: true
+  
+  # zoom_to_data: focus the map on non-zero cells
+  zoom_to_data: true
+  zoom_pad: 0.05
+  
+  # --- Output Settings ---
+  
+  outdir: "./netcdf_plots"
+  export_csv: true
+  
+  # Optional: log-level for debugging
+  log_level: "INFO"
