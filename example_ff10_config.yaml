@@ -11,7 +11,6 @@ arguments:
   overlay_shapefile: 
   - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/Permian_Basin_Extent.gpkg
   - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/SanJuan_Basin_Extent.gpkg
-  filtered_by_overlay: false
   griddesc: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/griddesc_simplified.txt
   gridname: 12US1_459X299
   pltyp: county

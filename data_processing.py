@@ -19,6 +19,10 @@ import io
 import os, sys
 import re
 import warnings
+
+_CLEAN_NAME_QUOTE_RE = re.compile(r"['`,]")
+_CLEAN_NAME_WHITESPACE_RE = re.compile(r"\s+")
+_GRIDDESC_SPLIT_RE = re.compile(r',\s*|\s+')
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Dict, List, Any, Union, Tuple, Set
@@ -52,7 +56,8 @@ from shapely.geometry import Polygon
 from config import (
     USE_SPHERICAL_EARTH,
     COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, UNIT_COLS, REL_COLS,
-    EMIS_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS, COUNTRY_CODE_MAPPINGS
+    EMIS_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS, COUNTRY_CODE_MAPPINGS,
+    TRIBAL_TO_COUNTY_FIPS
 )
 from utils import normalize_delim, coerce_merge_key
 
@@ -129,6 +134,10 @@ def apply_spatial_filter(gdf: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode:
         return gdf
     if gdf.empty:
         return gdf
+
+    # Consolidate DataFrame to avoid fragmentation warnings (PerformanceWarning)
+    # This is important for pivotted CSVs with many pollutant columns.
+    gdf = gdf.copy()
 
     try:
         if gdf.crs and overlay.crs and (gdf.crs != overlay.crs):
@@ -2344,7 +2353,58 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
         pass
     return detected
 
+def remap_tribal_fips(df: pd.DataFrame, fips_col: str = 'FIPS') -> pd.DataFrame:
+    """Map tribal area codes back to standard US county FIPS using config mapping."""
+    if df is None or not TRIBAL_TO_COUNTY_FIPS:
+        return df
+    
+    # Identify relevant columns
+    cols_to_check = [fips_col] if fips_col in df.columns else []
+    tribal_col = _check_column_in_df(df, TRIBAL_COLS, warn=False)
+    if tribal_col and tribal_col not in cols_to_check:
+        cols_to_check.append(tribal_col)
+        
+    if not cols_to_check:
+        return df
+
+    def _get_mapped_val(val):
+        if pd.isna(val) or val == '': return None
+        s_val = str(val).strip()
+        # Direct match (e.g. '88750' or 'Navajo')
+        if s_val in TRIBAL_TO_COUNTY_FIPS:
+            return TRIBAL_TO_COUNTY_FIPS[s_val]
+        # Padded matches
+        z_val = s_val.zfill(6)
+        if z_val in TRIBAL_TO_COUNTY_FIPS:
+            return TRIBAL_TO_COUNTY_FIPS[z_val]
+        if z_val.startswith('0') and z_val[1:] in TRIBAL_TO_COUNTY_FIPS:
+            return TRIBAL_TO_COUNTY_FIPS[z_val[1:]]
+        return None
+
+    # We want to fill fips_col. If fips_col doesn't exist yet, we'll create it later in get_emis_fips.
+    # But for now, if it exists, try to fix it.
+    has_fips = fips_col in df.columns
+    
+    # Try mapping from each candidate column
+    remapping_found = False
+    for context_col in cols_to_check:
+        mapped = df[context_col].apply(_get_mapped_val)
+        mask = mapped.notna()
+        if mask.any():
+            if not remapping_found:
+                df = df.copy()
+                remapping_found = True
+            
+            target_col = fips_col if has_fips else context_col
+            df.loc[mask, target_col] = mapped[mask]
+            logging.info(f"Remapped {mask.sum()} tribal records from '{context_col}' to county FIPS in '{target_col}'")
+
+    return df
+
 def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
+    # Step 1: Remap tribal codes if they exist in FIPS or tribal_code columns
+    df = remap_tribal_fips(df, 'FIPS')
+    
     # Skip recalculation if FIPS column already exists
     if 'FIPS' in df.columns:
         if verbose:
@@ -2425,7 +2485,11 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
             df = pd.concat([df, new_fips.rename('FIPS')], axis=1)
             df.attrs = original_attrs
 
-        return df
+    # Final pass: Remap tribal codes in the newly built or existing FIPS column
+    if 'FIPS' in df.columns:
+        df = remap_tribal_fips(df, 'FIPS')
+
+    return df
     
     raise ValueError("No valid FIPS code columns found")
 

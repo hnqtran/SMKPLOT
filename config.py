@@ -59,3 +59,83 @@ DEFAULT_ONLINE_COUNTIES_URL = "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb
 # ---- GRIDDESC parsing toggle ----
 # Toggle: set to True if you want spherical earth (a=b=6370000 m) instead of WGS84
 USE_SPHERICAL_EARTH = True
+
+# ---- Tribal FIPS to County FIPS Mapping ----
+# Used to map tribal area emissions (IDs starting with 88) to a primary underlying county
+# for visualization on standard administrative maps.
+# This covers major energy-producing and populated tribal lands across CONUS.
+# 
+# DEVELOPMENT METHODOLOGY:
+# 1. Identified tribal area codes (88xxx) used in EPA emissions inventories (NEI/SMOKE).
+# 2. Consulted EPA COSTCY/GE_DAT files (e.g., costcy_for_2017platform_20dec2023_v8.txt)
+#    to identify the tribal name and state associated with each code.
+# 3. Mapped the tribal land physical extents/major energy production centers to 
+#    the primary underlying US county FIPS code.
+# 4. Prioritized regions with significant oil & gas production (San Juan, Permian, 
+#    Northern Plains, Oklahoma) to prevent emission "artifacts" (dropped data) 
+#    during administrative attribute-based joins.
+TRIBAL_TO_COUNTY_FIPS = {
+    # -- San Juan / Permian / Four Corners --
+    '88750': '08067',  # Southern Ute Reservation -> La Plata, CO
+    '88755': '08083',  # Ute Mountain Reservation -> Montezuma, CO
+    '88124': '35045',  # Navajo Nation -> San Juan, NM
+    '88701': '35039',  # Jicarilla Apache Nation -> Rio Arriba, NM
+    '88702': '35035',  # Mescalero Reservation -> Otero, NM
+    '88703': '35006',  # Acoma -> Cibola, NM
+    '88707': '35006',  # Laguna -> Cibola, NM
+    '88714': '35039',  # San Juan / Ohkay Owingeh -> Rio Arriba, NM
+    '88716': '35043',  # Santa Ana -> Sandoval, NM
+    '88719': '35043',  # Zia -> Sandoval, NM
+    '88720': '35031',  # Zuni -> McKinley, NM
+    '44444': '35045',  # Generic San Juan Basin placeholder
+
+    # -- Arizona / Nevada --
+    '88603': '04012',  # Colorado River -> La Paz, AZ
+    '88608': '04017',  # Hopi -> Navajo, AZ
+    '88610': '04019',  # Tohono O'Odham -> Pima, AZ
+    '88614': '04021',  # Gila River -> Pinal, AZ
+    '88615': '04013',  # Salt River -> Maricopa, AZ
+    '88616': '04007',  # San Carlos -> Gila, AZ
+    '88617': '04015',  # Kaibab -> Mohave, AZ
+    '88507': '04017',  # Fort Apache -> Navajo, AZ
+    '88651': '32029',  # Pyramid Lake -> Washoe, NV
+
+    # -- Oklahoma (Major Energy Producing Tribes) --
+    '88151': '40113',  # Osage Nation -> Osage, OK
+    '88118': '40013',  # Choctaw -> Bryan, OK
+    '88043': '40021',  # Cherokee -> Cherokee, OK
+    '88044': '40123',  # Chickasaw -> Pontotoc, OK
+    '88114': '40111',  # Muscogee (Creek) -> Okmulgee, OK
+
+    # -- Northern Plains / Mountain (Oil & Gas focuses) --
+    '88770': '56013',  # Wind River -> Fremont, WY
+    '88687': '49047',  # Uintah-Ouray -> Uintah, UT
+    '88012': '30035',  # Blackfeet -> Glacier, MT
+    '88049': '30003',  # Crow -> Big Horn, MT
+    '88136': '30087',  # Northern Cheyenne -> Rosebud, MT
+    '88077': '30085',  # Fort Peck -> Roosevelt, MT
+    '88076': '30005',  # Fort Belknap -> Blaine, MT
+    '88078': '38061',  # Fort Berthold -> Mountrail, ND
+    '88301': '38005',  # Spirit Lake -> Benson, ND
+
+    # -- South Dakota --
+    '88344': '46031',  # Standing Rock -> Corson, SD
+    '88029': '46041',  # Cheyenne River -> Dewey, SD
+    '88235': '46102',  # Pine Ridge (Oglala Lakota) -> Oglala Lakota, SD
+    '88283': '46121',  # Rosebud -> Todd, SD
+
+    # -- Washington / Northwest --
+    '88047': '53047',  # Colville -> Okanogan, WA
+    '88315': '53077',  # Yakama -> Yakima, WA
+    '88234': '16011',  # Fort Hall (Shoshone-Bannock) -> Bingham, ID
+
+    # -- Great Lakes / Midwest --
+    '88319': '55087',  # Oneida -> Outagamie, WI
+    '88130': '27021',  # Leech Lake -> Cass, MN
+    '88409': '27007',  # Red Lake -> Beltrami, MN
+    '88410': '27005',  # White Earth -> Becker, MN
+
+    # -- Southeast --
+    '88122': '28099',  # Mississippi Band of Choctaw -> Neshoba, MS
+    '88061': '37173',  # Eastern Band of Cherokee -> Swain, NC
+}

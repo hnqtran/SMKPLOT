@@ -204,52 +204,83 @@ class EmissionGUI:
         self._source_type: Optional[str] = None
         self._ff10_ready = False
         self._ff10_grid_ready = False
-        self._build_layout()
 
         # Load default settings under .config/smkgui_settings.json and apply them if needed
         settings = load_settings()
         last_paths = settings.get('last_paths', {})
         ui_state = settings.get('ui_state', {})
 
-        # Restore UI state first
+        # --- Pre-calculate settings for UI initialization ---
+        # Load optional overlay shapefile
+        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None) or last_paths.get('overlay')
+        
+        # Load filter shapefile (new parameter)
+        self.filter_path = getattr(cli_args, 'filter_shapefile', None) if cli_args else None or self._json_arguments.get('filter_shapefile', None) or last_paths.get('filter_shapefile')
 
-        # Setting for plot scale (linear/log)
-        if self._json_arguments.get('log_scale', None) is True:
+        # Load filter_shapefile_opt setting (new parameter)
+        val_filter_opt = getattr(cli_args, 'filter_shapefile_opt', None)
+        if val_filter_opt is None:
+            val_filter_opt = self._json_arguments.get('filter_shapefile_opt', None)
+        if val_filter_opt is None:
+            val_filter_opt = last_paths.get('filter_shapefile_opt', None)
+
+        # Load filtered_by_overlay setting (deprecated, backward compatibility)
+        val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
+        if val_filter is None:
+            val_filter = self._json_arguments.get('filtered_by_overlay', None)
+        if val_filter is None:
+            val_filter = last_paths.get('filtered_by_overlay', False)
+        
+        # Determine initial filter mode
+        initial_filter_mode = 'False'
+        raw_filter = val_filter_opt if val_filter_opt is not None else val_filter
+        if raw_filter:
+            if isinstance(raw_filter, bool):
+                initial_filter_mode = 'intersect' if raw_filter else 'False'
+            elif isinstance(raw_filter, str):
+                s_filter = raw_filter.strip().lower()
+                if s_filter in ('true', 'yes', 'on'):
+                    initial_filter_mode = 'intersect'
+                elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
+                    initial_filter_mode = 'False'
+                else:
+                    initial_filter_mode = raw_filter
+        self.initial_filter_overlay = initial_filter_mode
+        # --- End pre-calculation ---
+
+        self._build_layout()
+
+        # Restore UI choices (linear/log, bins, cmap, delim, etc.)
+        if self._json_arguments.get('log_scale') is True:
             self.scale_var.set('log')
-        elif self._json_arguments.get('log_scale', None) is None:
+        elif self._json_arguments.get('log_scale') is False:
             self.scale_var.set('linear')
         else:
             self.scale_var.set(ui_state.get('scale', 'linear'))
-        
-        # Settings for bins var
-        if self._json_arguments.get('bins', None):
-            self.class_bins_var.set(str(self._json_arguments.get('bins')))
+
+        bins_val = self._json_arguments.get('bins')
+        if bins_val is not None:
+            self.class_bins_var.set(str(bins_val))
         else:
             self.class_bins_var.set(ui_state.get('bins', ''))
-            
-        # Settings for cmaps
-        if self._json_arguments.get('cmap', None):
-            self.cmap_var.set(str(self._json_arguments.get('cmap')))
+
+        cmap_val = self._json_arguments.get('cmap')
+        if cmap_val:
+            self.cmap_var.set(str(cmap_val))
         else:
             self.cmap_var.set(ui_state.get('colormap', 'viridis'))
 
-        # Setting for delimiter
-        if self._json_arguments.get('delim', None):
-            self.delim_var.set(str(self._json_arguments.get('delim')))
-        else:
-            self.delim_var.set(ui_state.get('delimiter', ','))            
+        if self.custom_delim_var and ui_state.get('custom_delimiter'):
+            self.custom_delim_var.set(ui_state['custom_delimiter'])
             
-        if self.custom_delim_var and ui_state.get('custom_delimiter'): self.custom_delim_var.set(ui_state['custom_delimiter'])
-        if self.plot_by_var and ui_state.get('plot_by'): self.plot_by_var.set(ui_state['plot_by'])
-        # Projection selection (added)
+        if self.plot_by_var and ui_state.get('plot_by'):
+            self.plot_by_var.set(ui_state['plot_by'])
+            
         if hasattr(self, 'projection_var') and ui_state.get('projection'):
-                try:
-                    self.projection_var.set(ui_state['projection'])
-                except Exception:
-                    pass
-        if self.zoom_var and 'zoom_to_data' in ui_state: self.zoom_var.set(ui_state['zoom_to_data'])
-        
-        #self._on_delim_change() # Ensure custom delim entry visibility is correct
+            self.projection_var.set(ui_state['projection'])
+            
+        if self.zoom_var and 'zoom_to_data' in ui_state:
+            self.zoom_var.set(ui_state['zoom_to_data'])
 
         # Restore last inputpath path but defer loading until user requests it
         self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) if cli_args else None or self._json_arguments.get('filepath', None)
@@ -258,114 +289,75 @@ class EmissionGUI:
         if not self.inputfile_path:
             self.inputfile_path = last_paths.get('inputpath')
 
-        # Normalize inputfile_path to string (handle list for multiple files)
-        if isinstance(self.inputfile_path, (list, tuple)):
-            filtered_paths = [str(p) for p in self.inputfile_path if p]
-            self.inputfile_path = "; ".join(filtered_paths)
+        # --- Initialize logic-heavy fields and trigger loaders ---
         
-        if self.inputfile_path and (";" in self.inputfile_path or os.path.exists(self.inputfile_path.split(';')[0].strip())):
+        # 1. Emissions Input
+        self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) or self._json_arguments.get('filepath') or last_paths.get('inputpath')
+        if isinstance(self.inputfile_path, (list, tuple)):
+            self.inputfile_path = "; ".join([str(p) for p in self.inputfile_path if p])
+            
+        if self.inputfile_path:
             try:
                 self.emis_entry.delete(0, tk.END)
-                self.emis_entry.insert(0, self.inputfile_path)
+                self.emis_entry.insert(0, str(self.inputfile_path))
             except Exception:
                 pass
-            
-            cli_filepath = getattr(cli_args, 'filepath', None) if cli_args else None
-            if self.json_payload or cli_filepath:
-                self._set_status('Auto-loading data...', level='INFO')
-                # Schedule load to run after UI init
+            # Auto-load if coming from CLI or JSON snapshot
+            if self.json_payload or (cli_args and getattr(cli_args, 'filepath', None)):
                 self.root.after(200, lambda: self.load_inputfile(show_preview=False))
-            else:
-                self._set_status('Recovered previous input path. Click Preview Data to load.', level='INFO')
 
-        # Restore and auto-load GRIDDESC path
-        self.griddesc_path  = getattr(cli_args, 'griddesc', None) if cli_args else None or self._json_arguments.get('griddesc', None) or last_paths.get('griddesc') or None
-        if self.griddesc_path and os.path.exists(self.griddesc_path):
+        # 2. GRIDDESC
+        self.griddesc_path = getattr(cli_args, 'griddesc', None) or self._json_arguments.get('griddesc') or last_paths.get('griddesc')
+        if self.griddesc_path:
             try:
                 self.griddesc_entry.delete(0, tk.END)
-                self.griddesc_entry.insert(0, self.griddesc_path)
+                self.griddesc_entry.insert(0, str(self.griddesc_path))
             except Exception:
                 pass
             self.load_griddesc()
+            
+            # Restore selected grid name (Priority: CLI/Config > UI State)
+            grid_name = getattr(cli_args, 'gridname', None) or self._json_arguments.get('gridname') or ui_state.get('grid_name')
+            if self.grid_name_var and grid_name and grid_name != "Select Grid":
+                self.grid_name_var.set(grid_name)
+                self.load_grid_shape()
 
-            # Restore last selected grid name if available
-            if self.grid_name_var and ui_state.get('grid_name'):
-                # Check if the saved grid name is in the list of available grids
-                available_grids = self.grid_name_menu['menu'].winfo_children()
-                available_names = [item.cget('label') for item in available_grids]
-                if ui_state['grid_name'] in available_names:
-                    self.grid_name_var.set(ui_state['grid_name'])
-                    self.load_grid_shape()
-
-        # Restore last SCC selection
+        # 3. SCC Selection
         if self.scc_select_var and ui_state.get('scc_selection'):
             self.scc_select_var.set(ui_state['scc_selection'])
 
-        # Restore and auto-load Counties shapefile path (precedence: CLI arg > saved last path > online default)
-        self.counties_path  = counties_path or getattr(cli_args, 'county_shapefile', None) if cli_args else None or self._json_arguments.get('county_shapefile', None) or last_paths.get('counties') or None
-        if self.counties_path and os.path.exists(self.counties_path):
-            self.load_shpfile()
+        # 4. Counties Shapefile
+        self.counties_path = counties_path or getattr(cli_args, 'county_shapefile', None) or self._json_arguments.get('county_shapefile') or last_paths.get('counties')
+        if self.counties_path:
             try:
                 self.county_entry.delete(0, tk.END)
-                self.county_entry.insert(0, self.counties_path)
+                self.county_entry.insert(0, str(self.counties_path))
             except Exception:
-                    pass
+                pass
+            self.load_shpfile()
         else:
-            # Fall back to online counties
-            try:
-                self.use_online_counties()
-            except Exception as e:
-                self._notify('WARNING', 'Online Counties Not Loaded', f'Could not load default online counties: {e}')
+            self.use_online_counties()
 
-        # Load optional overlay shapefile
-        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None) or last_paths.get('overlay')
-
-        # Load filtered_by_overlay setting
-        val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
-        if val_filter is None:
-            val_filter = self._json_arguments.get('filtered_by_overlay', None)
-        if val_filter is None:
-            val_filter = last_paths.get('filtered_by_overlay', False)
-        
-        # Normalize to string or boolean (preserving modes like 'intersect', 'within')
-        if isinstance(val_filter, str):
-            s_filter = val_filter.lower()
-            if s_filter in ('true', 'yes', 'on'):
-                self.initial_filter_overlay = 'intersect' # Default to intersect if True/flag present
-            elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
-                self.initial_filter_overlay = 'False'
-            else:
-                self.initial_filter_overlay = val_filter
-        elif isinstance(val_filter, bool):
-            self.initial_filter_overlay = 'intersect' if val_filter else 'False'
-        else:
-            self.initial_filter_overlay = 'False'
-
+        # 5. Overlays and Filters
         if self.overlay_path:
-            # Handle multiple paths (list or valid single path)
-            valid_ov = False
-            if isinstance(self.overlay_path, str) and os.path.exists(self.overlay_path):
-                valid_ov = True
-                final_str = self.overlay_path
-            elif isinstance(self.overlay_path, list):
-                # Just check the first one for existance logic or join
-                if self.overlay_path:
-                    valid_ov = True
-                    final_str = ";".join([str(p) for p in self.overlay_path])
-             
-            if valid_ov:
-                try:
-                    self.overlay_entry.delete(0, tk.END)
-                    self.overlay_entry.insert(0, final_str)
-                except Exception:
-                    pass
-                self.load_overlay()
+            ov_str = ";".join(self.overlay_path) if isinstance(self.overlay_path, list) else str(self.overlay_path)
+            try:
+                self.overlay_entry.delete(0, tk.END)
+                self.overlay_entry.insert(0, ov_str)
+            except Exception:
+                pass
+            
+        if self.filter_path:
+            fl_str = ";".join(self.filter_path) if isinstance(self.filter_path, list) else str(self.filter_path)
+            try:
+                self.filter_entry.delete(0, tk.END)
+                self.filter_entry.insert(0, fl_str)
+            except Exception:
+                pass
 
-        
-
-        #self._preferred_grid_name = getattr(cli_args, 'gridname', None) if cli_args else None or self._json_arguments.get('gridname', None)
-        #self._preferred_overlay_path = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None)
-        #self._apply_json_snapshot_defaults()
+        # Trigger loader for overlays/filters
+        if self.overlay_path or self.filter_path:
+            self.load_overlay()
 
     # ---- Projection helpers (LCC + graticule) ----
     def _default_conus_lcc_crs(self):
@@ -580,12 +572,16 @@ class EmissionGUI:
                 if val: current_overlay = val
             except Exception: pass
             
-        current_filter_overlay = False
-        if hasattr(self, 'filter_overlay_var'):
+        current_filter = getattr(self, 'filter_path', None)
+        if hasattr(self, 'filter_entry'):
             try:
-                val = self.filter_overlay_var.get()
-                current_filter_overlay = (str(val).lower() == 'true')
+                val = self.filter_entry.get().strip()
+                if val: current_filter = val
             except Exception: pass
+
+        filter_opt = 'False'
+        if hasattr(self, 'filter_overlay_var'):
+            filter_opt = self.filter_overlay_var.get()
 
         settings = {
             'last_paths': {
@@ -593,7 +589,9 @@ class EmissionGUI:
                 'griddesc': current_griddesc or '',
                 'counties': current_counties or '',
                 'overlay': current_overlay or '',
-                'filtered_by_overlay': current_filter_overlay,
+                'filter_shapefile': current_filter or '',
+                'filter_shapefile_opt': filter_opt or 'False',
+                'filtered_by_overlay': (str(filter_opt).lower() != 'false'),
             },
             'ui_state': {
                 'scale': self.scale_var.get() if self.scale_var else 'linear',
@@ -809,28 +807,36 @@ class EmissionGUI:
 
         # Filter by Overlay Shapefile
         self.filter_overlay_var = tk.StringVar(value=str(getattr(self, 'initial_filter_overlay', 'False')))
-        ttk.Label(frm, text="Filter by Overlay:").grid(row=2, column=3, sticky='e', padx=(10, 2))
+        ttk.Label(frm, text="Filter Operation:").grid(row=3, column=3, sticky='e', padx=(10, 2))
         self.filter_overlay_menu = ttk.OptionMenu(frm, self.filter_overlay_var, self.filter_overlay_var.get(), "False", "clipped", "intersect", "within")
-        self.filter_overlay_menu.grid(row=2, column=4, sticky='we')
+        self.filter_overlay_menu.grid(row=3, column=4, sticky='we')
+
+        # Filter Shapefile (Optional - for spatial filtering)
+        ttk.Label(frm, text="Filter Shapefile (optional):").grid(row=3, column=0, sticky='w')
+        self.filter_entry = ttk.Entry(frm, width=self._w_chars(60))
+        self.filter_entry.grid(row=3, column=1, sticky='we')
+        self.filter_entry.bind('\u003cReturn\u003e', self._on_filter_entry_change)
+        self.filter_entry.bind('\u003cFocusOut\u003e', self._on_filter_entry_change)
+        ttk.Button(frm, text="Browse", command=self.browse_filter_shpfile).grid(row=3, column=2, padx=4)
 
         # GRIDDESC file
-        ttk.Label(frm, text="GRIDDESC File (optional):").grid(row=3, column=0, sticky='w')
+        ttk.Label(frm, text="GRIDDESC File (optional):").grid(row=4, column=0, sticky='w')
         self.griddesc_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.griddesc_entry.grid(row=3, column=1, sticky='we')
+        self.griddesc_entry.grid(row=4, column=1, sticky='we')
         self.griddesc_entry.bind('<Return>', self._on_griddesc_entry_change)
         self.griddesc_entry.bind('<FocusOut>', self._on_griddesc_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_griddesc).grid(row=3, column=2, padx=4)
+        ttk.Button(frm, text="Browse", command=self.browse_griddesc).grid(row=4, column=2, padx=4)
 
         # Grid Name selector
         self.grid_name_var = tk.StringVar()
         self.grid_name_menu = ttk.OptionMenu(frm, self.grid_name_var, "Select Grid", command=lambda *_: self.load_grid_shape())
-        self.grid_name_menu.grid(row=3, column=3, sticky='we')
+        self.grid_name_menu.grid(row=4, column=3, sticky='we')
 
         # Pollutant selector
-        ttk.Label(frm, text="Pollutant:").grid(row=4, column=0, sticky='w')
+        ttk.Label(frm, text="Pollutant:").grid(row=5, column=0, sticky='w')
         self.pollutant_var = tk.StringVar()
         self.pollutant_menu = ttk.OptionMenu(frm, self.pollutant_var, None)
-        self.pollutant_menu.grid(row=4, column=1, sticky='we')
+        self.pollutant_menu.grid(row=5, column=1, sticky='we')
 
         # (Scale and Zoom moved to button row to avoid horizontal expansion)
         # Custom bins state (widgets placed later in button row)
@@ -846,7 +852,7 @@ class EmissionGUI:
 
         # Buttons
         btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=5, column=0, columnspan=4, pady=6, sticky='we')
+        btn_frame.grid(row=6, column=0, columnspan=5, pady=6, sticky='we')
         # Column stretching: let the bins entry grow
         for c in (11,):
             try:
@@ -964,11 +970,11 @@ class EmissionGUI:
 
         # Text preview widget (persistent)
         self.preview = tk.Text(frm, height=10, width=90)
-        self.preview.grid(row=6, column=0, columnspan=4, pady=4, sticky='nsew')
+        self.preview.grid(row=7, column=0, columnspan=5, pady=4, sticky='nsew')
 
         # Embedded plot frame (row 7) - map will display here (pop-out windows draw their own figs)
         self.plot_frame = ttk.Frame(frm)
-        self.plot_frame.grid(row=7, column=0, columnspan=4, sticky='nsew', pady=(4, 0))
+        self.plot_frame.grid(row=8, column=0, columnspan=5, sticky='nsew', pady=(4, 0))
 
         if USING_TK:
             try:
@@ -978,13 +984,13 @@ class EmissionGUI:
                 self.status_var = None
             if self.status_var is not None:
                 self.status_label = ttk.Label(frm, textvariable=self.status_var, relief='sunken', anchor='w')
-                self.status_label.grid(row=8, column=0, columnspan=4, sticky='we', pady=(4, 0))
+                self.status_label.grid(row=9, column=0, columnspan=5, sticky='we', pady=(4, 0))
 
         # Configure stretch rows/columns for the main frame
         try:
-            frm.rowconfigure(6, weight=1)   # text preview
-            frm.rowconfigure(7, weight=3)   # plot area larger
-            frm.rowconfigure(8, weight=0)
+            frm.rowconfigure(7, weight=1)   # text preview
+            frm.rowconfigure(8, weight=3)   # plot area larger
+            frm.rowconfigure(9, weight=0)
             frm.columnconfigure(1, weight=1)
         except Exception:
             pass
@@ -1159,24 +1165,41 @@ class EmissionGUI:
 
     def _on_emissions_entry_change(self, event=None):
         path = self.emis_entry.get().strip()
-        if path and path != getattr(self, 'inputfile_path', None):
+        if path != getattr(self, 'inputfile_path', None):
+            self.inputfile_path = path
             self.load_inputfile(show_preview=False)
 
     def _on_counties_entry_change(self, event=None):
         path = self.county_entry.get().strip()
-        if path and path != getattr(self, 'counties_path', None):
+        if path != getattr(self, 'counties_path', None):
             self.counties_path = path
             self.load_shpfile()
 
     def _on_overlay_entry_change(self, event=None):
         path = self.overlay_entry.get().strip()
-        if path and path != getattr(self, 'overlay_path', None):
+        if path != getattr(self, 'overlay_path', None):
             self.overlay_path = path
             self.load_overlay()
 
+    def browse_filter_shpfile(self):
+        init_dir = DEFAULT_SHPFILE_INITIALDIR if os.path.isdir(DEFAULT_SHPFILE_INITIALDIR) else None
+        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Shapefile / Geopackage / Zip", "*.shp *.gpkg *.zip *.geojson *.json"), ("All", "*.*")])
+        if not path:
+            return
+        self.filter_entry.delete(0, tk.END)
+        self.filter_entry.insert(0, path)
+        self.filter_path = path
+        self.load_filter()
+
+    def _on_filter_entry_change(self, event=None):
+        path = self.filter_entry.get().strip()
+        if path != getattr(self, 'filter_path', None):
+            self.filter_path = path
+            self.load_filter()
+
     def _on_griddesc_entry_change(self, event=None):
         path = self.griddesc_entry.get().strip()
-        if path and path != getattr(self, 'griddesc_path', None):
+        if path != getattr(self, 'griddesc_path', None):
             self.griddesc_path = path
             self.load_griddesc()
 
@@ -1378,6 +1401,20 @@ class EmissionGUI:
             pass
 
         self._set_status("Loading data...", level="INFO")
+
+        # Reset UI elements in main thread before starting background loader
+        try:
+            if hasattr(self, 'ncf_layer_menu'):
+                self.ncf_layer_menu.set('')
+                self.ncf_tstep_menu.set('')
+                self.ncf_layer_menu['values'] = []
+                self.ncf_tstep_menu['values'] = []
+                self.ncf_layer_menu.state(['disabled'])
+                self.ncf_tstep_menu.state(['disabled'])
+            if not self.inputfile_path:
+                self.pollutant_menu['menu'].delete(0, 'end')
+        except Exception:
+            pass
         
         threading.Thread(
             target=self._load_inputfile_worker, 
@@ -1386,21 +1423,14 @@ class EmissionGUI:
         ).start()
 
     def _load_inputfile_worker(self, show_preview, effective_delim, current_delim_state, ncf_preserve):
-        # Always reset NCF widgets to disabled initially; NCF logic will re-enable if applicable
-        def _reset_ncf_ui():
-            try:
-                # Only clear if we didn't preserve a seemingly valid value?
-                # Actually, clearing 'values' is fine, but we should restore '.set()' if NCF is re-detected.
-                # However, usually we want to clear everything in case it's NOT an NCF file.
-                self.ncf_layer_menu.set('')
-                self.ncf_tstep_menu.set('')
-                self.ncf_layer_menu['values'] = []
-                self.ncf_tstep_menu['values'] = []
-                self.ncf_layer_menu.state(['disabled'])
-                self.ncf_tstep_menu.state(['disabled'])
-            except Exception:
-                pass
-        self.root.after(0, _reset_ncf_ui)
+        if not self.inputfile_path:
+            self.emissions_df = None
+            self.raw_df = None
+            self.pollutants = []
+            self.units_map = {}
+            self._invalidate_merge_cache()
+            self.status_var.set("Emissions data cleared.")
+            return
 
         try:
             if True: # Unified loading path (reimport deprecated)
@@ -1726,6 +1756,14 @@ class EmissionGUI:
 
     def load_griddesc(self):
         if not self.griddesc_path:
+            self.grid_gdf = None
+            try:
+                menu = self.grid_name_menu["menu"]
+                menu.delete(0, "end")
+                self.grid_name_var.set("Select Grid")
+            except Exception:
+                pass
+            self._invalidate_merge_cache()
             return
         self._ff10_grid_ready = False
         try:
@@ -1750,7 +1788,7 @@ class EmissionGUI:
             self._notify('ERROR', 'GRIDDESC Load Error', str(e), exc=e)
 
     def load_grid_shape(self):
-        if not self.griddesc_path or not self.grid_name_var.get():
+        if not self.griddesc_path or not self.grid_name_var.get() or self.grid_name_var.get() == "Select Grid":
             return
         self._ff10_grid_ready = False
         try:
@@ -1775,51 +1813,78 @@ class EmissionGUI:
             return
 
     def load_overlay(self):
+        """Load optional overlay shapefile(s) for visual reference. Also includes filter shapefiles."""
         try:
-            # Handle multiple files (semicolon separated)
-            ov_paths = self.overlay_path
-            if not ov_paths:
-                return
-             
-            file_list = []
-            if isinstance(ov_paths, str):
-                file_list = [p.strip() for p in ov_paths.split(';') if p.strip()]
-            elif isinstance(ov_paths, (list, tuple)):
-                for item in ov_paths:
-                    if isinstance(item, str):
-                        file_list.extend([p.strip() for p in item.split(';') if p.strip()])
-                    else:
-                        file_list.append(str(item))
-            else:
-                file_list = [str(ov_paths)]
+            # 1. Clear existing visual overlay list
+            self.overlay_gdf = None
+            
+            # 2. Get paths for both overlays and filters
+            ov_paths = getattr(self, 'overlay_path', None)
+            filter_paths = getattr(self, 'filter_path', None)
+            
+            all_parts = []
+            
+            # Helper to load paths into parts list
+            def _load_into(paths, parts_list):
+                if not paths: return
+                file_list = []
+                if isinstance(paths, str):
+                    file_list = [p.strip() for p in paths.split(';') if p.strip()]
+                elif isinstance(paths, (list, tuple)):
+                    for item in paths:
+                        if isinstance(item, str):
+                            file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                        else:
+                            file_list.append(str(item))
+                else:
+                    file_list = [str(paths)]
+                
+                for fpath in file_list:
+                    try:
+                        part = read_shpfile(fpath, False)
+                        if part is not None and not part.empty:
+                            parts_list.append(part)
+                    except Exception:
+                        self._notify("WARNING", "Load Warning", f"Failed to load shapefile: {fpath}")
 
-            loaded_parts = []
-            for fpath in file_list:
-                try:
-                    part = read_shpfile(fpath, False)
-                    if part is not None and not part.empty:
-                        loaded_parts.append(part)
-                except Exception:
-                    self._notify("WARNING", "Overlay Load Warning", f"Failed to load overlay part: {fpath}")
-             
-            if not loaded_parts:
-                self.overlay_gdf = None
-            elif len(loaded_parts) == 1:
-                self.overlay_gdf = loaded_parts[0]
-            else:
-                # Combine multiple layers
-                target = loaded_parts[0]
-                target_crs = target.crs
-                final_list = [target]
-                for other in loaded_parts[1:]:
-                    if target_crs and other.crs and other.crs != target_crs:
-                        other = other.to_crs(target_crs)
-                    final_list.append(other)
-                self.overlay_gdf = pd.concat(final_list, ignore_index=True)
-                 
+            # Load primary overlays
+            _load_into(ov_paths, all_parts)
+            
+            # Load filters (for visual display)
+            filter_parts = []
+            _load_into(filter_paths, filter_parts)
+            
+            # Update filter_gdf for spatial filtering logic
+            self._update_filter_gdf(filter_parts)
+            
+            # Combine all for visual display
+            all_parts.extend(filter_parts)
+            
+            if all_parts:
+                self.overlay_gdf = all_parts
+                  
         except Exception as e:
-            self._notify('ERROR', 'Overlay Shapefile Load Error', str(e), exc=e)
-            return
+            self._notify('ERROR', 'Overlay Load Error', str(e), exc=e)
+
+    def _update_filter_gdf(self, loaded_filter_parts):
+        """Update the internal filter_gdf used for spatial filtering."""
+        if not loaded_filter_parts:
+            self.filter_gdf = None
+        elif len(loaded_filter_parts) == 1:
+            self.filter_gdf = loaded_filter_parts[0]
+        else:
+            target_crs = loaded_filter_parts[0].crs
+            combined_parts = [loaded_filter_parts[0]]
+            for other in loaded_filter_parts[1:]:
+                if target_crs and other.crs and other.crs != target_crs:
+                    other = other.to_crs(target_crs)
+                combined_parts.append(other)
+            self.filter_gdf = pd.concat(combined_parts, ignore_index=True)
+
+    def load_filter(self):
+        """Update filter data and refresh overlays."""
+        self.load_overlay()
+
 
     def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None) -> Optional[gpd.GeoDataFrame]:
         if self.emissions_df is None:
@@ -2069,28 +2134,46 @@ class EmissionGUI:
         except Exception as e:
             print(f"Error filling NaNs in merged geometry: {e}")
 
-        # Filter by Overlay Shapefile if enabled
+        # Filter by Filter Shapefile if enabled (new logic with backward compatibility)
         try:
             filter_mode = None
+            filter_gdf_to_use = getattr(self, 'filter_gdf', None)
+            
+            # Check new filter_shapefile_opt first
             if getattr(self, 'filter_overlay_var', None):
                 val = self.filter_overlay_var.get()
                 if isinstance(val, str):
-                        s = val.strip().lower()
-                        if s not in ('false', 'none', 'off', 'null', ''):
-                            filter_mode = 'intersect' if s == 'true' else s
+                    s = val.strip().lower()
+                    if s not in ('false', 'none', 'off', 'null', ''):
+                        filter_mode = 'intersect' if s == 'true' else s
                 elif isinstance(val, bool) and val:
-                        filter_mode = 'intersect'
-             
-            ov_gdf = getattr(self, 'overlay_gdf', None)
-            if filter_mode and ov_gdf is not None:
-                if not ov_gdf.empty:
-                    _do_notify('INFO', 'Filtering', f'Filtering data by overlay ({filter_mode})...', popup=False)
-                     
-                    # apply_spatial_filter handles CRS conversion and logic
-                    try:
-                        merged = apply_spatial_filter(merged, ov_gdf, filter_mode)
-                    except Exception as e:
-                        _do_notify('WARNING', 'Filter Failed', f"Could not filter by overlay ({filter_mode}): {e}")
+                    filter_mode = 'intersect'
+            
+            # Backward compatibility: if filter_gdf not set but filtering requested, use overlay_gdf
+            if filter_mode and filter_gdf_to_use is None:
+                ov_gdf = getattr(self, 'overlay_gdf', None)
+                if ov_gdf is not None:
+                    _do_notify('WARNING', 'Deprecated', 'Using overlay for filtering. Please use filter_shapefile instead.', popup=False)
+                    # Convert overlay list to combined GeoDataFrame for filtering
+                    if isinstance(ov_gdf, list):
+                        if ov_gdf:
+                            target_crs = ov_gdf[0].crs
+                            combined_parts = [ov_gdf[0]]
+                            for other in ov_gdf[1:]:
+                                if target_crs and other.crs and other.crs != target_crs:
+                                    other = other.to_crs(target_crs)
+                                combined_parts.append(other)
+                            filter_gdf_to_use = pd.concat(combined_parts, ignore_index=True)
+                    else:
+                        filter_gdf_to_use = ov_gdf
+            
+            # Apply filtering
+            if filter_mode and filter_gdf_to_use is not None:
+                _do_notify('INFO', 'Filtering', f'Filtering data by shapefile ({filter_mode})...', popup=False)
+                try:
+                    merged = apply_spatial_filter(merged, filter_gdf_to_use, filter_mode)
+                except Exception as e:
+                    _do_notify('WARNING', 'Filter Failed', f"Could not filter by shapefile ({filter_mode}): {e}")
         except Exception as e:
             _do_notify('WARNING', 'Filter Logic Error', str(e))
 
@@ -2143,11 +2226,15 @@ class EmissionGUI:
                 else:
                     # Fallback to brute-force if no sindex
                     cand_idx = range(len(gdf))
+                best_parts = None
+                best_val = -1.0
+                
                 for idx in cand_idx:
                     row = gdf.iloc[idx]
                     geom = row.geometry
                     if geom is not None and geom.contains(pt):
                         parts = [base]
+                        # Identify region
                         fips = row.get('FIPS')
                         region_cd = row.get('region_cd') or row.get('REGION_CD')
                         gridrc = row.get('GRID_RC')
@@ -2158,13 +2245,27 @@ class EmissionGUI:
                             parts.append(f"region_cd={region_str.zfill(6) if region_str.isdigit() else region_str}")
                         elif isinstance(gridrc, (str, int)):
                             parts.append(f"GRID_RC={gridrc}")
+                        
+                        # Pull value
                         val = row.get(pollutant)
+                        try:
+                            f_val = float(val) if not pd.isna(val) else 0.0
+                        except Exception:
+                            f_val = 0.0
+                            
                         if not pd.isna(val):
                             try:
-                                parts.append(f"{pollutant}={float(val):.4g}")
+                                parts.append(f"{pollutant}={f_val:.4g}")
                             except Exception:
                                 parts.append(f"{pollutant}={val}")
-                        return ", ".join(parts)
+                        
+                        # If this is the best (highest non-zero) value we've seen, remember it
+                        if f_val > best_val or best_parts is None:
+                            best_val = f_val
+                            best_parts = parts
+                
+                if best_parts:
+                    return ", ".join(best_parts)
             except Exception:
                 pass
             return base
@@ -2910,15 +3011,20 @@ class EmissionGUI:
             except Exception:
                 pass
         if self.overlay_gdf is not None:
-            try:
-                overlay = self.overlay_gdf
+            # Handle both single GeoDataFrame and list of GeoDataFrames
+            overlay_list = self.overlay_gdf if isinstance(self.overlay_gdf, list) else [self.overlay_gdf]
+            colors = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
+            
+            for idx, ov_part in enumerate(overlay_list):
                 try:
-                    overlay = overlay.to_crs(plot_crs) if plot_crs is not None and getattr(overlay, 'crs', None) is not None else overlay
-                except Exception:
-                    pass
-                overlay.plot(ax=local_ax, facecolor='none', edgecolor=overlay_color, linewidth=overlay_lw, alpha=0.9, zorder=25)
-            except Exception:
-                pass            
+                    if plot_crs is not None and getattr(ov_part, 'crs', None) is not None:
+                        ov_part = ov_part.to_crs(plot_crs)
+                    
+                    # Use unique color for each overlay
+                    color = colors[idx % len(colors)]
+                    ov_part.boundary.plot(ax=local_ax, facecolor='none', edgecolor=color, linewidth=overlay_lw, alpha=0.9, zorder=25, linestyle='--')
+                except Exception as e:
+                    logging.warning("Failed to plot overlay part %d: %s", idx, e)
         # Optional zoom to data extent (non-NA values)
         if self.zoom_var.get():
             candidates = None

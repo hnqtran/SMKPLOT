@@ -222,8 +222,8 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
 
     # Auto-enable zoom_to_data if spatial filtering is active and no explicit override exists.
     zoom_flag = args.zoom_to_data
-    filter_mode_arg = getattr(args, 'filtered_by_overlay', None)
-    if not zoom_flag and filter_mode_arg and str(filter_mode_arg).lower() not in ('false', 'none'):
+    filter_mode_arg = getattr(args, 'filter_shapefile_opt', None) or getattr(args, 'filtered_by_overlay', None)
+    if not zoom_flag and filter_mode_arg and str(filter_mode_arg).lower() not in ('false', 'none', ''):
         zoom_flag = True
         logging.info("Auto-enabling zoom_to_data because spatial filtering is active.")
 
@@ -343,10 +343,13 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     else:
         fname_base = f"{input_basename}_{pol}{pltyp_suffix}{ncf_info}"
     
-    # Add overlay filter mode to filename if active
-    filter_mode_arg = getattr(args, 'filtered_by_overlay', None)
-    if filter_mode_arg and str(filter_mode_arg).lower() not in ('false', 'none'):
-        fname_base += f".overlay_{filter_mode_arg}"
+    # Add spatial filter mode to filename if active (new: filter_shapefile_opt, old: filtered_by_overlay)
+    filter_mode_arg = getattr(args, 'filter_shapefile_opt', None)
+    if filter_mode_arg is None:
+        filter_mode_arg = getattr(args, 'filtered_by_overlay', None)
+    
+    if filter_mode_arg and str(filter_mode_arg).lower() not in ('false', 'none', ''):
+        fname_base += f".filtered_{filter_mode_arg}"
 
     out_file = os.path.join(args.outdir, f"{fname_base}.png")
 
@@ -730,7 +733,7 @@ def _batch_mode(args):
             logging.exception(f"Failed to load {args.county_shapefile} for overlay plotting. Ignoring overlay.")
             overlay_county = None
 
-    # Optional overlay when a shapefile is supplied (e.g., for grid runs)
+    # Optional overlay when a shapefile is supplied (for grid runs)
     overlay_geom = None
     ov_paths = getattr(args, 'overlay_shapefile', None)
     
@@ -746,11 +749,10 @@ def _batch_mode(args):
                 else:
                     ov_file_list.append(str(item))
         
-        # Load and combine
+        # Load each overlay separately (keep as list for different colors)
         loaded_parts = []
         for fpath in ov_file_list:
             try:
-                # Resolve path similar to inputs (optional check omitted for brevity, rely on read_shpfile)
                 part_gdf = read_shpfile(fpath, False)
                 if part_gdf is not None and not part_gdf.empty:
                     loaded_parts.append(part_gdf)
@@ -758,26 +760,58 @@ def _batch_mode(args):
                 logging.exception(f"Failed to load overlay shapefile: {fpath}. Skipping.")
         
         if loaded_parts:
-            if len(loaded_parts) == 1:
-                overlay_geom = loaded_parts[0]
+            # Keep as list instead of combining - allows different colors per overlay
+            overlay_geom = loaded_parts
+            logging.info("Loaded %d overlay shapefile(s).", len(loaded_parts))
+
+    # Load filter shapefile(s) for spatial filtering (separate from visual overlays)
+    filter_geom = None
+    filter_paths = getattr(args, 'filter_shapefile', None)
+    
+    if filter_paths:
+        # Normalize to list
+        filter_file_list = []
+        if isinstance(filter_paths, str):
+            filter_file_list = [p.strip() for p in filter_paths.split(';') if p.strip()]
+        elif isinstance(filter_paths, (list, tuple)):
+            for item in filter_paths:
+                if isinstance(item, str):
+                    filter_file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                else:
+                    filter_file_list.append(str(item))
+        
+        # Load and combine filter shapefiles
+        loaded_filter_parts = []
+        for fpath in filter_file_list:
+            try:
+                part_gdf = read_shpfile(fpath, False)
+                if part_gdf is not None and not part_gdf.empty:
+                    loaded_filter_parts.append(part_gdf)
+            except Exception:
+                logging.exception(f"Failed to load filter shapefile: {fpath}. Skipping.")
+        
+        if loaded_filter_parts:
+            # Combine all filter shapefiles into one for filtering
+            if len(loaded_filter_parts) == 1:
+                filter_geom = loaded_filter_parts[0]
             else:
-                try:
-                    # Combine multiple layers
-                    # Use First layer's CRS as target
-                    target = loaded_parts[0]
-                    target_crs = target.crs
-                    
-                    final_list = [target]
-                    for other in loaded_parts[1:]:
-                        if target_crs and other.crs and other.crs != target_crs:
-                            other = other.to_crs(target_crs)
-                        final_list.append(other)
-                    
-                    overlay_geom = pd.concat(final_list, ignore_index=True)
-                    logging.info("Combined %d overlay shapefiles.", len(final_list))
-                except Exception:
-                    logging.exception("Failed to combine multiple overlay shapefiles. Using first successfully loaded file.")
-                    overlay_geom = loaded_parts[0]
+                target_crs = loaded_filter_parts[0].crs
+                combined_parts = [loaded_filter_parts[0]]
+                for other in loaded_filter_parts[1:]:
+                    if target_crs and other.crs and other.crs != target_crs:
+                        other = other.to_crs(target_crs)
+                    combined_parts.append(other)
+                filter_geom = pd.concat(combined_parts, ignore_index=True)
+            logging.info("Loaded %d filter shapefile(s).", len(loaded_filter_parts))
+            
+            # Add filter shapefiles to overlay for visual display
+            if overlay_geom is None:
+                overlay_geom = loaded_filter_parts
+            elif isinstance(overlay_geom, list):
+                overlay_geom.extend(loaded_filter_parts)
+            else:
+                # overlay_geom is a single GeoDataFrame (shouldn't happen with current logic, but handle it)
+                overlay_geom = [overlay_geom] + loaded_filter_parts
 
     # Detect pollutants
     pollutants = detect_pollutants(emis_df)
@@ -861,10 +895,31 @@ def _batch_mode(args):
         except Exception:
             logging.exception("Failed to fill NaN values in merged dataframe")
 
-    # Filter by overlay if requested
-    filter_arg = getattr(args, 'filtered_by_overlay', None)
+
+    # Spatial filtering logic (new: filter_shapefile_opt, backward compatible: filtered_by_overlay)
+    filter_arg = getattr(args, 'filter_shapefile_opt', None)
     
-    # Resolve boolean/None/String inputs to a canonical mode string
+    # Backward compatibility: if filter_shapefile_opt not set, check filtered_by_overlay
+    if filter_arg is None:
+        filter_arg = getattr(args, 'filtered_by_overlay', None)
+        if filter_arg is not None:
+            logging.warning("Using deprecated 'filtered_by_overlay'. Please use 'filter_shapefile' and 'filter_shapefile_opt' instead.")
+            # For backward compatibility, use overlay_geom as filter if no filter_geom specified
+            if filter_geom is None and overlay_geom is not None:
+                logging.info("Backward compatibility mode: using overlay_shapefile for filtering.")
+                # Convert overlay_geom list to combined GeoDataFrame for filtering
+                if isinstance(overlay_geom, list):
+                    target_crs = overlay_geom[0].crs
+                    combined_parts = [overlay_geom[0]]
+                    for other in overlay_geom[1:]:
+                        if target_crs and other.crs and other.crs != target_crs:
+                            other = other.to_crs(target_crs)
+                        combined_parts.append(other)
+                    filter_geom = pd.concat(combined_parts, ignore_index=True)
+                else:
+                    filter_geom = overlay_geom
+    
+    # Parse filter mode
     filter_mode = None
     if filter_arg is None:
         filter_mode = None
@@ -879,22 +934,20 @@ def _batch_mode(args):
     else:
         filter_mode = str(filter_arg).strip().lower()
 
+    # Apply spatial filtering if requested
     if filter_mode:
-        # Update args with the canonical mode so it propagates to title/filename generation
-        args.filtered_by_overlay = filter_mode
-
-        if overlay_geom is None:
-            logging.warning("filtered_by_overlay='%s' requested but no overlay shapefile loaded.", filter_mode)
+        if filter_geom is None:
+            logging.warning("filter_shapefile_opt='%s' requested but no filter shapefile loaded.", filter_mode)
         else:
             try:
-                logging.info("Applying overlay filter mode: '%s'", filter_mode)
-                merged = apply_spatial_filter(merged, overlay_geom, filter_mode)
+                logging.info("Applying spatial filter mode: '%s'", filter_mode)
+                merged = apply_spatial_filter(merged, filter_geom, filter_mode)
                  
                 if filter_mode in ('clipped', 'intersect', 'within'):
                     logging.info("Filtering complete. Remaining features: %d", len(merged))
 
             except Exception:
-                logging.exception("Failed to apply overlay filter '%s'", filter_mode)
+                logging.exception("Failed to apply spatial filter '%s'", filter_mode)
 
     # Export processed emissions data to CSV (post-filtering)
     csv_from_json = False
@@ -918,9 +971,9 @@ def _batch_mode(args):
         if args.filter_col:
             fname_base += f".filterby_{args.filter_col}"
         
-        # Add overlay filter mode to filename if active (using the resolved filter_mode variable)
+        # Add spatial filter mode to filename if active (using the resolved filter_mode variable)
         if filter_mode:
-            fname_base += f".overlay_{filter_mode}"
+            fname_base += f".filtered_{filter_mode}"
             
         csv_outpath = os.path.join(args.outdir, f"{fname_base}.pivotted.csv")
         

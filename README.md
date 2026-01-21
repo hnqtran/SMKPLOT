@@ -107,8 +107,9 @@ arguments:
   filepath: /path/to/emissions.csv
   sector: my_sector
   county_shapefile: /path/to/counties.gpkg
-  overlay_shapefile: /path/to/state.shp
-  filtered_by_overlay: within
+  overlay_shapefile: /path/to/state_lines.shp; /path/to/major_roads.shp
+  filter_shapefile: /path/to/my_region.shp
+  filter_shapefile_opt: within
   pltyp: county
   pollutant: NOX,VOC
   cmap: viridis
@@ -164,12 +165,14 @@ outputs:
 ### Spatial Filtering
 | Argument | Description |
 | :--- | :--- |
-| `--filtered-by-overlay` | Filter mode: `within`, `intersect`, or `clipped` |
+| `--filter-shapefile` | Path/URL to shapefile(s) for spatial filtering (can specify multiple times) |
+| `--filter-shapefile-opt` | Filter operation: `within`, `intersect`, or `clipped` (default: `intersect`) |
+| `--filtered-by-overlay` | [DEPRECATED] Use `--filter-shapefile-opt` instead |
 
-**Filter Modes:**
-*   **`within`**: Keeps features inside overlay (uses dual-check: centroid + representative point for coastal/irregular shapes)
-*   **`intersect`**: Keeps features touching overlay
-*   **`clipped`**: Geometrically clips features to overlay boundary
+**Filter Operations:**
+*   **`within`**: Keeps features whose center (centroid/representative point) is inside the filter shapefile.
+*   **`intersect`**: Keeps features that touch any part of the filter shapefile.
+*   **`clipped`**: Geometrically clips features (like grid cells) to match the filter shapefile boundary.
 
 ### Data Filtering
 | Argument | Description |
@@ -202,8 +205,13 @@ outputs:
 
 ## Advanced Features
 
-### Spatial Filtering with Dual-Check Strategy
+### Multiple Overlays and Filters
+You can specify multiple shapefiles for either visual overlays or spatial filters:
+*   **CLI**: Use the flag multiple times: `--overlay-shapefile file1.shp --overlay-shapefile file2.shp`
+*   **GUI**: Separate paths with semicolons: `/path/to/file1.shp; /path/to/file2.shp`
+*   **Automatic Coloring**: Visual overlays are automatically assigned distinct colors (cyan, magenta, yellow, etc.) to differentiate between boundaries.
 
+### Spatial Filtering with Dual-Check Strategy
 The `within` filter mode uses a robust dual-check approach:
 1.  Checks if feature **centroid** is within overlay
 2.  Checks if feature **representative point** is within overlay
@@ -212,15 +220,12 @@ The `within` filter mode uses a robust dual-check approach:
 This ensures accurate filtering for complex geometries like coastal counties where centroids may fall in water.
 
 ### Automatic Zoom Behavior
-
-When spatial filtering is active (`--filtered-by-overlay`), the tool automatically enables `--zoom-to-data` to focus the map on the filtered region, eliminating empty space.
+When spatial filtering is active (using `--filter-shapefile-opt`), the tool automatically enables `--zoom-to-data` to focus the map on the filtered region, eliminating empty space.
 
 ### NetCDF Grid Handling
-
 NetCDF files (including inline point sources) automatically derive grid parameters from file headers. External `--griddesc` arguments are ignored for NetCDF inputs.
 
 ### Warning Management
-
 Python warnings (e.g., from matplotlib, geopandas) are captured and routed through the logging system, respecting the `--log-level` setting.
 
 ## Troubleshooting
@@ -252,13 +257,13 @@ Python warnings (e.g., from matplotlib, geopandas) are captured and routed throu
   --outdir ./batch_output
 ```
 
-**3. State-specific analysis:**
+**3. Powerful Spatial Filtering (State-specific analysis):**
 ```bash
 ./smkplot.py --run-mode batch \
   -f national_emissions.csv \
   --county-shapefile us_counties.gpkg \
-  --overlay-shapefile texas.shp \
-  --filtered-by-overlay within \
+  --filter-shapefile texas.shp \
+  --filter-shapefile-opt within \
   --pollutant NOX \
   --zoom-to-data \
   --outdir ./texas_maps
@@ -275,7 +280,16 @@ Python warnings (e.g., from matplotlib, geopandas) are captured and routed throu
   --outdir ./netcdf_maps
 ```
 
-**5. Reuse saved configuration:**
+**5. Multiple Visual Overlays:**
+```bash
+./smkplot.py --run-mode batch \
+  -f report.csv \
+  --overlay-shapefile state_lines.shp \
+  --overlay-shapefile pipelines.shp \
+  --pollutant CO
+```
+
+**6. Reuse saved configuration:**
 ```bash
 ./smkplot.py -f previous_run.yaml
 ```

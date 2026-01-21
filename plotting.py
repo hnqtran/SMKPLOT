@@ -152,20 +152,31 @@ def _add_overlays(ax: plt.Axes, overlay_counties, overlay_shape, crs_proj, theme
             logging.warning("Failed to overlay county shapefile: %s", e)
             
     if overlay_shape is not None:
-        try:
-            if crs_proj is not None and getattr(overlay_shape, 'crs', None) is not None:
-                shape_overlay = overlay_shape.to_crs(crs_proj)
-            else:
-                shape_overlay = overlay_shape
-            shape_overlay.boundary.plot(
-                ax=ax, 
-                color=theme['overlay_color'], 
-                linewidth=theme['overlay_lw'], 
-                alpha=0.9, 
-                linestyle='--'
-            )
-        except Exception as e:
-            logging.warning("Failed to overlay auxiliary shapefile: %s", e)
+        # Handle both single GeoDataFrame and list of GeoDataFrames
+        overlay_list = overlay_shape if isinstance(overlay_shape, list) else [overlay_shape]
+        
+        # Color cycle for multiple overlays
+        colors = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
+        
+        for idx, shape_gdf in enumerate(overlay_list):
+            try:
+                if crs_proj is not None and getattr(shape_gdf, 'crs', None) is not None:
+                    shape_overlay = shape_gdf.to_crs(crs_proj)
+                else:
+                    shape_overlay = shape_gdf
+                
+                # Use different color for each overlay
+                color = colors[idx % len(colors)]
+                
+                shape_overlay.boundary.plot(
+                    ax=ax, 
+                    color=color, 
+                    linewidth=theme['overlay_lw'], 
+                    alpha=0.9, 
+                    linestyle='--'
+                )
+            except Exception as e:
+                logging.warning("Failed to overlay auxiliary shapefile %d: %s", idx, e)
 
 
 def _zoom_to_extent(ax: plt.Axes, gdf, column: str, zoom_pad: float):

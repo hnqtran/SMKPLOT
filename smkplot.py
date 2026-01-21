@@ -145,8 +145,10 @@ def parse_args():
     ap.add_argument('--comment', help='Comment character to ignore lines (e.g., #).')
     ap.add_argument('--encoding', help='File encoding (e.g., latin1, utf-8).')
     ap.add_argument('--county-shapefile', help='Path/URL to counties shapefile (.shp, .gpkg or .zip) for county plots.')
-    ap.add_argument('--overlay-shapefile', action='append', help='Path/URL to auxiliary shapefile for overlaid on plots. Can be specified multiple times.')
-    ap.add_argument('--filtered-by-overlay', nargs='?', const='intersect', help='Clip/filter data using overlay shapefile. Values: "intersect" (default if flag present), "clipped", "within".')
+    ap.add_argument('--overlay-shapefile', action='append', help='Path/URL to auxiliary shapefile for visual overlay on plots (no filtering). Can be specified multiple times.')
+    ap.add_argument('--filter-shapefile', action='append', help='Path/URL to shapefile(s) for spatial filtering. Can be specified multiple times.')
+    ap.add_argument('--filter-shapefile-opt', nargs='?', const='intersect', help='Spatial filter operation. Values: "intersect" (default), "clipped", "within".')
+    ap.add_argument('--filtered-by-overlay', nargs='?', const='intersect', help='[DEPRECATED] Use --filter-shapefile and --filter-shapefile-opt instead.')
     ap.add_argument('--stack-groups', help='Path to STACK_GROUPS file (for Inline Point Source processing).')
     ap.add_argument('--griddesc', help='Path to GRIDDESC file (for batch grid plotting).')
     ap.add_argument('--gridname', help='Name of the grid in GRIDDESC (for batch grid plotting).')
@@ -333,21 +335,6 @@ def main():
             cli_args=args,
             app_version=SMKPLOT_VERSION,
         )
-        # Pass batch-mode grid settings to the GUI instance if provided
-        if args.griddesc:
-            app.griddesc_path = args.griddesc
-            app.griddesc_entry.delete(0, tk.END)
-            app.griddesc_entry.insert(0, args.griddesc)
-            app.load_griddesc()
-            if args.gridname:
-                # Check if the grid name is valid before setting
-                available_grids = app.grid_name_menu['menu'].winfo_children()
-                available_names = [item.cget('label') for item in available_grids]
-                if args.gridname in available_names:
-                    app.grid_name_var.set(args.gridname)
-                    app.load_grid_shape()
-        if args.pltyp:
-            app.plot_by_var.set(args.pltyp)
             
     except Exception as e:
         logging.exception("Failed creating Tk root (final); falling back to batch mode")
