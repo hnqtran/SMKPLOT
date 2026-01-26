@@ -1,0 +1,8 @@
+#FORMAT=FF10_POINT
+country_cd,region_cd,tribal_code,facility_id,unit_id,rel_point_id,process_id,agy_facility_id,agy_unit_id,agy_rel_point_id,agy_process_id,scc,poll,ann_value,ann_pct_red,facility_name,erptype,stkhgt,stkdiam,stktemp,stkflow,stkvel,naics,longitude,latitude,ll_datum,horiz_coll_mthd,design_capacity,design_capacity_units,reg_codes,fac_source_type,unit_type_code,control_ids,control_measures,current_cost,cumulative_cost,projection_factor,submitter_id,calc_method,data_set_id,facil_category_code,oris_facility_code,oris_boiler_id,ipm_yn,calc_year,date_updated,fug_height,fug_width_xdim,fug_length_ydim,fug_angle,zipcode,annual_avg_hours_per_year,jan_value,feb_value,mar_value,apr_value,may_value,jun_value,jul_value,aug_value,sep_value,oct_value,nov_value,dec_value,jan_pctred,feb_pctred,mar_pctred,apr_pctred,may_pctred,jun_pctred,jul_pctred,aug_pctred,sep_pctred,oct_pctred,nov_pctred,dec_pctred,comment
+"US","34017",,"7217311",,,,,,,,"39999999","NOX",10.5,,"Kearny",,,,,,,,-74.097155,40.73799,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","34017",,"7217311",,,,,,,,"39999999","VOC",2.3,,"Kearny",,,,,,,,-74.097155,40.73799,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","36061",,"FAC2",,,,,,,,"20200101","NOX",50.2,,"NYC",,,,,,,,-73.97,40.78,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","36061",,"FAC2",,,,,,,,"20200101","VOC",12.1,,"NYC",,,,,,,,-73.97,40.78,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","48001",,"FAC3",,,,,,,,"10100101","NOX",30.0,,"TX1",,,,,,,,-95.63,31.76,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","48201",,"FAC4",,,,,,,,"10100101","NOX",100.5,,"TX2",,,,,,,,-95.36,29.76,"WGS84",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,

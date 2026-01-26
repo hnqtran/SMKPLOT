@@ -1,0 +1,13 @@
+timestamp_utc: '2026-01-26T10:00:00Z'
+arguments:
+  filepath: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/example_gridded.nc
+  sector: test_netcdf
+  pltyp: grid
+  pollutant: NOX,VOC
+  ncf_tdim: avg
+  ncf_zdim: 0
+  zoom_to_data: true
+  cmap: turbo
+  outdir: ./test_outputs/netcdf
+  export_csv: true
+  run_mode: batch

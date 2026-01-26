@@ -1,0 +1,8 @@
+#FORMAT=FF10_NONPOINT
+country_cd,region_cd,tribal_code,census_tract_cd,shape_id,scc,emis_type,poll,ann_value,ann_pct_red,control_ids,control_measures,current_cost,cumulative_cost,projection_factor,reg_codes,calc_method,calc_year,date_updated,data_set_id,jan_value,feb_value,mar_value,apr_value,may_value,jun_value,jul_value,aug_value,sep_value,oct_value,nov_value,dec_value,jan_pctred,feb_pctred,mar_pctred,apr_pctred,may_pctred,jun_pctred,jul_pctred,aug_pctred,sep_pctred,oct_pctred,nov_pctred,dec_pctred,comment
+"US","36001",,,"","10100101",,"NOX",10.5,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","36001",,,"","10100101",,"VOC",2.3,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","36061",,,"","20200101",,"NOX",50.2,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","36061",,,"","20200101",,"VOC",12.1,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","48001",,,"","10100101",,"NOX",30.0,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
+"US","48201",,,"","10100101",,"NOX",100.5,0.0,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,

@@ -25,6 +25,7 @@ It supports:
 """
 
 import os
+import sys
 import logging
 import copy
 import json
@@ -386,49 +387,109 @@ def _batch_mode(args):
 
     # Optional self-test harness (runs before reading real data if requested)
     if args.self_test:
+        logging.info("Starting comprehensive self-test using example_inputs...")
         try:
-            os.makedirs(args.outdir, exist_ok=True)
-            # Build small synthetic emissions DataFrame (counties mode) with two fictitious FIPS codes
-            synth = pd.DataFrame({
-                'FIPS': ['01001','01003','01005','01007'],
-                'NOX': [5.0, 10.0, 0.0, 20.0],
-                'SO2': [1.0, 0.5, 2.0, 0.0]
-            })
-            # Minimal square polygons (fake geometries) in WGS84
-            polys = []
-            for i, f in enumerate(synth['FIPS']):
-                x0 = -90 + i*0.5
-                y0 = 30 + i*0.5
-                polys.append(Polygon([(x0,y0),(x0+0.4,y0),(x0+0.4,y0+0.4),(x0,y0+0.4)]))
-            gdf = gpd.GeoDataFrame({'FIPS': synth['FIPS']}, geometry=polys, crs='+proj=longlat +datum=WGS84')
-            merged = gdf.merge(synth, on='FIPS', how='left')
-            for pol in ['NOX','SO2']:
-                fig, ax = plt.subplots(figsize=(6,3))
-                merged.plot(column=pol, ax=ax, legend=True, cmap='jet', edgecolor='black', linewidth=0.2)
-                # Zoom-to-data demonstration
-                if args.zoom_to_data:
-                    try:
-                        valid = merged[merged[pol].notna()]
-                        if not valid.empty:
-                            minx, miny, maxx, maxy = valid.total_bounds
-                            dx = (maxx - minx) * 0.05 if maxx > minx else 0.1
-                            dy = (maxy - miny) * 0.05 if maxy > miny else 0.1
-                            ax.set_xlim(minx - dx, maxx + dx)
-                            ax.set_ylim(miny - dy, maxy + dy)
-                    except Exception:
-                        pass
-                ax.set_title(f"SELF-TEST {pol}")
-                fig.tight_layout()
-                out_path = os.path.join(args.outdir, f"selftest_{pol}.png")
-                fig.savefig(out_path, dpi=150)
-                plt.close(fig)
-                generated_plots.append(os.path.abspath(out_path))
-            logging.info("Self-test artifacts written to %s (files starting with selftest_)", args.outdir)
-        except Exception:
-            logging.exception("Self-test failed")
-        # Continue with normal processing if real inputs provided; else exit early
-        if not args.filepath:
-            return _finish(0)
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            example_dir = os.path.join(script_dir, 'example_inputs')
+            
+            if not os.path.isdir(example_dir):
+                logging.error(f"Self-test failed: Example directory {example_dir} not found.")
+                return 1
+
+            configs = [
+                'config_ff10.yaml', 
+                'config_smkreport.yaml', 
+                'config_netcdf.yaml',
+                'config_ff10_point_county.yaml',
+                'config_ff10_point_grid.yaml'
+            ]
+            
+            # Helper for QA/QC: Compare sums
+            def _check_sum(df, col, expected, tolerance=1e-3):
+                if col not in df.columns:
+                    return False, f"Column {col} missing in output"
+                actual = df[col].sum()
+                if abs(actual - expected) > tolerance:
+                    return False, f"Sum mismatch for {col}: Expected {expected}, got {actual}"
+                return True, f"Sum match for {col}: {actual}"
+
+            # Expected sums for QA/QC (hardcoded for example data)
+            # NOX: 10.5 + 50.2 + 30.0 + 100.5 = 191.2
+            # VOC: 2.3 + 12.1 = 14.4
+            expected_sums = {'NOX': 191.2, 'VOC': 14.4}
+            # NetCDF NOX: Step 0 (0..99) sum=4950, Step 1 (4950*1.5) sum=7425. Avg = 6187.5
+            # NetCDF VOC: Step 0 (1..100 * 0.8) sum=4040, Step 1 (4040*0.8) sum=3232. Avg = 3636.0
+            expected_ncf_sums = {'NOX': 6187.5, 'VOC': 3636.0}
+
+            test_failures = []
+
+            # We need to run the batch logic for each config. 
+            import subprocess
+            
+            interpreter = sys.executable
+            launcher = os.path.join(script_dir, 'smkplot.py')
+            
+            for cfg_name in configs:
+                cfg_path = os.path.join(example_dir, cfg_name)
+                logging.info(f"--- Testing Format: {cfg_name} ---")
+                
+                # Run smkplot.py with the config
+                cmd = [interpreter, launcher, "-f", cfg_path]
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if result.returncode != 0:
+                        test_failures.append(f"{cfg_name}: Process failed with exit code {result.returncode}\n{result.stderr}")
+                        continue
+                    
+                    logging.info(f"Execution successful for {cfg_name}")
+                    
+                    # QA/QC Check
+                    if 'ff10_point_county' in cfg_name:
+                        csv_path = os.path.abspath("./test_outputs/ff10_point_county/test_ff10_point_county.pivotted.csv")
+                        target_sums = expected_sums
+                    elif 'ff10_point_grid' in cfg_name:
+                        csv_path = os.path.abspath("./test_outputs/ff10_point_grid/test_ff10_point_grid.pivotted.csv")
+                        target_sums = expected_sums
+                    elif 'ff10' in cfg_name:
+                        csv_path = os.path.abspath("./test_outputs/ff10/test_ff10.pivotted.csv")
+                        target_sums = expected_sums
+                    elif 'smkreport' in cfg_name:
+                        csv_path = os.path.abspath("./test_outputs/smkreport/test_smkreport.pivotted.csv")
+                        target_sums = expected_sums
+                    elif 'netcdf' in cfg_name:
+                        csv_path = os.path.abspath("./test_outputs/netcdf/test_netcdf.t_avg.z_0.pivotted.csv")
+                        target_sums = expected_ncf_sums
+                    else:
+                        csv_path = None
+                    
+                    if csv_path and os.path.exists(csv_path):
+                        df_out = pd.read_csv(csv_path)
+                        for pol, expected in target_sums.items():
+                            success, msg = _check_sum(df_out, pol, expected)
+                            if not success:
+                                test_failures.append(f"{cfg_name}: QA/QC Failed - {msg}")
+                                logging.error(f"  [QA/QC] {msg}")
+                            else:
+                                logging.info(f"  [QA/QC] {msg}")
+                    elif csv_path:
+                        test_failures.append(f"{cfg_name}: Output CSV {csv_path} not found.")
+
+                except Exception as e:
+                    test_failures.append(f"{cfg_name}: Error during test execution: {e}")
+
+            if test_failures:
+                logging.error("\nSelf-test finished with FAILURES:")
+                for fail in test_failures:
+                    logging.error(f"  - {fail}")
+                return 1
+            else:
+                logging.info("\nALL SELF-TESTS PASSED SUCCESSFULLY (FF10, SMOKE Report, NetCDF, FF10_POINT).")
+                logging.info("Output maps and CSVs are available in ./test_outputs/")
+                return 0
+
+        except Exception as e:
+            logging.exception("Self-test framework error")
+            return 1
     
     
     # Retrieve json_payload

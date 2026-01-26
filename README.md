@@ -100,6 +100,33 @@ Simply pass a `.yaml` or `.json` file to `-f` / `--filepath`. The tool automatic
 ./smkplot.py -f my_config.yaml
 ```
 
+## Self-Testing
+
+The tool includes a comprehensive self-test suite that verifies parsing, spatial processing, and QA/QC sums for all supported formats (FF10 Point/Nonpoint, SMOKE Report, and NetCDF) using realistic **12LISTOS** parameters.
+
+**To run the self-test:**
+```bash
+./smkplot.py --run-mode batch --self-test
+```
+
+### What to Check
+When the self-test completes, verify the following:
+
+1.  **Terminal Output (QA/QC Sums)**:
+    *   Look for `INFO [QA/QC] Sum match for NOX: ...` and `VOC: ...`.
+    *   This confirms that the data processed by the tool (and saved in the pivoted CSV) exactly matches the total emissions in the input files.
+    *   The test must finish with: `ALL SELF-TESTS PASSED SUCCESSFULLY`.
+
+2.  **Exported Data (`./test_outputs/`)**:
+    *   Navigate to the subfolders (e.g., `./test_outputs/ff10_point_grid/`).
+    *   Open the `...pivotted.csv` files.
+    *   Verify that columns like `FIPS` are correctly zero-padded (e.g., `034013`) and that `GRID_RC` values (e.g., `3_4`) are present for gridded tests.
+
+3.  **Visual Plots**:
+    *   Inspect the generated PNG maps in the test output folders.
+    *   Check for consistent geographic placement (e.g., points over New Jersey, New York, and Texas).
+    *   Verify the colorbar limits and the statistics (Sum/Max/Min) displayed in the plot footer or legend.
+
 **Configuration File Structure:**
 
 ```yaml
