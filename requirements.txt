@@ -10,4 +10,6 @@ pyogrio
 netCDF4
 fiona
 xarray
-dask
+dask[complete]
+toolz
+cytoolz
