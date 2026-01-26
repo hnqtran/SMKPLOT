@@ -22,7 +22,7 @@ US_STATE_FIPS_TO_NAME: Dict[str, str] = {
 }
 
 # ---- Key cols to be kept in exported pivotted csv files
-key_cols = ['country_cd','tribal_code','region_cd','facility_id','unit_id','rel_point_id','scc','latitude','longitude']
+key_cols = ['country_cd','tribal_code','region_cd','facility_id','unit_id','rel_point_id','facility_name','scc','latitude','longitude']
 
 # Define constant column name lists for remapping (moved from data_processing.py)
 COUNTRY_COLS = ['country_cd', 'country', 'country_id']

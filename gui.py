@@ -28,9 +28,7 @@ import os
 import sys
 import copy
 import logging
-import io
 import threading
-from functools import lru_cache
 from typing import Optional, List, Dict, Any, Union, Tuple
 
 import pandas as pd
@@ -47,7 +45,7 @@ from config import (
     US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
     DEFAULT_ONLINE_COUNTIES_URL
 )
-from utils import load_settings, save_settings, normalize_delim
+from utils import normalize_delim, is_netcdf_file
 from data_processing import (
     read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
     merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
@@ -205,31 +203,22 @@ class EmissionGUI:
         self._ff10_ready = False
         self._ff10_grid_ready = False
 
-        # Load default settings under .config/smkgui_settings.json and apply them if needed
-        settings = load_settings()
-        last_paths = settings.get('last_paths', {})
-        ui_state = settings.get('ui_state', {})
-
         # --- Pre-calculate settings for UI initialization ---
         # Load optional overlay shapefile
-        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None) or last_paths.get('overlay')
+        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None)
         
         # Load filter shapefile (new parameter)
-        self.filter_path = getattr(cli_args, 'filter_shapefile', None) if cli_args else None or self._json_arguments.get('filter_shapefile', None) or last_paths.get('filter_shapefile')
+        self.filter_path = getattr(cli_args, 'filter_shapefile', None) if cli_args else None or self._json_arguments.get('filter_shapefile', None)
 
         # Load filter_shapefile_opt setting (new parameter)
         val_filter_opt = getattr(cli_args, 'filter_shapefile_opt', None)
         if val_filter_opt is None:
             val_filter_opt = self._json_arguments.get('filter_shapefile_opt', None)
-        if val_filter_opt is None:
-            val_filter_opt = last_paths.get('filter_shapefile_opt', None)
 
         # Load filtered_by_overlay setting (deprecated, backward compatibility)
         val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
         if val_filter is None:
             val_filter = self._json_arguments.get('filtered_by_overlay', None)
-        if val_filter is None:
-            val_filter = last_paths.get('filtered_by_overlay', False)
         
         # Determine initial filter mode
         initial_filter_mode = 'False'
@@ -256,43 +245,26 @@ class EmissionGUI:
         elif self._json_arguments.get('log_scale') is False:
             self.scale_var.set('linear')
         else:
-            self.scale_var.set(ui_state.get('scale', 'linear'))
+            self.scale_var.set('linear')
 
         bins_val = self._json_arguments.get('bins')
         if bins_val is not None:
             self.class_bins_var.set(str(bins_val))
         else:
-            self.class_bins_var.set(ui_state.get('bins', ''))
+            self.class_bins_var.set('')
 
         cmap_val = self._json_arguments.get('cmap')
         if cmap_val:
             self.cmap_var.set(str(cmap_val))
         else:
-            self.cmap_var.set(ui_state.get('colormap', 'viridis'))
+            self.cmap_var.set('viridis')
 
-        if self.custom_delim_var and ui_state.get('custom_delimiter'):
-            self.custom_delim_var.set(ui_state['custom_delimiter'])
-            
-        if self.plot_by_var and ui_state.get('plot_by'):
-            self.plot_by_var.set(ui_state['plot_by'])
-            
-        if hasattr(self, 'projection_var') and ui_state.get('projection'):
-            self.projection_var.set(ui_state['projection'])
-            
-        if self.zoom_var and 'zoom_to_data' in ui_state:
-            self.zoom_var.set(ui_state['zoom_to_data'])
-
-        # Restore last inputpath path but defer loading until user requests it
-        self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) if cli_args else None or self._json_arguments.get('filepath', None)
-
-        # Fallback to last used path
-        if not self.inputfile_path:
-            self.inputfile_path = last_paths.get('inputpath')
+        # Restore from CLI or JSON snapshot
+        self.inputfile_path = inputfile_path or (getattr(cli_args, 'filepath', None) if cli_args else None) or self._json_arguments.get('filepath')
 
         # --- Initialize logic-heavy fields and trigger loaders ---
         
         # 1. Emissions Input
-        self.inputfile_path = inputfile_path or getattr(cli_args, 'filepath', None) or self._json_arguments.get('filepath') or last_paths.get('inputpath')
         if isinstance(self.inputfile_path, (list, tuple)):
             self.inputfile_path = "; ".join([str(p) for p in self.inputfile_path if p])
             
@@ -307,7 +279,10 @@ class EmissionGUI:
                 self.root.after(200, lambda: self.load_inputfile(show_preview=False))
 
         # 2. GRIDDESC
-        self.griddesc_path = getattr(cli_args, 'griddesc', None) or self._json_arguments.get('griddesc') or last_paths.get('griddesc')
+        self.griddesc_path = getattr(cli_args, 'griddesc', None) or self._json_arguments.get('griddesc')
+        if self.griddesc_path == "(NetCDF Attributes)":
+            self.griddesc_path = None
+
         if self.griddesc_path:
             try:
                 self.griddesc_entry.delete(0, tk.END)
@@ -316,18 +291,16 @@ class EmissionGUI:
                 pass
             self.load_griddesc()
             
-            # Restore selected grid name (Priority: CLI/Config > UI State)
-            grid_name = getattr(cli_args, 'gridname', None) or self._json_arguments.get('gridname') or ui_state.get('grid_name')
+            # Restore selected grid name (Priority: CLI/Config)
+            grid_name = getattr(cli_args, 'gridname', None) or self._json_arguments.get('gridname')
             if self.grid_name_var and grid_name and grid_name != "Select Grid":
                 self.grid_name_var.set(grid_name)
                 self.load_grid_shape()
 
-        # 3. SCC Selection
-        if self.scc_select_var and ui_state.get('scc_selection'):
-            self.scc_select_var.set(ui_state['scc_selection'])
+        # 3. SCC Selection (Handled by load_inputfile if present)
 
         # 4. Counties Shapefile
-        self.counties_path = counties_path or getattr(cli_args, 'county_shapefile', None) or self._json_arguments.get('county_shapefile') or last_paths.get('counties')
+        self.counties_path = counties_path or getattr(cli_args, 'county_shapefile', None) or self._json_arguments.get('county_shapefile')
         if self.counties_path:
             try:
                 self.county_entry.delete(0, tk.END)
@@ -383,7 +356,7 @@ class EmissionGUI:
     def _lcc_from_griddesc(self):
         """Build an LCC CRS from the current GRIDDESC selection if available."""
         try:
-            if not self.griddesc_path:
+            if not self.griddesc_path or self.griddesc_path == "(NetCDF Attributes)":
                 return None
             grid_name = self.grid_name_var.get() if getattr(self, 'grid_name_var', None) else None
             if not grid_name or grid_name == 'Select Grid':
@@ -438,7 +411,7 @@ class EmissionGUI:
 
         try:
             # Require explicit grid specification for LCC
-            if self.griddesc_path and getattr(self, 'grid_name_var', None):
+            if self.griddesc_path and self.griddesc_path != "(NetCDF Attributes)" and getattr(self, 'grid_name_var', None):
                 gname = self.grid_name_var.get()
                 if gname and gname not in (None, '', 'Select Grid'):
                     lcc = self._lcc_from_griddesc()
@@ -528,85 +501,7 @@ class EmissionGUI:
         ax._smk_graticule_callback = _on_limits  # type: ignore[attr-defined]
         return artists
 
-    # ---- Simple config persistence for last-used paths ----
-    def _config_file(self) -> str:
-        cfg_dir = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('./'), '.config')
-        try:
-            os.makedirs(cfg_dir, exist_ok=True)
-        except Exception:
-            pass
-        return os.path.join(cfg_dir, 'smkgui_settings.json')
 
-    def _load_settings(self) -> dict:
-        """Load the entire settings dictionary from the JSON config file."""
-        return load_settings()
-
-    def _save_settings(self) -> None:
-        """Collect and save current GUI settings to the JSON config file."""
-        # Sync from widgets first to capture manual edits (prior to explicit load/preview)
-        current_input = self.inputfile_path
-        if hasattr(self, 'emis_entry'):
-            try:
-                val = self.emis_entry.get().strip()
-                if val: current_input = val
-            except Exception: pass
-            
-        current_griddesc = self.griddesc_path
-        if hasattr(self, 'griddesc_entry'):
-            try:
-                val = self.griddesc_entry.get().strip()
-                if val: current_griddesc = val
-            except Exception: pass
-            
-        current_counties = self.counties_path
-        if hasattr(self, 'county_entry'):
-            try:
-                val = self.county_entry.get().strip()
-                if val: current_counties = val
-            except Exception: pass
-
-        current_overlay = getattr(self, 'overlay_path', None)
-        if hasattr(self, 'overlay_entry'):
-            try:
-                val = self.overlay_entry.get().strip()
-                if val: current_overlay = val
-            except Exception: pass
-            
-        current_filter = getattr(self, 'filter_path', None)
-        if hasattr(self, 'filter_entry'):
-            try:
-                val = self.filter_entry.get().strip()
-                if val: current_filter = val
-            except Exception: pass
-
-        filter_opt = 'False'
-        if hasattr(self, 'filter_overlay_var'):
-            filter_opt = self.filter_overlay_var.get()
-
-        settings = {
-            'last_paths': {
-                'inputpath': current_input or '',
-                'griddesc': current_griddesc or '',
-                'counties': current_counties or '',
-                'overlay': current_overlay or '',
-                'filter_shapefile': current_filter or '',
-                'filter_shapefile_opt': filter_opt or 'False',
-                'filtered_by_overlay': (str(filter_opt).lower() != 'false'),
-            },
-            'ui_state': {
-                'scale': self.scale_var.get() if self.scale_var else 'linear',
-                'bins': self.class_bins_var.get() if self.class_bins_var else '',
-                'colormap': self.cmap_var.get() if self.cmap_var else 'jet',
-                'delimiter': self.delim_var.get() if self.delim_var else 'auto',
-                'custom_delimiter': self.custom_delim_var.get() if self.custom_delim_var else '',
-                'plot_by': self.plot_by_var.get() if self.plot_by_var else 'auto',
-                'projection': self.projection_var.get() if hasattr(self, 'projection_var') and self.projection_var else 'auto',
-                'grid_name': self.grid_name_var.get() if self.grid_name_var else '',
-                'scc_selection': self.scc_select_var.get() if self.scc_select_var else 'All SCC',
-                'zoom_to_data': self.zoom_var.get() if self.zoom_var else True,
-            }
-        }
-        save_settings(settings)
 
     def _set_status(self, message: str, level: Optional[str] = None) -> None:
         """Update the GUI status bar, collapsing whitespace and capping length."""
@@ -708,11 +603,7 @@ class EmissionGUI:
             pass
 
     def _on_close(self):
-        """Harden shutdown: save settings, close plots, and force exit."""
-        try:
-            self._save_settings()
-        except Exception:
-            pass
+        """Harden shutdown: close plots, and force exit."""
         try:
             # Close all matplotlib figures to release memory and resources
             plt.close('all')
@@ -728,10 +619,13 @@ class EmissionGUI:
         sys.exit(0)
 
     # ---- Unified notification / logging helper ----
-    def _notify(self, level: str, title: str, message: str, exc: Optional[Exception] = None, *, popup: bool = True):
+    def _notify(self, level: str, title: str, message: str, exc: Optional[Exception] = None, *, popup: Optional[bool] = None):
         """Log the message and show a GUI dialog (if Tk available). Levels: INFO, WARNING, ERROR.
         If an exception object is supplied, logs stack trace at ERROR level."""
         lvl = level.upper()
+        if popup is None:
+            # Default: Show popups for WARNING and ERROR, but NOT for INFO
+            popup = (lvl != 'INFO')
         if exc is not None and lvl == 'ERROR':
             logging.error("%s: %s", title, message, exc_info=exc)
         else:
@@ -932,8 +826,8 @@ class EmissionGUI:
         # Projection selection (Auto / WGS84 / LCC)
         self.proj_label = ttk.Label(btn_frame, text='Proj:')
         self.proj_label.grid(row=0, column=15, sticky='e', padx=(12,2)) # Was 11
-        self.projection_var = tk.StringVar(value='auto')
-        self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'auto', 'auto', 'wgs84', 'lcc')
+        self.projection_var = tk.StringVar(value='lcc')
+        self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'lcc', 'auto', 'wgs84', 'lcc')
         self.proj_menu_widget.grid(row=0, column=16, sticky='w') # Was 12
         # Bins and Colormap controls
         self.bins_label = ttk.Label(btn_frame, text='Bins:')
@@ -1093,10 +987,7 @@ class EmissionGUI:
         # Prefer directory of current/last SMKREPORT/FF10 if available
         init_dir = None
         try:
-            # Load fresh settings to get the most recent path
-            settings = load_settings()
-            last_smk = (settings.get('last_paths') or {}).get('inputpath')
-            cand = self.inputfile_path or last_smk
+            cand = self.inputfile_path
             if cand and os.path.exists(cand):
                 init = os.path.dirname(cand)
                 if os.path.isdir(init):
@@ -1268,7 +1159,6 @@ class EmissionGUI:
 
     def _apply_json_snapshot_defaults(self) -> None:
         
-        print(self._json_arguments)
         
         if not self._json_arguments:
             return
@@ -1288,11 +1178,7 @@ class EmissionGUI:
             self._source_type = None
         self._ff10_ready = bool(self._source_type == 'ff10_point')
 
-        try:
-            if self.inputfile_path:
-                self._save_settings()
-        except Exception:
-            pass
+        # No-op: Path persistence disabled
 
         if self._ff10_ready and self.grid_gdf is not None:
             self._ensure_ff10_grid_mapping()
@@ -1300,6 +1186,8 @@ class EmissionGUI:
         self._update_scc_widgets(scc_data=scc_data)
 
         self.pollutants = detect_pollutants(self.emissions_df)
+        if not self.pollutants and isinstance(self.emissions_df, pd.DataFrame):
+            self.pollutants = self.emissions_df.attrs.get('available_pollutants', [])
         try:
             self.units_map = dict(self.emissions_df.attrs.get('units_map', {}))
         except Exception:
@@ -1307,6 +1195,9 @@ class EmissionGUI:
         if not self.pollutants:
             self._notify('WARNING', 'No Pollutants', 'No pollutant columns detected.')
             return
+
+        # Sort pollutants alphabetically for easier navigation
+        self.pollutants = sorted(self.pollutants, key=lambda s: s.lower())
 
         menu = self.pollutant_menu["menu"]
         try:
@@ -1487,13 +1378,16 @@ class EmissionGUI:
                         flter_end=self.filter_end,
                         flter_val=self.filter_values,
                         notify=safe_notify,
-                        ncf_params=ncf_params
+                        ncf_params=ncf_params,
+                        lazy=True
                     )
+                    if isinstance(emissions_df, pd.DataFrame):
+                        emissions_df.attrs['ncf_params'] = ncf_params
 
                     # Build FIPS to ensure compatibility and consistent attributes
                     if isinstance(emissions_df, pd.DataFrame):
                         try:
-                            is_ncf = isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc'))
+                            is_ncf = isinstance(f_input, str) and is_netcdf_file(f_input)
                             emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
                         except ValueError:
                             # Ignore if FIPS columns not found (e.g. gridded data without region_cd)
@@ -1511,7 +1405,7 @@ class EmissionGUI:
                         emissions_df.attrs['units_map'] = existing_map
 
                     # NCF Auto-Grid Logic
-                    if isinstance(f_input, str) and (f_input.lower().endswith('.ncf') or f_input.lower().endswith('.nc')):
+                    if isinstance(f_input, str) and is_netcdf_file(f_input):
                         try:
                             # Lazy import
                             from ncf_processing import create_ncf_domain_gdf, read_ncf_grid_params, get_ncf_dims, read_ncf_emissions
@@ -1609,10 +1503,16 @@ class EmissionGUI:
                             
                             # Re-read emissions with specific params
                             # Note: read_inputfile called read_ncf_emissions default inside data_processing.
-                            # We need to re-call it here to apply params, updating emissions_df
+                            # We update to use lazy skeleton logic by default
                             msg = f"Reading NetCDF (Layer: {curr_lay_str or 'Layer 1'}, Time: {curr_ts_str or 'Average'})..."
                             safe_notify('INFO', msg)
-                            emissions_df = read_ncf_emissions(f_input, layer_idx=l_idx, tstep_idx=ts_idx, layer_op=l_op, tstep_op=ts_op)
+                            # Pass existing xr_ds if available
+                            old_ds = getattr(emissions_df, 'attrs', {}).get('_smk_xr_ds')
+                            emissions_df = read_ncf_emissions(f_input, layer_idx=l_idx, tstep_idx=ts_idx, layer_op=l_op, tstep_op=ts_op, xr_ds=old_ds, lazy=True)
+                            # Record current params for future lazy fetches
+                            emissions_df.attrs['ncf_params'] = {
+                                'layer_idx': l_idx, 'tstep_idx': ts_idx, 'layer_op': l_op, 'tstep_op': ts_op
+                            }
                             # Update raw_df too for consistency
                             raw_df = emissions_df
                             
@@ -1672,7 +1572,7 @@ class EmissionGUI:
                             if len(rcols) > 0:
                                 raw_df[rcols] = raw_df[rcols].fillna(fill_num)
                     except Exception as e:
-                        print(f"Fill NaN error: {e}")
+                        logging.warning(f"Fill NaN error: {e}")
 
                 self.emissions_df = emissions_df
                 self.raw_df = raw_df
@@ -1755,7 +1655,7 @@ class EmissionGUI:
             pass
 
     def load_griddesc(self):
-        if not self.griddesc_path:
+        if not self.griddesc_path or self.griddesc_path == "(NetCDF Attributes)":
             self.grid_gdf = None
             try:
                 menu = self.grid_name_menu["menu"]
@@ -1767,7 +1667,7 @@ class EmissionGUI:
             return
         self._ff10_grid_ready = False
         try:
-            grid_names = extract_grid(self.griddesc_path, grid_id=None)
+            grid_names = sorted(extract_grid(self.griddesc_path, grid_id=None), key=lambda s: s.lower())
             menu = self.grid_name_menu["menu"]
             menu.delete(0, "end")
             for name in grid_names:
@@ -1802,11 +1702,7 @@ class EmissionGUI:
     def load_shpfile(self):
         try:
             self.counties_gdf = read_shpfile(self.counties_path, True)
-            # Save updated path on successful load
-            try:
-                self._save_settings()
-            except Exception:
-                pass
+            # Path persistence disabled
             self._invalidate_merge_cache()
         except Exception as e:
             self._notify('ERROR', 'Counties Load Error', str(e), exc=e)
@@ -1886,7 +1782,7 @@ class EmissionGUI:
         self.load_overlay()
 
 
-    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None) -> Optional[gpd.GeoDataFrame]:
+    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None) -> Optional[gpd.GeoDataFrame]:
         if self.emissions_df is None:
             return None
 
@@ -1975,6 +1871,7 @@ class EmissionGUI:
             id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
             sel_code if use_scc_filter else '',
             pol_tuple,
+            pollutant or '',
             getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
             getattr(self, 'fill_nan_arg', None),
             # Filter overlay state
@@ -2000,11 +1897,37 @@ class EmissionGUI:
                 pass
             return merged_view
 
-        emis_for_merge: Optional[pd.DataFrame]
         emis_for_merge = self.emissions_df if isinstance(self.emissions_df, pd.DataFrame) else None
         if emis_for_merge is None:
             _do_notify('ERROR', 'No Emissions Data', 'Emissions dataset is not loaded or invalid.')
             return None
+
+        # ON-DEMAND LAZY NETCDF FETCH:
+        # If the requested pollutant is in the NetCDF variables but not in the DataFrame yet
+        target_pol = pollutant if pollutant else (self.pollutant_var.get() if hasattr(self, 'pollutant_var') else None)
+        if target_pol and target_pol not in emis_for_merge.columns:
+                ds = emis_for_merge.attrs.get('_smk_xr_ds')
+                if ds is not None:
+                    _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
+                    try:
+                        from ncf_processing import read_ncf_emissions
+                        ncf_params = emis_for_merge.attrs.get('ncf_params', {})
+                        # Re-read just this pollutant using the cached xarray handle
+                        new_data = read_ncf_emissions(
+                            self.inputfile_path, 
+                            pollutants=[target_pol], 
+                            xr_ds=ds, 
+                            **ncf_params
+                        )
+                        if target_pol in new_data.columns:
+                            # Cache it in the main dataframe so we don't fetch it again
+                            emis_for_merge[target_pol] = new_data[target_pol].values
+                            # Also update units_map if missing
+                            if target_pol not in self.units_map:
+                                v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
+                                self.units_map[target_pol] = v_meta.get('units', '')
+                    except Exception as e:
+                        _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
 
         raw_df_for_scc = None
         if use_scc_filter and isinstance(self.raw_df, pd.DataFrame):
@@ -2088,6 +2011,11 @@ class EmissionGUI:
                 sort=False,
                 copy_geometry=False,
             )
+            # Propagate attributes from emissions and geometry
+            if hasattr(merged, 'attrs'):
+                for src in [emis_for_merge, base_gdf]:
+                    if hasattr(src, 'attrs'):
+                        merged.attrs.update(src.attrs)
         except Exception as exc:
             _do_notify('ERROR', 'Geometry Merge Failed', str(exc), exc=exc)
             return None
@@ -2132,7 +2060,7 @@ class EmissionGUI:
                     if cols_to_fill:
                             merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_val)
         except Exception as e:
-            print(f"Error filling NaNs in merged geometry: {e}")
+            logging.warning(f"Error filling NaNs in merged geometry: {e}")
 
         # Filter by Filter Shapefile if enabled (new logic with backward compatibility)
         try:
@@ -2221,11 +2149,48 @@ class EmissionGUI:
                 base = f"x={x:.4f}, y={y:.4f}"
             try:
                 pt = Point(x, y)
-                if sindex is not None:
-                    cand_idx = list(sindex.intersection((x, y, x, y)))
-                else:
-                    # Fallback to brute-force if no sindex
-                    cand_idx = range(len(gdf))
+                cand_idx = []
+                
+                # OPTIMIZATION: High-speed grid math for large datasets
+                # This bypasses expensive SIndex intersection for 100k+ polygons
+                info = getattr(gdf, 'attrs', {}).get('_smk_grid_info')
+                if info and 'ROW' in gdf.columns:
+                    try:
+                        # 1. Coordinate to Native Grid space (e.g. LCC)
+                        native_crs_str = info.get('proj_str')
+                        lookup_x, lookup_y = x, y
+                        
+                        if native_crs_str:
+                            try:
+                                import pyproj
+                                native_crs = pyproj.CRS.from_user_input(native_crs_str)
+                                # The Axes CRS is recorded by the plotter
+                                axes_crs = getattr(target_ax, '_smk_ax_crs', None) or getattr(gdf, 'crs', None)
+                                
+                                if axes_crs is not None and not native_crs.equals(axes_crs):
+                                    if not hasattr(target_ax, '_hover_lookup_transformer'):
+                                        target_ax._hover_lookup_transformer = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
+                                    lookup_x, lookup_y = target_ax._hover_lookup_transformer.transform(x, y)
+                            except Exception: pass
+                        
+                        # 2. Native space to Row/Col (1-based)
+                        col_look = int(np.floor((lookup_x - info['xorig']) / info['xcell'])) + 1
+                        row_look = int(np.floor((lookup_y - info['yorig']) / info['ycell'])) + 1
+                        
+                        # 3. Fast lookup in GDF
+                        # Identify candidate index based on Row/Col
+                        matches = gdf.index[(gdf['ROW'] == row_look) & (gdf['COL'] == col_look)].tolist()
+                        if matches:
+                            cand_idx = matches
+                    except Exception: cand_idx = []
+                
+                # FALLBACK: Use Spatial Index (Intersection) if math failed or no match
+                if not cand_idx:
+                    if sindex is not None:
+                        cand_idx = list(sindex.intersection((x, y, x, y)))
+                    else:
+                        cand_idx = range(len(gdf))
+
                 best_parts = None
                 best_val = -1.0
                 
@@ -2523,7 +2488,8 @@ class EmissionGUI:
                     plot_by_mode=plot_by_mode, 
                     scc_selection=scc_selection, 
                     scc_code_map=scc_code_map,
-                    notify=safe_notify
+                    notify=safe_notify,
+                    pollutant=pollutant
                 )
             except ValueError as ve:
                 if str(ve) == "Handled":
@@ -2541,9 +2507,9 @@ class EmissionGUI:
             plot_crs, tf_fwd, tf_inv = plot_crs_info
             try:
                 merged_plot = merged.to_crs(plot_crs) if plot_crs is not None and getattr(merged, 'crs', None) is not None else merged
-                # Ensure attributes needed for time series (stack_groups_path) are preserved
+                # Ensure attributes needed for time series and QuadMesh are preserved
                 if getattr(merged, 'attrs', None) and getattr(merged_plot, 'attrs', None) is not None:
-                    for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path']:
+                    for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path', '_smk_grid_info', '_smk_is_native']:
                         if k in merged.attrs:
                                 merged_plot.attrs[k] = merged.attrs[k]
             except Exception:
@@ -2568,8 +2534,7 @@ class EmissionGUI:
         self._enable_plot_btn()
         self._set_status("Rendering plot...", level="INFO")
         _log_time("Plot initialization")
-        # Save current settings on successful plot generation
-        self._save_settings()
+        # Persistence disabled
 
         # Lazy import for embedding
         from matplotlib.figure import Figure
@@ -3162,7 +3127,7 @@ class EmissionGUI:
             # Check if source is NetCDF
             src_type = attrs.get('source_type')
             is_ncf_source = (src_type == 'gridded_netcdf') or \
-                            (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
+                            is_netcdf_file(self.inputfile_path) or \
                             ('proxy_ncf_path' in attrs)
             
             if is_ncf_source:
@@ -3196,7 +3161,7 @@ class EmissionGUI:
         try:
             src_type = attrs.get('source_type')
             is_ncf_source = (src_type == 'gridded_netcdf') or \
-                            (self.inputfile_path and self.inputfile_path.lower().endswith(('.ncf', '.nc'))) or \
+                            is_netcdf_file(self.inputfile_path) or \
                             ('proxy_ncf_path' in attrs)
         except Exception:
             pass
@@ -3737,18 +3702,44 @@ class EmissionGUI:
                     pt = Point(x, y)
                      
                     target = None
-                    # Optimization: use sindex
-                    if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                        cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                        for idx in cands:
-                            row = merged_plot.iloc[idx]
-                            if row.geometry.contains(pt):
-                                target = row
-                                break
-                    else:
-                        matches = merged_plot[merged_plot.intersects(pt)]
-                        if not matches.empty:
-                            target = matches.iloc[0]
+                    # OPTIMIZATION: High-speed grid math check
+                    info = getattr(merged_plot, 'attrs', {}).get('_smk_grid_info')
+                    if info and 'ROW' in merged_plot.columns:
+                        try:
+                            lx, ly = x, y
+                            # Transform click to native space if needed
+                            native_crs_str = info.get('proj_str')
+                            if native_crs_str:
+                                import pyproj
+                                native_crs = pyproj.CRS.from_user_input(native_crs_str)
+                                axes_crs = getattr(local_ax, '_smk_ax_crs', None) or getattr(merged_plot, 'crs', None)
+                                if axes_crs is not None and not native_crs.equals(axes_crs):
+                                    if not hasattr(local_ax, '_click_lookup_transformer'):
+                                        local_ax._click_lookup_transformer = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
+                                    lx, ly = local_ax._click_lookup_transformer.transform(x, y)
+                            
+                            c_look = int(np.floor((lx - info['xorig']) / info['xcell'])) + 1
+                            r_look = int(np.floor((ly - info['yorig']) / info['ycell'])) + 1
+                            
+                            # Lookup
+                            matches = merged_plot[(merged_plot['ROW'] == r_look) & (merged_plot['COL'] == c_look)]
+                            if not matches.empty:
+                                target = matches.iloc[0]
+                        except Exception: target = None
+                    
+                    if target is None:
+                        # FALLBACK: Spatial lookup
+                        if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
+                            cands = list(merged_plot.sindex.intersection((x, y, x, y)))
+                            for idx in cands:
+                                row = merged_plot.iloc[idx]
+                                if row.geometry.contains(pt):
+                                    target = row
+                                    break
+                        else:
+                            matches = merged_plot[merged_plot.intersects(pt)]
+                            if not matches.empty:
+                                target = matches.iloc[0]
                          
                     if target is None: return
 
@@ -3811,7 +3802,7 @@ class EmissionGUI:
                         self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
                      
                 except Exception as e:
-                    print(f"Click handler failed: {e}")
+                    logging.error(f"Click handler failed: {e}")
              
             ts_click_handler = _on_click
 

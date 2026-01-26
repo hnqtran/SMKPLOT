@@ -154,7 +154,7 @@ def parse_args():
     ap.add_argument('--gridname', help='Name of the grid in GRIDDESC (for batch grid plotting).')
     ap.add_argument('--pltyp', choices=['county', 'grid'], default='county', help='Plot by county or grid (batch mode). Default: county.')
     ap.add_argument('--force-lcc', action='store_true', help='Force legacy CONUS LCC projection in batch mode even without GRIDDESC (deprecated behavior).')
-    ap.add_argument('--projection', choices=['auto','wgs84','lcc'], default='auto', help='Projection mode: auto (if gridname provided, use grid projection; else WGS84), wgs84 (always geographic), lcc (always LCC; grid-specific if grid provided else default CONUS).')
+    ap.add_argument('--projection', choices=['auto','wgs84','lcc'], default='lcc', help='Projection mode: auto (if gridname provided, use grid projection; else WGS84), wgs84 (always geographic), lcc (always LCC; grid-specific if grid provided else default CONUS).')
     ap.add_argument('--pollutant', help='Pollutant(s) to plot (batch mode or to preselect in GUI). Separate multiple values with comma or space.')
     ap.add_argument('--zoom-to-data', action='store_true', help='In batch mode, limit map extent to data (non-zero pollutant cells) with small padding.')
     ap.add_argument('--zoom-pad', type=float, default=0.02, help='Padding fraction to apply around data extent when using --zoom-to-data (default 0.02 = 2%%).')

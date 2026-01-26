@@ -36,8 +36,8 @@ arguments:
   # --- Plot Aesthetics ---
   county_shapefile: /proj/ie/proj/staff/tranhuy/python/GIS/tl_2020_us_county_CONUS.gpkg # Path to county boundary shapefile
   overlay_shapefile: 
-  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/Permian_Basin_Extent.gpkg
-  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/SanJuan_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/GIS/Permian_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/GIS/SanJuan_Basin_Extent.gpkg
 
   cmap: "viridis"
   log_scale: true

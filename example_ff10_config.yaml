@@ -9,8 +9,8 @@ arguments:
   delim: null
   county_shapefile: /proj/ie/proj/staff/tranhuy/python/GIS/tl_2020_us_county_CONUS.gpkg # Path to county boundary shapefile
   overlay_shapefile: 
-  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/Permian_Basin_Extent.gpkg
-  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/SanJuan_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/GIS/Permian_Basin_Extent.gpkg
+  - /proj/ie/proj/Wellcome-Methane/utils/tranhuy/inputs/GIS/SanJuan_Basin_Extent.gpkg
   griddesc: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/griddesc_simplified.txt
   gridname: 12US1_459X299
   pltyp: county
@@ -23,7 +23,7 @@ arguments:
   cmap: jet
   fill_nan: 0.0
   workers: 0
-  outdir: /proj/ie/proj/Wellcome-Methane/utils/tranhuy/outputs
+  outdir: ./outputs
   log_scale: true
   export_csv: true
   run_mode: batch

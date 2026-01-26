@@ -194,6 +194,71 @@ def _zoom_to_extent(ax: plt.Axes, gdf, column: str, zoom_pad: float):
         pass
 
 
+def _draw_gridded_mesh(gdf: gpd.GeoDataFrame, column: str, ax: plt.Axes, plot_kwargs: Dict[str, Any], target_crs=None):
+    """Draw a large grid using QuadMesh (pcolormesh) for high performance."""
+    info = gdf.attrs.get('_smk_grid_info')
+    if not info:
+        return None
+        
+    try:
+        # 1. Reconstruct corners in native space
+        nx = int(info['ncols'])
+        ny = int(info['nrows'])
+        
+        # Grid dimensions safety
+        if nx <= 0 or ny <= 0 or nx * ny > 20_000_000:
+            return None
+            
+        x_edges = info['xorig'] + np.arange(nx + 1, dtype=np.float64) * info['xcell']
+        y_edges = info['yorig'] + np.arange(ny + 1, dtype=np.float64) * info['ycell']
+        XX, YY = np.meshgrid(x_edges, y_edges)
+        
+        # 2. Transform to plot CRS
+        p_str = info.get('proj_str')
+        if not p_str:
+            return None
+            
+        native_crs = pyproj.CRS.from_user_input(p_str)
+        actual_target_crs = target_crs or (gdf.crs if hasattr(gdf, 'crs') else None)
+        
+        if actual_target_crs and not native_crs.equals(actual_target_crs):
+            transformer = pyproj.Transformer.from_crs(native_crs, actual_target_crs, always_xy=True)
+            XP, YP = transformer.transform(XX, YY)
+        else:
+            XP, YP = XX, YY
+            
+        # 3. Construct 2D data array
+        C = np.full((ny, nx), np.nan, dtype=np.float32)
+        
+        # Determine R/C column names (handle potential join suffixes)
+        r_col = next((c for c in gdf.columns if c.startswith('ROW')), 'ROW')
+        c_col = next((c for c in gdf.columns if c.startswith('COL')), 'COL')
+        
+        # Efficient assignment
+        r_idx = gdf[r_col].values.astype(int) - 1
+        c_idx = gdf[c_col].values.astype(int) - 1
+        
+        # Clip indices for safety
+        valid = (r_idx >= 0) & (r_idx < ny) & (c_idx >= 0) & (c_idx < nx)
+        C[r_idx[valid], c_idx[valid]] = gdf[column].values[valid]
+        
+        # 4. Use pcolormesh
+        mesh = ax.pcolormesh(
+            XP, YP, C,
+            cmap=plot_kwargs.get('cmap'),
+            norm=plot_kwargs.get('norm'),
+            shading='flat',
+            zorder=plot_kwargs.get('zorder', 1),
+            edgecolors='none',
+            linewidth=0,
+            antialiased=False
+        )
+        return mesh
+    except Exception as e:
+        logging.debug(f"QuadMesh generation error: {e}")
+        return None
+
+
 def create_map_plot(
     gdf: gpd.GeoDataFrame,
     column: str,
@@ -226,10 +291,37 @@ def create_map_plot(
     # 3. Plot Data
     collection = None
     try:
-        # GeoPandas plot returns the axes, but assumes collection is added
-        gdf.plot(**plot_kwargs)
-        if ax.collections:
-            collection = ax.collections[-1]
+        # Optimization: Use QuadMesh (pcolormesh) for large regular grids
+        info = gdf.attrs.get('_smk_grid_info')
+        if len(gdf) > 10000:
+            if not info:
+                logging.info(f"QuadMesh skipped: No _smk_grid_info attribute found in GDF (Size: {len(gdf)}).")
+            else:
+                try:
+                    collection = _draw_gridded_mesh(gdf, column, ax, plot_kwargs, target_crs=crs_proj)
+                    if collection:
+                        logging.info(f"Using Optimized QuadMesh for {len(gdf)} cells.")
+                    else:
+                        logging.warning("QuadMesh function returned None.")
+                except Exception as qe:
+                    logging.warning(f"QuadMesh optimization failed: {qe}")
+                    collection = None
+
+        if collection is None:
+            # Fallback to standard GeoPandas (Vector) plot
+            gdf.plot(**plot_kwargs)
+            if ax.collections:
+                collection = ax.collections[-1]
+        elif plot_kwargs.get('legend'):
+            # Manual colorbar for QuadMesh optimization
+            try:
+                from mpl_toolkits.axes_grid1 import make_axes_locatable
+                divider = make_axes_locatable(ax)
+                cax = divider.append_axes("right", size="2%", pad=0.1)
+                plt.colorbar(collection, cax=cax)
+                cax.set_label('<colorbar>')
+            except Exception as e:
+                logging.debug("Failed to add manual colorbar: %s", e)
     except Exception as e:
         logging.error("Map plotting failed for column '%s': %s", column, e)
         return None
@@ -260,6 +352,9 @@ def create_map_plot(
     # 6. Graticule (Draw AFTER zoom to ensure grid matches visible extent)
     if crs_proj is not None and tf_fwd and tf_inv:
         _draw_graticule(ax, tf_fwd, tf_inv, lon_step=None, lat_step=None)
+
+    # Preserve the actual CRS used for the axes so hover/click handlers know how to transform coordinates.
+    ax._smk_ax_crs = crs_proj if crs_proj is not None else (gdf.crs if hasattr(gdf, 'crs') else None)
     return collection
 
 

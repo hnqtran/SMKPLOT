@@ -15,7 +15,6 @@
 ##############################################################################
 """
 
-import io
 import os, sys
 import re
 import warnings
@@ -23,7 +22,6 @@ import warnings
 _CLEAN_NAME_QUOTE_RE = re.compile(r"['`,]")
 _CLEAN_NAME_WHITESPACE_RE = re.compile(r"\s+")
 _GRIDDESC_SPLIT_RE = re.compile(r',\s*|\s+')
-from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional, Sequence, Dict, List, Any, Union, Tuple, Set
 
@@ -59,7 +57,7 @@ from config import (
     EMIS_COLS, SCC_COLS, POL_COLS, LAT_COLS, LON_COLS, COUNTRY_CODE_MAPPINGS,
     TRIBAL_TO_COUNTY_FIPS
 )
-from utils import normalize_delim, coerce_merge_key
+from utils import normalize_delim, coerce_merge_key, is_netcdf_file
 
 def _spatial_filter_chunk(gdf_chunk: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
     """Helper for parallel spatial filtering."""
@@ -145,42 +143,10 @@ def apply_spatial_filter(gdf: gpd.GeoDataFrame, overlay: gpd.GeoDataFrame, mode:
     except Exception:
         pass  # CRS conversion failed, proceed with original CRS
 
-    # Parallelize for large datasets
-    # NOTE: Multiprocessing is currently disabled for spatial filtering to ensure 
-    # stability against pickling overhead with GeoDataFrames. Sequential processing 
-    # is verified as efficient for standard datasets.
-    max_workers = 1 
-    if len(gdf) > 1000000 and max_workers > 1: # Increased threshold to basically disable it unless forced
-        logging.info(f"Applying spatial filter '{mode}' on {len(gdf)} features using {max_workers} workers...")
-        
-        # Split into chunks manually to avoid numpy deprecated 'swapaxes' warning
-        chunk_size = int(np.ceil(len(gdf) / max_workers))
-        chunks = [gdf.iloc[i : i + chunk_size] for i in range(0, len(gdf), chunk_size)]
-        
-        # Process chunks
-        results = []
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(_spatial_filter_chunk, chunk, overlay, mode)
-                for chunk in chunks
-            ]
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
-                    if not res.empty:
-                        results.append(res)
-                except Exception as e:
-                    logging.warning(f"Parallel spatial filter chunk failed: {e}")
-                    
-        if results:
-            # Combine results. 'ignore_index' depends on whether clipped mode created new geometries.
-            return pd.concat(results, ignore_index=(mode == 'clipped'))
-        else:
-            # Return empty GDF with same columns/crs
-            return gdf.iloc[:0]
-
-    # Sequential fallback for small data
+    # Sequential processing is verified as efficient for standard datasets.
+    logging.info(f"Applying spatial filter '{mode}' on {len(gdf)} features...")
     return _spatial_filter_chunk(gdf, overlay, mode)
+
 
 
 
@@ -737,6 +703,7 @@ def read_inputfile(
     notify: Optional[Callable[[str, str], None]] = None,
     return_raw: bool = True,
     ncf_params: Optional[Dict[str, Any]] = None,
+    lazy: bool = False,
 ):
     """Check file format identifier to select appropriate parser.
     Rules:
@@ -744,21 +711,28 @@ def read_inputfile(
         * If 1st line has #LIST, treat as list file of multiple FF10 files
         * else, treat as smkreport and call read_smkreport().
     """
-    # NetCDF Support
-    if isinstance(fpath, str) and (fpath.lower().endswith('.ncf') or fpath.lower().endswith('.nc')):
+    # NetCDF Support: Improved detection using magic numbers
+    is_ncf = False
+    if isinstance(fpath, str):
+        if is_netcdf_file(fpath):
+            is_ncf = True
+        elif fpath.lower().endswith(('.ncf', '.nc')):
+            # Fallback for empty/unreadable files with ncf extension
+            is_ncf = True
+
+    if is_ncf:
         try:
             # Lazy import to avoid circular dependency
             from ncf_processing import read_ncf_emissions
-            _emit_user_message(notify, 'INFO', "Detected NetCDF extension. Reading as IOAPI NetCDF...")
+            _emit_user_message(notify, 'INFO', "Detected NetCDF binary format. Reading as IOAPI NetCDF...")
             
             # Prepare optional args
             kwargs = {}
             if ncf_params:
                 kwargs.update(ncf_params)
             
-            # Detect implicit pollutants? read_ncf_emissions handles that.
             # We don't support filtering inside read_ncf yet, but we can filter after.
-            result_df = read_ncf_emissions(fpath, notify=notify, **kwargs)
+            result_df = read_ncf_emissions(fpath, notify=notify, lazy=lazy, **kwargs)
             
             # Apply sector/source_type metadata if possible
             if sector:
@@ -798,7 +772,8 @@ def read_inputfile(
                     d, r = read_inputfile(
                         p, sector, delim, skiprows, comment, encoding, header_last, 
                         flter_col, flter_start, flter_end, flter_val, notify,
-                        return_raw=return_raw
+                        return_raw=return_raw,
+                        lazy=lazy
                     )
                     if d is not None:
                         dfs.append(d)
@@ -821,7 +796,9 @@ def read_inputfile(
                         read_inputfile,
                         p, sector, delim, skiprows, comment, encoding, header_last,
                         flter_col, flter_start, flter_end, flter_val, None, # notify cannot be passed
-                        return_raw
+                        return_raw,
+                        None, # ncf_params
+                        lazy
                     )
                     futures[fut] = p
                 
@@ -1589,7 +1566,8 @@ def read_smkreport(
             mean_cnt = sum(nonzero) / len(nonzero)
             variance = sum((x - mean_cnt)**2 for x in nonzero) / len(nonzero)
             stability = 1.0 / (1.0 + variance)
-            penalty = 0.6 if c == ' ' else 1.0
+            # Higher penalty for space as it often appears in description text
+            penalty = 0.4 if c == ' ' else 1.0
             scores[c] = coverage * stability * mean_cnt * penalty
         if scores:
             best = max(scores.items(), key=lambda kv: kv[1])
@@ -1735,18 +1713,24 @@ def read_smkreport(
     if 'fips' not in lower_map and 'region_cd' not in lower_map:
         county_col = lower_map.get('county') or lower_map.get('# county') or lower_map.get('#county')
         if county_col:
-            # Check if it looks like a composite column (contains spaces)
+            # Check if it looks like a composite column (e.g. "2022001 01001 Alabama Autauga Co")
+            # Heuristic: must have at least 4 tokens and one should look like a 5-7 digit FIPS
             sample = df[county_col].astype(str).iloc[0] if not df.empty else ''
-            if ' ' in sample:
+            tokens = sample.split()
+            if len(tokens) >= 4:
                 try:
-                    # Extract the second token (FIPS)
-                    # Assuming format: Date FIPS State County...
-                    extracted = df[county_col].astype(str).str.split(n=2).str[1]
-                    # Clean to 6 digits (consistent with program-wide FIPS handling)
-                    # Remove non-digits just in case
-                    digits = extracted.str.replace(r'\D', '', regex=True)
-                    # Take last 6 digits (or pad to 6)
-                    df['FIPS'] = digits.str[-6:].str.zfill(6)
+                    # Look for 5-7 digit numeric token
+                    f_token = None
+                    for t in tokens:
+                        t_clean = re.sub(r'\D', '', t)
+                        if 5 <= len(t_clean) <= 7:
+                            f_token = t_clean
+                            break
+                    
+                    if f_token:
+                        df['FIPS'] = f_token.zfill(6)
+                    else:
+                        logging.debug(f"Skipping composite County fix: no FIPS-like token found in '{sample}'")
                 except Exception:
                     pass
 
@@ -1886,7 +1870,6 @@ def _load_shapefile(path: str, get_fips: bool, _signature: Tuple[str, Optional[i
     got_FIPS = False
     if geoid_col:
         lengths = gdf[geoid_col].astype('string').str.strip().str.len()
-        #print(lengths.describe())  # min, max, etc.
         geoid_stats = lengths.describe()
         max_len = int(geoid_stats['max'])
         min_len = int(geoid_stats['min'])
@@ -2287,7 +2270,7 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
         pts = pts.to_crs(grid_subset.crs)
 
     if verbose:
-        print(f"Mapping {len(coords)} locations to grid (single-process)...")
+        logging.info(f"Mapping {len(coords)} locations to grid (single-process)...")
 
     # Perform Spatial Join
     # sjoin with predicate='within' is efficient with rtree
@@ -2316,9 +2299,15 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
 
 def detect_pollutants(df: pd.DataFrame) -> List[str]:
     try:
-        cached = df.attrs.get('_detected_pollutants')  # type: ignore[attr-defined]
+        # Priority 1: Specifically cached list (internal)
+        cached = df.attrs.get('_detected_pollutants')
         if isinstance(cached, (list, tuple)):
             return list(cached)
+        
+        # Priority 2: Lazy loader pre-identified list
+        lazy_pols = df.attrs.get('available_pollutants')
+        if isinstance(lazy_pols, (list, tuple)) and lazy_pols:
+            return list(lazy_pols)
     except Exception:
         pass
     # Exclude grid identifiers as well
@@ -2396,7 +2385,9 @@ def remap_tribal_fips(df: pd.DataFrame, fips_col: str = 'FIPS') -> pd.DataFrame:
                 remapping_found = True
             
             target_col = fips_col if has_fips else context_col
-            df.loc[mask, target_col] = mapped[mask]
+            # Update values and ensure consistent string dtypes to avoid mixed-type inference
+            # that triggers FutureWarning: Index.insert with object-dtype.
+            df.loc[mask, target_col] = mapped[mask].astype(str)
             logging.info(f"Remapped {mask.sum()} tribal records from '{context_col}' to county FIPS in '{target_col}'")
 
     return df
@@ -2405,11 +2396,11 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
     # Step 1: Remap tribal codes if they exist in FIPS or tribal_code columns
     df = remap_tribal_fips(df, 'FIPS')
     
-    # Skip recalculation if FIPS column already exists
-    if 'FIPS' in df.columns:
-        if verbose:
-            print("FIPS column exists. Skip checking for statefp and countyfp columns to build FIPS")
-        return df
+    # If FIPS column exists, we might still want to normalize it or ensure it's 6 digits.
+    # However, if it's already there and seems to be the right length/format, we can skip heavy rebuilds.
+    # For now, let's remove the aggressive early return to ensure normalization happens if needed.
+    # We will only skip if FIPS is already 6-digit strings on average.
+    pass
 
     # Find region_cd column if df
     region_col = _check_column_in_df(df, REGION_COLS, warn=False)
@@ -2425,7 +2416,7 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
             country_col = _check_column_in_df(df, COUNTRY_COLS, warn=False)
             if country_col:
                 if verbose:
-                    print(f"Building FIPS by affixing country code from column {country_col} to region_cd column {region_col}")
+                    logging.info(f"Building FIPS by affixing country code from column {country_col} to region_cd column {region_col}")
                 ## Map country code value from COUNTRY_CODE_MAPPINGS dict to new column df[country_id]
                 country_codes = (
                     df[country_col]
@@ -2448,12 +2439,10 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
                     pass
             
             fips_suffix = s_region.str.strip().str.zfill(5)
-            # Use concat to avoid PerformanceWarning: DataFrame is highly fragmented
-            original_attrs = df.attrs.copy()
-            if 'FIPS' in df.columns:
-                df = df.drop(columns=['FIPS'])
-            df = pd.concat([df, (country_codes + fips_suffix).rename('FIPS')], axis=1)
-            df.attrs = original_attrs
+            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
+            # then assign directly to avoids FutureWarning: Index.insert.
+            df = df.copy()
+            df['FIPS'] = country_codes + fips_suffix
         else:
             # Ensure robust string conversion
             s_region = df[region_col].astype(str)
@@ -2463,12 +2452,10 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
                 except Exception:
                     pass
             
-            # Use concat to avoid PerformanceWarning
-            original_attrs = df.attrs.copy()
-            if 'FIPS' in df.columns:
-                df = df.drop(columns=['FIPS'])
-            df = pd.concat([df, s_region.str.zfill(6).rename('FIPS')], axis=1)
-            df.attrs = original_attrs
+            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
+            # then assign directly to avoids FutureWarning: Index.insert.
+            df = df.copy()
+            df['FIPS'] = s_region.str.zfill(6)
         
         return df
     else:
@@ -2480,10 +2467,10 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
         if statefp_col and countyfp_col:
             original_attrs = df.attrs.copy()
             new_fips = '0' + df[statefp_col].astype(str).str.zfill(2) + df[countyfp_col].astype(str).str.zfill(3)
-            if 'FIPS' in df.columns:
-                df = df.drop(columns=['FIPS'])
-            df = pd.concat([df, new_fips.rename('FIPS')], axis=1)
-            df.attrs = original_attrs
+            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
+            # then assign directly to avoids FutureWarning: Index.insert.
+            df = df.copy()
+            df['FIPS'] = new_fips
 
     # Final pass: Remap tribal codes in the newly built or existing FIPS column
     if 'FIPS' in df.columns:

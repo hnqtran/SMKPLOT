@@ -70,7 +70,7 @@ from data_processing import (
     filter_dataframe_by_values,
     apply_spatial_filter
 )
-from utils import safe_sector_slug, serialize_attrs, normalize_delim, coerce_merge_key
+from utils import safe_sector_slug, serialize_attrs, normalize_delim, coerce_merge_key, is_netcdf_file
 
 from plotting import _draw_graticule, create_map_plot
 
@@ -652,10 +652,13 @@ def _batch_mode(args):
     input_basename = start_sector or json_sector or (os.path.basename(resolved_files[0]) if resolved_files else 'output')
     input_basename_var = input_basename  # Assign to nonlocal variable for _finish closure
 
-    # Detect NetCDF input
+    # Detect NetCDF input: Use signature check + fallback to extension
     is_ncf_input = False
-    if resolved_files and resolved_files[0].lower().endswith(('.nc', '.ncf')):
-        is_ncf_input = True
+    if resolved_files:
+        if is_netcdf_file(resolved_files[0]):
+            is_ncf_input = True
+        elif resolved_files[0].lower().endswith(('.nc', '.ncf')):
+            is_ncf_input = True
 
     # Validate inputs based on plot type
     

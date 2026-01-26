@@ -7,9 +7,10 @@ A comprehensive tool for visualizing emissions data from SMOKE reports, FF10 fil
 *   **Dual Mode Operation**: Interactive GUI for exploration or headless batch mode for automation
 *   **Multiple Data Formats**: SMOKE reports, FF10 point/nonpoint, NetCDF (including inline sources), CSV/TXT
 *   **Flexible Plotting**: County-based (FIPS) or grid-based visualization
+*   **Tribal Remapping**: Automatic mapping of tribal area emissions (88xxx) to underlying counties for standard visualization
 *   **Spatial Filtering**: Filter data by geographic regions using overlay shapefiles with robust boundary detection
 *   **Projections**: Automatic projection handling (WGS84, Lambert Conformal Conic)
-*   **Configuration Management**: Save/load complete run configurations via YAML/JSON
+*   **Configuration Management**: Load complete run configurations via YAML/JSON
 *   **Parallel Processing**: Multi-core batch processing for large datasets
 
 ## Installation

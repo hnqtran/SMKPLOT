@@ -23,6 +23,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Polygon
 import netCDF4
+import xarray as xr
 import pyproj
 import tempfile
 import atexit
@@ -91,18 +92,18 @@ def _process_inline_chunk(inln_path, vars_to_process, t_start, t_end, valid_indi
     return (t_start, t_end, res_data)
 
 def get_proj_object_from_info(gi):
-    """Returns pyproj object based on grid info dictionary."""
+    """Returns pyproj.CRS object based on grid info dictionary."""
     if gi['proj_type'] == 2: # LCC
         proj_str = (f"+proj=lcc +lat_1={gi['p_alp']} +lat_2={gi['p_bet']} "
                     f"+lat_0={gi['ycent']} +lon_0={gi['xcent']} "
                     f"+x_0=0 +y_0=0 +a=6370000 +b=6370000 +units=m +no_defs")
-        return pyproj.Proj(proj_str)
+        return pyproj.CRS.from_user_input(proj_str)
     elif gi['proj_type'] == 6: # Polar Stereographic
         proj_str = (f"+proj=stere +lat_ts={gi['p_alp']} +lat_0={gi['ycent']} +lon_0={gi['xcent']} "
                     f"+x_0=0 +y_0=0 +a=6370000 +b=6370000 +units=m +no_defs")
-        return pyproj.Proj(proj_str)
+        return pyproj.CRS.from_user_input(proj_str)
     elif gi['proj_type'] == 1: # Lat/Lon
-        return pyproj.Proj("+proj=longlat +datum=WGS84 +no_defs")
+        return pyproj.CRS.from_epsg(4326)
     else:
         raise NotImplementedError(f"Projection type {gi['proj_type']} not yet implemented.")
 
@@ -180,7 +181,8 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
         lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
 
     # Project
-    proj = get_proj_object_from_info(gi)
+    proj_crs = get_proj_object_from_info(gi)
+    proj = pyproj.Proj(proj_crs)
     xx, yy = proj(lons, lats)
     
     if gi['xcell'] == 0 or gi['ycell'] == 0:
@@ -288,7 +290,8 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
             lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
 
         # Project
-        proj = get_proj_object_from_info(gi)
+        proj_crs = get_proj_object_from_info(gi)
+        proj = pyproj.Proj(proj_crs)
         xx, yy = proj(lons, lats)
         
         # Calculate Grid Indices (0-based)
@@ -670,6 +673,20 @@ def create_ncf_domain_gdf(
     except:
         gdf['GRID_RC'] = [f"{r}_{c}" for r, c in zip(rows_attr, cols_attr)]
 
+    # Attach grid info for optimized QuadMesh plotting
+    try:
+        gdf.attrs['_smk_grid_info'] = {
+            'xorig': xorig,
+            'yorig': yorig,
+            'xcell': xcell,
+            'ycell': ycell,
+            'ncols': ncols,
+            'nrows': nrows,
+            'proj_str': proj_str
+        }
+    except Exception:
+        pass
+
     return gdf
 
 
@@ -680,7 +697,9 @@ def read_ncf_emissions(
     tstep_idx: int = None,
     layer_op: str = 'select',
     tstep_op: str = 'mean',
-    notify = None
+    notify = None,
+    xr_ds = None,
+    lazy: bool = False
 ) -> pd.DataFrame:
     """
     Read emissions from NetCDF.
@@ -846,6 +865,18 @@ def read_ncf_emissions(
             proj_obj = get_proj_object_from_info(gi)
             gdf.crs = proj_obj.srs
             
+            # Attach grid info
+            gdf.attrs['_smk_grid_info'] = {
+                'xorig': gi['xorig'],
+                'yorig': gi['yorig'],
+                'xcell': gi['xcell'],
+                'ycell': gi['ycell'],
+                'ncols': gi['ncols'],
+                'nrows': gi['nrows'],
+                'proj_str': proj_obj.srs
+            }
+            gdf.attrs['_smk_is_native'] = True
+
             # Set Attributes
             gdf.attrs['source_type'] = 'inline_point_lazy'
             gdf.attrs['stack_groups_path'] = stack_groups
@@ -881,6 +912,147 @@ def read_ncf_emissions(
             traceback.print_exc()
             _notify('ERROR', f"Failed to process as inline emissions (Lazy): {e}. Falling back to standard grid reading.")
             # Fallback to standard reading (which will likely result in strip maps, but at least not crash)
+    # --- Optimized xarray/dask Path ---
+    try:
+        import xarray as xr
+        import dask
+        
+        # Open dataset lazily or use provided handle
+        ds = xr_ds if xr_ds is not None else xr.open_dataset(ncf_path, chunks={})
+        
+        # 1. Identify pollutants (variables with ROW and COL dims)
+        available_vars = []
+        for vname in ds.data_vars:
+            if vname == 'TFLAG': continue
+            if 'ROW' in ds[vname].dims and 'COL' in ds[vname].dims:
+                available_vars.append(vname)
+        
+        # 2. Extract metadata
+        var_metadata = {}
+        for pol in available_vars:
+            v_attr = ds[pol].attrs
+            var_metadata[pol] = {
+                'long_name': str(v_attr.get('long_name', '')).strip(),
+                'units': str(v_attr.get('units', '')).strip()
+            }
+            
+        nrows = ds.sizes['ROW']
+        ncols = ds.sizes['COL']
+        
+        # 3. Handle Initial Load (Skeleton Case or Detect All)
+        if pollutants is None:
+            if lazy:
+                _notify('INFO', f"Lazy-loading NetCDF skeleton with {len(available_vars)} variables...")
+                
+                # Build Row/Col structure
+                row_idx, col_idx = np.indices((nrows, ncols), dtype=np.int32)
+                row_idx = row_idx.flatten() + 1
+                col_idx = col_idx.flatten() + 1
+                
+                df = pd.DataFrame({'ROW': row_idx, 'COL': col_idx})
+                df['GRID_RC'] = df['ROW'].astype(str) + '_' + df['COL'].astype(str)
+                
+                # Attach metadata
+                df.attrs['variable_metadata'] = var_metadata
+                df.attrs['available_pollutants'] = available_vars
+                df.attrs['pollutants'] = available_vars # compat
+                df.attrs['source_type'] = 'gridded_netcdf'
+                df.attrs['_smk_is_native'] = True
+                df.attrs['_smk_xr_ds'] = ds
+                
+                try:
+                    coord_params, grid_params = read_ncf_grid_params(ncf_path)
+                    proj_obj = get_proj_object_from_info({
+                        'proj_type': coord_params[0], 'p_alp': coord_params[1],
+                        'p_bet': coord_params[2], 'p_gam': coord_params[3],
+                        'xcent': coord_params[4], 'ycent': coord_params[5]
+                    })
+                    df.attrs['_smk_grid_info'] = {
+                        'xorig': grid_params[1], 'yorig': grid_params[2],
+                        'xcell': grid_params[3], 'ycell': grid_params[4],
+                        'ncols': grid_params[5], 'nrows': grid_params[6],
+                        'proj_str': proj_obj.srs
+                    }
+                except: pass
+                
+                return df
+            else:
+                # Eager load all detected pollutants (standard for batch mode)
+                pollutants = available_vars
+
+        # 4. Handle Specific Pollutant Extraction
+        _notify('INFO', f"Extracting {len(pollutants)} pollutants using xarray...")
+        
+        # Slice Time
+        if 'TSTEP' in ds.sizes:
+            if tstep_idx is not None:
+                # Ensure valid index
+                t_idx = min(max(0, tstep_idx), ds.sizes['TSTEP']-1)
+                ds_sliced = ds.isel(TSTEP=t_idx)
+            else:
+                if tstep_op == 'mean': ds_sliced = ds.mean(dim='TSTEP')
+                elif tstep_op == 'sum': ds_sliced = ds.sum(dim='TSTEP')
+                elif tstep_op == 'max': ds_sliced = ds.max(dim='TSTEP')
+                elif tstep_op == 'min': ds_sliced = ds.min(dim='TSTEP')
+                else: ds_sliced = ds.mean(dim='TSTEP')
+        else:
+            ds_sliced = ds
+
+        # Slice Layers
+        if 'LAY' in ds_sliced.sizes:
+            if layer_idx is not None:
+                l_idx = min(max(0, layer_idx), ds_sliced.sizes['LAY']-1)
+                ds_sliced = ds_sliced.isel(LAY=l_idx)
+            else:
+                if layer_op == 'mean': ds_sliced = ds_sliced.mean(dim='LAY')
+                elif layer_op == 'sum': ds_sliced = ds_sliced.sum(dim='LAY')
+                elif layer_op == 'max': ds_sliced = ds_sliced.max(dim='LAY')
+                elif layer_op == 'min': ds_sliced = ds_sliced.min(dim='LAY')
+                else: ds_sliced = ds_sliced.isel(LAY=0) # Default to surface
+        
+        # Prepare data dictionary
+        data_dict = {}
+        for pol in pollutants:
+            if pol in ds_sliced:
+                # Compute and convert to 1D
+                data_dict[pol] = ds_sliced[pol].values.astype(np.float32).flatten()
+        
+        # Build DataFrame
+        row_idx, col_idx = np.indices((nrows, ncols), dtype=np.int32)
+        df = pd.DataFrame({
+            'ROW': row_idx.flatten() + 1,
+            'COL': col_idx.flatten() + 1
+        })
+        df['GRID_RC'] = df['ROW'].astype(str) + '_' + df['COL'].astype(str)
+        
+        # Performance: Use assign or concat to avoid fragmenting the dataframe with many columns
+        if data_dict:
+            # We can convert the dict of arrays directly to a dataframe and join
+            pol_df = pd.DataFrame(data_dict)
+            df = pd.concat([df, pol_df], axis=1)
+                
+        df.attrs['variable_metadata'] = var_metadata
+        df.attrs['_smk_is_native'] = True
+        
+        try:
+            coord_params, grid_params = read_ncf_grid_params(ncf_path)
+            proj_obj = get_proj_object_from_info({
+                'proj_type': coord_params[0], 'p_alp': coord_params[1],
+                'p_bet': coord_params[2], 'p_gam': coord_params[3],
+                'xcent': coord_params[4], 'ycent': coord_params[5]
+            })
+            df.attrs['_smk_grid_info'] = {
+                'xorig': grid_params[1], 'yorig': grid_params[2],
+                'xcell': grid_params[3], 'ycell': grid_params[4],
+                'ncols': grid_params[5], 'nrows': grid_params[6],
+                'proj_str': proj_obj.srs
+            }
+        except: pass
+        
+        return df
+
+    except Exception as xr_err:
+        _notify('WARNING', f"Xarray lazy load failed or unavailable: {xr_err}. Falling back to netCDF4.")
 
     data_dict = {}
     var_metadata = {}
@@ -1123,6 +1295,20 @@ def read_ncf_emissions(
                  
                 gdf_lz.attrs['variable_metadata'] = var_metadata
                 gdf_lz.attrs['source_type'] = 'gridded_lazy'
+                gdf_lz.attrs['_smk_is_native'] = True
+                
+                # Attach grid info
+                try:
+                    gdf_lz.attrs['_smk_grid_info'] = {
+                        'xorig': xorig_lz,
+                        'yorig': yorig_lz,
+                        'xcell': xcell_lz,
+                        'ycell': ycell_lz,
+                        'ncols': grid_params_lz[5],
+                        'nrows': grid_params_lz[6],
+                        'proj_str': crs_lz
+                    }
+                except: pass
                  
                 _notify('INFO', f"Lazy Grid Load (Standard): {len(gdf_lz)} active cells.")
                 return gdf_lz
@@ -1151,6 +1337,31 @@ def read_ncf_emissions(
         df['GRID_RC'] = [f"{r}_{c}" for r, c in zip(flat_rows, flat_cols)]
     
     df.attrs['variable_metadata'] = var_metadata
+    
+    # Attach grid info
+    df.attrs['_smk_is_native'] = True
+    try:
+        coord_params, grid_params = read_ncf_grid_params(ncf_path)
+        # grid_params: (gdnam, xorig, yorig, xcell, ycell, ncols, nrows, nthik)
+        proj_obj = get_proj_object_from_info({
+            'proj_type': coord_params[0],
+            'p_alp': coord_params[1],
+            'p_bet': coord_params[2],
+            'p_gam': coord_params[3],
+            'xcent': coord_params[4],
+            'ycent': coord_params[5]
+        })
+        df.attrs['_smk_grid_info'] = {
+            'xorig': grid_params[1],
+            'yorig': grid_params[2],
+            'xcell': grid_params[3],
+            'ycell': grid_params[4],
+            'ncols': grid_params[5],
+            'nrows': grid_params[6],
+            'proj_str': proj_obj.srs
+        }
+    except Exception:
+        pass
                  
     return df
 

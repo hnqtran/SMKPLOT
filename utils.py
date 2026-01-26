@@ -4,7 +4,6 @@ import os
 import sys
 import traceback
 import json
-from functools import lru_cache
 from typing import Optional, List, Dict, Any, Union, Tuple
 import matplotlib
 
@@ -164,6 +163,26 @@ def serialize_attrs(attrs) -> dict:
     return result
 
 
+def is_netcdf_file(filepath: str) -> bool:
+    """Detect if a file is a NetCDF file by checking its magic number signature.
+    Supported: Classic, 64-bit Offset, 64-bit Data, and NetCDF-4 (HDF5).
+    """
+    if not os.path.isfile(filepath):
+        return False
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(8)
+            # NetCDF Classic (CDF\x01), 64-bit Offset (CDF\x02), 64-bit Data (CDF\x05)
+            if header.startswith(b'CDF\x01') or header.startswith(b'CDF\x02') or header.startswith(b'CDF\x05'):
+                return True
+            # NetCDF-4 (HDF5 format signature: \x89HDF\r\n\x1a\n)
+            if header.startswith(b'\x89HDF\r\n\x1a\n'):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 # ---- Original utils content (preserved) ----
 
 def _prune_incompatible_bundled_libs() -> None:
@@ -243,33 +262,3 @@ else:
     ttk = None  # type: ignore
     filedialog = None  # type: ignore
 
-def _config_file() -> str:
-    """Return the path to the configuration file."""
-    cfg_dir = os.environ.get('XDG_CONFIG_HOME') or os.path.join(os.path.expanduser('./'), '.config')
-    try:
-        os.makedirs(cfg_dir, exist_ok=True)
-    except Exception:
-        pass
-    return os.path.join(cfg_dir, 'smkgui_settings.json')
-
-def load_settings() -> dict:
-    """Load the entire settings dictionary from the JSON config file."""
-    try:
-        cfg = _config_file()
-        if not os.path.exists(cfg):
-            return {}
-        with open(cfg, 'r') as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-def save_settings(settings: dict) -> None:
-    """Collect and save current GUI settings to the JSON config file."""
-    try:
-        cfg = _config_file()
-        with open(cfg, 'w') as f:
-            json.dump(settings, f, indent=2)
-    except Exception:
-        # best-effort; ignore failures
-        pass
