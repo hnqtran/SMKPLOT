@@ -8,3 +8,6 @@ pyyaml
 joblib
 pyogrio
 netCDF4
+fiona
+xarray
+dask

@@ -13,14 +13,22 @@ and the headless Batch mode. It handles:
 import os
 import sys
 
-# Set PROJ data paths to fix pyogrio/pyproj issues in virtual environment
-
+# Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
 try:
     import pyproj
-    from pathlib import Path
-    _proj_share = Path(pyproj.__file__).resolve().parent / 'proj_dir' / 'share' / 'proj'
-    if _proj_share.is_dir():
-        os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_proj_share)
+    import pyproj.datadir
+    # Use pyproj's internal detection which is more robust than manual pathing
+    _proj_data = pyproj.datadir.get_data_dir()
+    if _proj_data and os.path.isdir(_proj_data):
+        os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+    else:
+        # Fallback to manual path construction if get_data_dir fails
+        from pathlib import Path
+        _base = Path(pyproj.__file__).resolve().parent
+        for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
+            if _path.is_dir():
+                os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
+                break
 except Exception:
     pass
 

@@ -71,6 +71,16 @@ else
     exit 1
 fi
 
+# 5. Check for Tkinter (Required for GUI)
+"$PYTHON_EXEC" -c "import tkinter" &> /dev/null
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "WARNING: 'tkinter' not found in this environment."
+    echo "         GUI mode will not work. Batch mode is unaffected."
+    echo "         On Ubuntu/Debian, install it with: sudo apt-get install python3-tk"
+    echo "         On RHEL/CentOS, install it with: sudo yum install python3-tkinter"
+fi
+
 echo "========================================================"
 echo "Setup Complete!"
 echo "You can now run the tool using: ./$MAIN_SCRIPT"

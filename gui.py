@@ -2213,6 +2213,15 @@ class EmissionGUI:
                         
                         # Pull value
                         val = row.get(pollutant)
+                        # Check for current values on axes (useful for NetCDF animation)
+                        current_vals = getattr(target_ax, '_smk_current_vals', None)
+                        if current_vals is not None:
+                            try:
+                                # Use the positional index if within bounds
+                                if idx < len(current_vals):
+                                    val = current_vals[idx]
+                            except Exception:
+                                pass
                         try:
                             f_val = float(val) if not pd.isna(val) else 0.0
                         except Exception:
@@ -3186,6 +3195,7 @@ class EmissionGUI:
              
             self._t_data_cache = None
             self._t_idx = 0
+            self._is_showing_agg = True
             # stats_box - removed, using stats_text
              
             lbl_time = ttk.Label(nav_frame, text="Time: Initial")
@@ -3337,15 +3347,18 @@ class EmissionGUI:
                         for i, t in enumerate(times):
                             if str(t).strip() == str(current_sel).strip():
                                 self._t_idx = i
+                                self._is_showing_agg = False
                                 found = True
                                 break
                             if str(current_sel) in str(t):
                                 self._t_idx = i
+                                self._is_showing_agg = False
                                 found = True
                                 break
                          
                         if not found:
                             self._t_idx = 0
+                            self._is_showing_agg = True
                              
                     except Exception:
                         pass
@@ -3376,6 +3389,7 @@ class EmissionGUI:
                 try:
                     if coll:
                         coll.set_array(new_vals)
+                        local_ax._smk_current_vals = new_vals
                         coll.set_clim(self._t_data_cache['vmin'], self._t_data_cache['vmax'])
                         if hasattr(coll, 'colorbar') and coll.colorbar:
                             coll.colorbar.update_normal(coll)
@@ -3428,7 +3442,11 @@ class EmissionGUI:
                 if not _ensure_time_data(): return
                 n_steps = len(self._t_data_cache['times'])
                 old_idx = self._t_idx
-                self._t_idx = (self._t_idx + delta) % n_steps
+                if getattr(self, '_is_showing_agg', False):
+                    self._t_idx = 0 if delta > 0 else n_steps - 1
+                    self._is_showing_agg = False
+                else:
+                    self._t_idx = (self._t_idx + delta) % n_steps
                 new_vals = self._t_data_cache['values'][self._t_idx]
                 time_lbl = self._t_data_cache['times'][self._t_idx]
                 logging.info(f"Animation Step: {old_idx} -> {self._t_idx}, ValRange=[{new_vals.min():.2f}, {new_vals.max():.2f}]")
@@ -3436,6 +3454,7 @@ class EmissionGUI:
             
             def _show_agg(mode):
                 if not _ensure_time_data(): return
+                self._is_showing_agg = True
                 if mode == 'total':
                     new_vals = self._t_data_cache['tot_val']
                     lbl = "Total (Sum)"
@@ -3809,6 +3828,8 @@ class EmissionGUI:
         local_ax.set_title("\n".join(title_lines))
         # Install hover/status text formatter with emission values and WGS84 lon/lat
         try:
+            # Initialize current values for hover lookup (NetCDF animation support)
+            local_ax._smk_current_vals = merged_plot[pollutant].values
             self._setup_hover(merged_plot, pollutant, ax=local_ax, lonlat_transformer=tf_inv)
         except Exception:
             pass
