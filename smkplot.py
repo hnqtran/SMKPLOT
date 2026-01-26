@@ -14,23 +14,40 @@ import os
 import sys
 
 # Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
-try:
-    import pyproj
-    import pyproj.datadir
-    # Use pyproj's internal detection which is more robust than manual pathing
-    _proj_data = pyproj.datadir.get_data_dir()
-    if _proj_data and os.path.isdir(_proj_data):
-        os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
-    else:
-        # Fallback to manual path construction if get_data_dir fails
-        from pathlib import Path
-        _base = Path(pyproj.__file__).resolve().parent
-        for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
-            if _path.is_dir():
-                os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
-                break
-except Exception:
-    pass
+# This MUST happen before any third-party imports (geopandas, pyproj, etc.)
+def _setup_proj_env():
+    try:
+        # Check if we are inside a PyInstaller bundle
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            # PyInstaller bundles projection data in these locations
+            for candidate in [
+                os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
+                os.path.join(meipass, 'proj_data'),
+                os.path.join(meipass, 'share', 'proj')
+            ]:
+                if os.path.isdir(candidate):
+                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
+                    return
+
+        # Not in a bundle, or bundle check failed. Try to find via site-packages
+        # We search path without importing if possible, but importing 'pyproj' is the most reliable
+        import pyproj
+        import pyproj.datadir
+        _proj_data = pyproj.datadir.get_data_dir()
+        if _proj_data and os.path.isdir(_proj_data):
+            os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+        else:
+            from pathlib import Path
+            _base = Path(pyproj.__file__).resolve().parent
+            for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
+                if _path.is_dir():
+                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
+                    break
+    except Exception:
+        pass
+
+_setup_proj_env()
 
 import argparse
 import datetime
