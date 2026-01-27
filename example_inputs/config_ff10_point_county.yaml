@@ -1,13 +1,13 @@
 timestamp_utc: '2026-01-26T11:00:00Z'
 arguments:
-  filepath: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/example_ff10_point.csv
+  filepath: example_inputs/example_ff10_point.csv
   sector: test_ff10_point_county
-  county_shapefile: /proj/ie/proj/staff/tranhuy/python/GIS/tl_2020_us_county_CONUS.gpkg
-  griddesc: /proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/example_inputs/example_griddesc.txt
+  county_shapefile: "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_500k.zip"
+  griddesc: example_inputs/example_griddesc.txt
   gridname: 12LISTOS
   pltyp: county
   pollutant: NOX,VOC
   zoom_to_data: true
-  outdir: ./test_outputs/ff10_point_county
+  outdir: test_outputs/ff10_point_county
   export_csv: true
   run_mode: batch
