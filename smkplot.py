@@ -13,19 +13,38 @@ and the headless Batch mode. It handles:
 import os
 import sys
 
-# Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
-# This MUST happen before any third-party imports (geopandas, pyproj, etc.)
 def _setup_proj_env():
-    # Clear potentially conflicting system variables first (HPC clusters often inherit mismatched DBs)
-    for var in ["PROJ_LIB", "PROJ_DATA"]:
-        if var in os.environ:
-            del os.environ[var]
-            
+    """
+    Robust PROJ environment setup for local machine.
+    Prioritizes system-wide databases to match system-wide C-libraries, 
+    preventing 'DATABASE.LAYOUT.VERSION' mismatches and 22s draw lags.
+    """
+    import os
+    import sys
+    
+    # 1. If PROJ_LIB is already set and exists, trust it (standard for 'module load proj')
+    current_proj = os.environ.get("PROJ_LIB") or os.environ.get("PROJ_DATA")
+    if current_proj and os.path.isdir(current_proj):
+        # Already set to a valid directory; do not clear it
+        return
+
+    # 2. Search for common system-wide PROJ paths (favors modern system DBs)
+    system_paths = [
+        "/usr/share/proj",
+        "/usr/local/share/proj",
+        "/opt/local/share/proj",
+        "/usr/lib/proj"
+    ]
+    for path in system_paths:
+        if os.path.exists(os.path.join(path, "proj.db")):
+            os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = path
+            return
+
+    # 3. Fallback: Try to find data directory via libraries (internal venv)
     try:
         # Check if we are inside a PyInstaller bundle
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
-            # PyInstaller bundles projection data in these locations
             for candidate in [
                 os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
                 os.path.join(meipass, 'proj_data'),
@@ -35,20 +54,12 @@ def _setup_proj_env():
                     os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
                     return
 
-        # Not in a bundle, or bundle check failed. Try to find via site-packages
-        # We search path without importing if possible, but importing 'pyproj' is the most reliable
+        # Last resort: use pyproj internal datadir
         import pyproj
         import pyproj.datadir
         _proj_data = pyproj.datadir.get_data_dir()
         if _proj_data and os.path.isdir(_proj_data):
             os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
-        else:
-            from pathlib import Path
-            _base = Path(pyproj.__file__).resolve().parent
-            for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
-                if _path.is_dir():
-                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
-                    break
     except Exception:
         pass
 
