@@ -2192,8 +2192,18 @@ class EmissionGUI:
                     except Exception:
                         sindex = None
                     if sindex is None:
-                        # Fallback to standard distance-based or full search if sindex failed
-                        cand_idx = range(len(gdf))
+                        # Fallback to vectorized bounding box search (fast in Pandas/NumPy even without rtree)
+                        try:
+                            # We check which features' bounds contain the point
+                            # This is significantly faster than a full Python loop over range(len(gdf))
+                            bounds = gdf.geometry.bounds
+                            cand_idx = gdf.index[
+                                (bounds['minx'] <= x) & (bounds['maxx'] >= x) &
+                                (bounds['miny'] <= y) & (bounds['maxy'] >= y)
+                            ].tolist()
+                        except Exception:
+                            # Extreme fallback if even bounds check fails (should not happen with Valid GDF)
+                            cand_idx = []
 
                 best_parts = None
                 best_val = -1.0
@@ -3510,10 +3520,24 @@ class EmissionGUI:
                     from shapely.geometry import box
                     bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
                      
-                    sidx = merged_plot.sindex
-                    cand_idxs = list(sidx.intersection(bbox.bounds))
+                    try:
+                        sidx = merged_plot.sindex
+                        cand_idxs = list(sidx.intersection(bbox.bounds))
+                    except Exception:
+                        # Manual bounding box fallback if rtree is missing
+                        b = bbox.bounds
+                        cand_idxs = merged_plot.index[
+                            (merged_plot.geometry.bounds['maxx'] >= b[0]) &
+                            (merged_plot.geometry.bounds['minx'] <= b[2]) &
+                            (merged_plot.geometry.bounds['maxy'] >= b[1]) &
+                            (merged_plot.geometry.bounds['miny'] <= b[3])
+                        ].tolist()
+                    
                     subset = merged_plot.iloc[cand_idxs]
-                    subset = subset[subset.intersects(bbox)]
+                    try:
+                        subset = subset[subset.intersects(bbox)]
+                    except Exception:
+                        pass
                      
                     if subset.empty:
                         self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
