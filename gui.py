@@ -2127,13 +2127,13 @@ class EmissionGUI:
         except Exception:
             sindex = None
             
-        # Pre-calculate bounds once to avoid 70k+ calculations on every mouse move (HPC optimization)
-        _pre_bounds = None
-        try:
-            if sindex is None:
-                _pre_bounds = gdf.geometry.bounds
-        except Exception:
-            pass
+        # Pre-calculate bounds once for all handlers (Hover, Stats Update, Animation)
+        if not hasattr(gdf, '_smk_pre_bounds'):
+            try:
+                gdf._smk_pre_bounds = gdf.geometry.bounds
+            except Exception:
+                gdf._smk_pre_bounds = None
+        _pre_bounds = gdf._smk_pre_bounds
 
         def _fmt(x: float, y: float) -> str:
             # Build lon/lat if possible; otherwise fall back to axes coords
@@ -3426,11 +3426,15 @@ class EmissionGUI:
                                 visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
                             except Exception:
                                 b = view_box.bounds
+                                # Use high-performance pre-calculated bounds if available
+                                bounds = getattr(merged_plot, '_smk_pre_bounds', None)
+                                if bounds is None:
+                                    bounds = merged_plot.geometry.bounds
+                                    merged_plot._smk_pre_bounds = bounds
+                                
                                 visible_idxs = merged_plot.index[
-                                    (merged_plot.geometry.bounds['maxx'] >= b[0]) &
-                                    (merged_plot.geometry.bounds['minx'] <= b[2]) &
-                                    (merged_plot.geometry.bounds['maxy'] >= b[1]) &
-                                    (merged_plot.geometry.bounds['miny'] <= b[3])
+                                    (bounds['maxx'] >= b[0]) & (bounds['minx'] <= b[2]) &
+                                    (bounds['maxy'] >= b[1]) & (bounds['miny'] <= b[3])
                                 ].tolist()
                              
                             if visible_idxs:
@@ -4188,11 +4192,15 @@ class EmissionGUI:
                     except Exception:
                         # Manual bounding box fallback if sindex call fails
                         b = bbox_geom.bounds
+                        # Performance optimization: Reuse pre-cleared bounds
+                        bounds = getattr(gdf_for_stats, '_smk_pre_bounds', None)
+                        if bounds is None:
+                            bounds = gdf_for_stats.geometry.bounds
+                            gdf_for_stats._smk_pre_bounds = bounds
+                            
                         idx = gdf_for_stats.index[
-                            (gdf_for_stats.geometry.bounds['maxx'] >= b[0]) & 
-                            (gdf_for_stats.geometry.bounds['minx'] <= b[2]) &
-                            (gdf_for_stats.geometry.bounds['maxy'] >= b[1]) &
-                            (gdf_for_stats.geometry.bounds['miny'] <= b[3])
+                            (bounds['maxx'] >= b[0]) & (bounds['minx'] <= b[2]) &
+                            (bounds['maxy'] >= b[1]) & (bounds['miny'] <= b[3])
                         ].tolist()
                         sub = gdf_for_stats.iloc[idx]
                 else:
