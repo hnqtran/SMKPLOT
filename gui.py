@@ -2186,9 +2186,13 @@ class EmissionGUI:
                 
                 # FALLBACK: Use Spatial Index (Intersection) if math failed or no match
                 if not cand_idx:
-                    if sindex is not None:
-                        cand_idx = list(sindex.intersection((x, y, x, y)))
-                    else:
+                    try:
+                        if sindex is not None:
+                            cand_idx = list(sindex.intersection((x, y, x, y)))
+                    except Exception:
+                        sindex = None
+                    if sindex is None:
+                        # Fallback to standard distance-based or full search if sindex failed
                         cand_idx = range(len(gdf))
 
                 best_parts = None
@@ -3401,11 +3405,23 @@ class EmissionGUI:
                             from shapely.geometry import box
                             view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
                              
-                            visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
+                            try:
+                                visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
+                            except Exception:
+                                b = view_box.bounds
+                                visible_idxs = merged_plot.index[
+                                    (merged_plot.geometry.bounds['maxx'] >= b[0]) &
+                                    (merged_plot.geometry.bounds['minx'] <= b[2]) &
+                                    (merged_plot.geometry.bounds['maxy'] >= b[1]) &
+                                    (merged_plot.geometry.bounds['miny'] <= b[3])
+                                ].tolist()
                              
                             if visible_idxs:
-                                view_vals = new_vals[visible_idxs]
-                                filtered = view_vals[~np.isnan(view_vals)]
+                                try:
+                                    view_vals = new_vals[visible_idxs]
+                                    filtered = view_vals[~np.isnan(view_vals)]
+                                except Exception:
+                                    filtered = np.array([])
                             else:
                                 filtered = np.array([])
 
@@ -3747,15 +3763,20 @@ class EmissionGUI:
                         except Exception: target = None
                     
                     if target is None:
-                        # FALLBACK: Spatial lookup
-                        if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                            cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                            for idx in cands:
-                                row = merged_plot.iloc[idx]
-                                if row.geometry.contains(pt):
-                                    target = row
-                                    break
-                        else:
+                        try:
+                            # Attempt high-speed index search
+                            if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
+                                cands = list(merged_plot.sindex.intersection((x, y, x, y)))
+                                for idx in cands:
+                                    row = merged_plot.iloc[idx]
+                                    if row.geometry.contains(pt):
+                                        target = row
+                                        break
+                        except Exception:
+                            pass
+                        
+                        if target is None:
+                            # Fallback to standard intersection (slower but stable without rtree)
                             matches = merged_plot[merged_plot.intersects(pt)]
                             if not matches.empty:
                                 target = matches.iloc[0]
@@ -4134,7 +4155,15 @@ class EmissionGUI:
                         idx = list(sidx.intersection(bbox_geom.bounds))
                         sub = gdf_for_stats.iloc[idx]
                     except Exception:
-                        sub = gdf_for_stats
+                        # Manual bounding box fallback if sindex call fails
+                        b = bbox_geom.bounds
+                        idx = gdf_for_stats.index[
+                            (gdf_for_stats.geometry.bounds['maxx'] >= b[0]) & 
+                            (gdf_for_stats.geometry.bounds['minx'] <= b[2]) &
+                            (gdf_for_stats.geometry.bounds['maxy'] >= b[1]) &
+                            (gdf_for_stats.geometry.bounds['miny'] <= b[3])
+                        ].tolist()
+                        sub = gdf_for_stats.iloc[idx]
                 else:
                     sub = gdf_for_stats
                 try:

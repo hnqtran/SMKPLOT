@@ -436,7 +436,13 @@ def _batch_mode(args):
                 # Run smkplot.py with the config
                 cmd = [interpreter, launcher, "-f", cfg_path]
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    result = subprocess.run(
+                        cmd, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE, 
+                        universal_newlines=True, 
+                        check=False
+                    )
                     if result.returncode != 0:
                         test_failures.append(f"{cfg_name}: Process failed with exit code {result.returncode}\n{result.stderr}")
                         continue

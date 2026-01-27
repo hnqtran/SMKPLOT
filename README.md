@@ -127,22 +127,6 @@ When the self-test completes, verify the following:
     *   Check for consistent geographic placement (e.g., points over New Jersey, New York, and Texas).
     *   Verify the colorbar limits and the statistics (Sum/Max/Min) displayed in the plot footer or legend.
 
-### Standalone Protected Build
-
-If you need to distribute the tool without sharing the source code, use the provided `build_protected.py` script. This will obfuscate the Python logic and bundle it with all dependencies into a single binary.
-
-**Prerequisites**: A C compiler (like `gcc`) must be installed on the system.
-
-**To build**:
-```bash
-./.venv/bin/python build_protected.py
-```
-
-**Result**:
-A single executable file `smkplot` will be created in the `dist/` directory. This file can be shared with users who do not have Python installed.
-
-> **Note**: Executables are OS-specific. You must run the build script on Linux to get a Linux binary, and on Windows to get a Windows `.exe`.
-
 **Configuration File Structure:**
 
 ```yaml

@@ -16,6 +16,11 @@ import sys
 # Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
 # This MUST happen before any third-party imports (geopandas, pyproj, etc.)
 def _setup_proj_env():
+    # Clear potentially conflicting system variables first (HPC clusters often inherit mismatched DBs)
+    for var in ["PROJ_LIB", "PROJ_DATA"]:
+        if var in os.environ:
+            del os.environ[var]
+            
     try:
         # Check if we are inside a PyInstaller bundle
         meipass = getattr(sys, '_MEIPASS', None)
