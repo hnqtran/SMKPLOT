@@ -2126,6 +2126,14 @@ class EmissionGUI:
             sindex = gdf.sindex
         except Exception:
             sindex = None
+            
+        # Pre-calculate bounds once to avoid 70k+ calculations on every mouse move (HPC optimization)
+        _pre_bounds = None
+        try:
+            if sindex is None:
+                _pre_bounds = gdf.geometry.bounds
+        except Exception:
+            pass
 
         def _fmt(x: float, y: float) -> str:
             # Build lon/lat if possible; otherwise fall back to axes coords
@@ -2194,9 +2202,8 @@ class EmissionGUI:
                     if sindex is None:
                         # Fallback to vectorized bounding box search (fast in Pandas/NumPy even without rtree)
                         try:
-                            # We check which features' bounds contain the point
-                            # This is significantly faster than a full Python loop over range(len(gdf))
-                            bounds = gdf.geometry.bounds
+                            # Use pre-calculated bounds if available, otherwise fallback
+                            bounds = _pre_bounds if _pre_bounds is not None else gdf.geometry.bounds
                             cand_idx = gdf.index[
                                 (bounds['minx'] <= x) & (bounds['maxx'] >= x) &
                                 (bounds['miny'] <= y) & (bounds['maxy'] >= y)
