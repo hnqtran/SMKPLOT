@@ -22,6 +22,17 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+# 1b. Check for Tkinter (Optional but needed for GUI)
+if ! python3 -c "import tkinter" &> /dev/null; then
+    echo "WARNING: 'tkinter' module not found in $(which python3)."
+    echo "         GUI mode will NOT work. You can only use '--no-gui' / batch mode."
+    echo "         To invoke GUI, try 'module load python' or install python3-tk."
+    echo "         Continuing setup for batch-only mode..."
+    sleep 3
+else
+    echo "INFO: Tkinter detected. GUI mode supported."
+fi
+
 # 2. Create Virtual Environment
 if [ ! -d "$VENV_DIR" ]; then
     echo "[1/3] Creating virtual environment ($VENV_DIR)..."

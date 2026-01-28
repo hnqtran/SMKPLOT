@@ -1813,6 +1813,9 @@ def read_smkreport(
 @_memoize(maxsize=6)
 def _load_shapefile(path: str, get_fips: bool, _signature: Tuple[str, Optional[int]]) -> gpd.GeoDataFrame:
     """Read and normalize a counties shapefile, returning a GeoDataFrame."""
+    if path is None:
+        return gpd.GeoDataFrame()
+        
     del _signature  # used only to bust caches when the underlying file changes
     is_url = isinstance(path, str) and path.lower().startswith(("http://", "https://"))
     local_path = path
