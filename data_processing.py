@@ -462,11 +462,20 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
         original_dtypes = df[index_cols].dtypes
 
         # Pre-aggregate to reduce duplicate index combinations before pivoting
+        # For older pandas (< 1.1), dropna=False is not supported. 
+        # We handle this by filling NaNs with a unique string and restoring them.
         try:
             df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False, dropna=False)[emis_col].sum()
         except (TypeError, ValueError):
-            # Fallback for older pandas (< 1.1) which doesn't support dropna=False in groupby
-            df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False)[emis_col].sum()
+            # Fallback for environments with older pandas versions (< 1.1)
+            df_temp = df.copy()
+            for c in index_cols:
+                if df_temp[c].dtype == object or str(df_temp[c].dtype) == 'string':
+                    df_temp[c] = df_temp[c].fillna("__NA__")
+            df_agg = df_temp.groupby(index_cols + [pol_col], observed=True, as_index=False)[emis_col].sum()
+            for c in index_cols:
+                if df_agg[c].dtype == object or str(df_agg[c].dtype) == 'string':
+                    df_agg[c] = df_agg[c].replace("__NA__", np.nan)
         
         # Create a single surrogate key for the index columns
         if len(index_cols) > 1:
@@ -2360,7 +2369,7 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
         c for c in df.columns
         if c.lower() not in id_like
         and not str(c).lower().startswith('unnamed')
-        and str(df[c].dtype) in ('float64', 'float32', 'int64', 'int32', 'Int64')
+        and hasattr(df[c].dtype, 'kind') and df[c].dtype.kind in 'iufc'
     ]
     try:
         df.attrs['_detected_pollutants'] = tuple(detected)

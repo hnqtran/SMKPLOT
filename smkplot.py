@@ -42,20 +42,21 @@ _handle_fast_cache()
 def _setup_proj_env():
     """
     Robust PROJ environment setup for local machine.
-    Prioritizes system-wide databases to match system-wide C-libraries, 
-    preventing 'DATABASE.LAYOUT.VERSION' mismatches and 22s draw lags.
+    Prioritizes internal virtual environment data to prevent 
+    DATABASE.LAYOUT.VERSION mismatches on certain system environments.
     """
     import os
     import sys
+    import warnings
     
-    # 1. If PROJ_LIB is already set manually (e.g. module load), preserve it
-    current_proj = os.environ.get("PROJ_LIB") or os.environ.get("PROJ_DATA")
-    if current_proj and os.path.isdir(current_proj):
-        return
+    # 1. Clean existing PROJ variables to avoid version cross-contamination
+    # This is critical for users who have 'module load proj' or similar active.
+    for var in ['PROJ_LIB', 'PROJ_DATA']:
+        if var in os.environ:
+            del os.environ[var]
 
     # 2. Prioritize Internal Environment (Matches library version)
     try:
-        import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="pyproj")
             
@@ -81,13 +82,8 @@ def _setup_proj_env():
     except Exception:
         pass
 
-    # 3. Last Resort: Search system-wide paths
-    system_paths = [
-        "/usr/share/proj",
-        "/usr/local/share/proj",
-        "/opt/local/share/proj",
-        "/usr/lib/proj"
-    ]
+    # 3. Last Resort: Search system-wide paths ONLY if library data is missing
+    system_paths = ["/usr/share/proj", "/usr/local/share/proj"]
     for path in system_paths:
         if os.path.exists(os.path.join(path, "proj.db")):
             os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = path
@@ -242,7 +238,7 @@ def parse_args():
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
-    ap.add_argument('--fast-cache', action='store_true', help='[HPC Feature] Redirect Matplotlib caches to a local temporary directory to bypass slow network drive (NFS) latency.')
+    ap.add_argument('--fast-cache', action='store_true', help='[Performance Feature] Redirect Matplotlib caches to a local temporary directory to bypass slow network drive (NFS) latency.')
 
     args = ap.parse_args()
 
