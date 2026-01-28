@@ -468,13 +468,20 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
             df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False, dropna=False)[emis_col].sum()
         except (TypeError, ValueError):
             # Fallback for environments with older pandas versions (< 1.1)
+            # We must manually handle NaNs because dropna=False isn't supported.
             df_temp = df.copy()
             for c in index_cols:
-                if df_temp[c].dtype == object or str(df_temp[c].dtype) == 'string':
-                    df_temp[c] = df_temp[c].fillna("__NA__")
+                # Category columns need special handling for fillna
+                if hasattr(df_temp[c], 'cat'):
+                    if "__NA__" not in df_temp[c].cat.categories:
+                        df_temp[c] = df_temp[c].cat.add_categories("__NA__")
+                df_temp[c] = df_temp[c].fillna("__NA__")
+                
             df_agg = df_temp.groupby(index_cols + [pol_col], observed=True, as_index=False)[emis_col].sum()
+            
+            # Restore NaNs in the result
             for c in index_cols:
-                if df_agg[c].dtype == object or str(df_agg[c].dtype) == 'string':
+                if df_agg[c].dtype == object or hasattr(df_agg[c], 'cat'):
                     df_agg[c] = df_agg[c].replace("__NA__", np.nan)
         
         # Create a single surrogate key for the index columns
@@ -2369,7 +2376,7 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
         c for c in df.columns
         if c.lower() not in id_like
         and not str(c).lower().startswith('unnamed')
-        and hasattr(df[c].dtype, 'kind') and df[c].dtype.kind in 'iufc'
+        and pd.api.types.is_numeric_dtype(df[c])
     ]
     try:
         df.attrs['_detected_pollutants'] = tuple(detected)
