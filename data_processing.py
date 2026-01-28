@@ -2247,7 +2247,12 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
     lat_col = next((cols_map[c] for c in lat_candidates if c in cols_map), None)
     
     if not lon_col or not lat_col:
-        raise ValueError('FF10 point data do not contain recognizable longitude/latitude columns.')
+        raise ValueError('FF10 point data do not contain recognizable longitude/latitude columns (looking for: lon, lat, x, y, etc.).')
+
+    # Ensure numeric for older pandas/Python 3.6
+    for col in [lon_col, lat_col]:
+        if not pd.api.types.is_numeric_dtype(emis_df[col]):
+            emis_df[col] = pd.to_numeric(emis_df[col], errors='coerce')
 
     # Unique locations
     coords = emis_df[[lon_col, lat_col]].dropna().drop_duplicates()
@@ -2330,12 +2335,29 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
         'oct_pctred', 'nov_pctred', 'dec_pctred', 'process_id', 'agy_facility_id',
         'agy_unit_id', 'agy_rel_point_id', 'agy_process_id', 'll_datum', 'horiz_coll_mthd'
     }
-    detected = [
-        c for c in df.columns
-        if c.lower() not in id_like
-        and not c.lower().startswith('unnamed')
-        and pd.api.types.is_numeric_dtype(df[c])
-    ]
+    detected = []
+    for c in df.columns:
+        if c.lower() in id_like or c.lower().startswith('unnamed'):
+            continue
+        
+        # Robust numeric check for older Pandas/Python 3.6
+        is_num = False
+        try:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                is_num = True
+            else:
+                # If it's an 'object' but contains numbers (common in old pandas string inference)
+                # check a sample
+                s = df[c].dropna()
+                if not s.empty:
+                    # Try converting first non-null value to float
+                    float(s.iloc[0])
+                    is_num = True
+        except (ValueError, TypeError):
+            pass
+            
+        if is_num:
+            detected.append(c)
     try:
         df.attrs['_detected_pollutants'] = tuple(detected)
     except Exception:

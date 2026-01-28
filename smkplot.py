@@ -48,31 +48,18 @@ def _setup_proj_env():
     import os
     import sys
     
-    # 1. If PROJ_LIB is already set and exists, trust it (standard for 'module load proj')
+    # 1. If PROJ_LIB is already set manually (e.g. module load), preserve it
     current_proj = os.environ.get("PROJ_LIB") or os.environ.get("PROJ_DATA")
     if current_proj and os.path.isdir(current_proj):
-        # Already set to a valid directory; do not clear it
         return
 
-    # 2. Search for common system-wide PROJ paths (favors modern system DBs)
-    system_paths = [
-        "/usr/share/proj",
-        "/usr/local/share/proj",
-        "/opt/local/share/proj",
-        "/usr/lib/proj"
-    ]
-    for path in system_paths:
-        if os.path.exists(os.path.join(path, "proj.db")):
-            os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = path
-            return
-
-    # 3. Fallback: Try to find data directory via libraries (internal venv)
+    # 2. Prioritize Internal Environment (Matches library version)
     try:
         import warnings
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="pyproj")
             
-            # Check if we are inside a PyInstaller bundle
+            # Check for PyInstaller bundle
             meipass = getattr(sys, '_MEIPASS', None)
             if meipass:
                 for candidate in [
@@ -84,17 +71,27 @@ def _setup_proj_env():
                         os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
                         return
 
-            # Last resort: use pyproj internal datadir
-            try:
-                import pyproj
-                import pyproj.datadir
-                _proj_data = pyproj.datadir.get_data_dir()
-                if _proj_data and os.path.isdir(_proj_data):
-                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
-            except (ImportError, AttributeError):
-                pass
+            # Check pyproj internal
+            import pyproj
+            import pyproj.datadir
+            _proj_data = pyproj.datadir.get_data_dir()
+            if _proj_data and os.path.isdir(_proj_data):
+                os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+                return
     except Exception:
         pass
+
+    # 3. Last Resort: Search system-wide paths
+    system_paths = [
+        "/usr/share/proj",
+        "/usr/local/share/proj",
+        "/opt/local/share/proj",
+        "/usr/lib/proj"
+    ]
+    for path in system_paths:
+        if os.path.exists(os.path.join(path, "proj.db")):
+            os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = path
+            return
 
 _setup_proj_env()
 
