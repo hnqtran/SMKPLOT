@@ -1,14 +1,14 @@
 timestamp_utc: '2026-01-26T10:00:00Z'
 arguments:
-  filepath: example_inputs/example_smkreport.csv
+  filepath: ./example_inputs/example_smkreport.csv
   sector: test_smkreport
-  county_shapefile: "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_500k.zip"
-  griddesc: example_inputs/example_griddesc.txt
+  county_shapefile: https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_500k.zip
+  griddesc: ./example_inputs/example_griddesc.txt
   gridname: 12LISTOS
   pltyp: county
   pollutant: NOX,VOC
   zoom_to_data: true
   cmap: plasma
-  outdir: test_outputs/smkreport
+  outdir: ./test_outputs/smkreport
   export_csv: true
   run_mode: batch
