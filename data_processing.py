@@ -462,9 +462,11 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
         original_dtypes = df[index_cols].dtypes
 
         # Pre-aggregate to reduce duplicate index combinations before pivoting
-        # This handles cases where multiple rows map to the same (index_cols + pol_col)
-        # IMPORTANT: dropna=False to preserve rows with NaN in index columns (e.g. tribal_code)
-        df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False, dropna=False)[emis_col].sum()
+        try:
+            df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False, dropna=False)[emis_col].sum()
+        except (TypeError, ValueError):
+            # Fallback for older pandas (< 1.1) which doesn't support dropna=False in groupby
+            df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False)[emis_col].sum()
         
         # Create a single surrogate key for the index columns
         if len(index_cols) > 1:
@@ -484,7 +486,13 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
             
             if len(index_tuples) > 0:
                 # Rebuild key DataFrame
-                key_df = pd.DataFrame(index_tuples.tolist(), columns=index_cols, index=pivot.index)
+                try:
+                    # Older pandas might fail with .tolist() if it's already a MultiIndex
+                    vals = list(index_tuples)
+                    key_df = pd.DataFrame(vals, columns=index_cols, index=pivot.index)
+                except Exception:
+                    key_df = pd.DataFrame([list(x) if isinstance(x, (tuple, list)) else [x] for x in index_tuples], 
+                                         columns=index_cols, index=pivot.index)
                 
                 # Restore original dtypes
                 for col in index_cols:
@@ -667,7 +675,7 @@ def filter_dataframe_by_values(
 
     series = df[col_name]
     if not pd.api.types.is_string_dtype(series):
-        series = series.astype('string')
+        series = series.astype(str)
     series = series.fillna('').str.strip()
 
     if digits_only and normalized_tokens:
@@ -1126,19 +1134,26 @@ def read_ff10(
         
     sep = detected_sep or ','
 
+    # Identify safest string-like dtype (modern pandas prefers 'string', old prefers object)
+    try:
+        from pandas import StringDtype
+        s_dtype = 'string'
+    except ImportError:
+        s_dtype = object
+
     # Use pandas C engine for speed
     # Specify dtypes for common columns to save memory and avoid type inference overhead
     dtype_map = {
-        'region_cd': 'string',
-        'region': 'string',
-        'fips': 'string',
-        'scc': 'string',
+        'region_cd': s_dtype,
+        'region': s_dtype,
+        'fips': s_dtype,
+        'scc': s_dtype,
         'poll': 'category',
         'country_cd': 'category',
         'tribal_code': 'category',
-        'facility_id': 'string',
-        'unit_id': 'string',
-        'rel_point_id': 'string',
+        'facility_id': s_dtype,
+        'unit_id': s_dtype,
+        'rel_point_id': s_dtype,
         'ann_value': 'float32',
         'emission': 'float32'
     }
@@ -1279,7 +1294,10 @@ def read_ff10(
 
     # Convert pollutant columns to numeric:
     for col in pollutant_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        try:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        except Exception:
+            pass
 
     # Preserve a copy of the parsed raw dataset for QA preview
     raw_df = df.copy()
@@ -1454,7 +1472,10 @@ def read_listfile(
     pollutant_cols = [col for col in df.columns if col not in col_lst]
     # Convert pollutant columns to numeric:
     for col in pollutant_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+        try:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        except Exception:
+            pass
 
     # Preserve a copy of the parsed raw dataset for QA preview
     raw_df = df.copy()
@@ -1869,7 +1890,7 @@ def _load_shapefile(path: str, get_fips: bool, _signature: Tuple[str, Optional[i
     region_col = _check_column_in_df(gdf, ['region_cd','regioncd'], warn=False)
     got_FIPS = False
     if geoid_col:
-        lengths = gdf[geoid_col].astype('string').str.strip().str.len()
+        lengths = gdf[geoid_col].astype(str).str.strip().str.len()
         geoid_stats = lengths.describe()
         max_len = int(geoid_stats['max'])
         min_len = int(geoid_stats['min'])
@@ -2247,11 +2268,11 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
     lat_col = next((cols_map[c] for c in lat_candidates if c in cols_map), None)
     
     if not lon_col or not lat_col:
-        raise ValueError('FF10 point data do not contain recognizable longitude/latitude columns (looking for: lon, lat, x, y, etc.).')
+        raise ValueError('FF10 point data do not contain recognizable longitude/latitude columns.')
 
     # Ensure numeric for older pandas/Python 3.6
     for col in [lon_col, lat_col]:
-        if not pd.api.types.is_numeric_dtype(emis_df[col]):
+        if str(emis_df[col].dtype) not in ('float64', 'float32', 'int64', 'int32'):
             emis_df[col] = pd.to_numeric(emis_df[col], errors='coerce')
 
     # Unique locations
@@ -2335,29 +2356,12 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
         'oct_pctred', 'nov_pctred', 'dec_pctred', 'process_id', 'agy_facility_id',
         'agy_unit_id', 'agy_rel_point_id', 'agy_process_id', 'll_datum', 'horiz_coll_mthd'
     }
-    detected = []
-    for c in df.columns:
-        if c.lower() in id_like or c.lower().startswith('unnamed'):
-            continue
-        
-        # Robust numeric check for older Pandas/Python 3.6
-        is_num = False
-        try:
-            if pd.api.types.is_numeric_dtype(df[c]):
-                is_num = True
-            else:
-                # If it's an 'object' but contains numbers (common in old pandas string inference)
-                # check a sample
-                s = df[c].dropna()
-                if not s.empty:
-                    # Try converting first non-null value to float
-                    float(s.iloc[0])
-                    is_num = True
-        except (ValueError, TypeError):
-            pass
-            
-        if is_num:
-            detected.append(c)
+    detected = [
+        c for c in df.columns
+        if c.lower() not in id_like
+        and not str(c).lower().startswith('unnamed')
+        and str(df[c].dtype) in ('float64', 'float32', 'int64', 'int32', 'Int64')
+    ]
     try:
         df.attrs['_detected_pollutants'] = tuple(detected)
     except Exception:
@@ -2429,7 +2433,7 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
 
     # Check if region_col less than 6 characters long, affix with country code
     if region_col:
-        lengths = df[region_col].astype('string').str.strip().str.len()
+        lengths = df[region_col].astype(str).str.strip().str.len()
         region_stats = lengths.describe()
         max_val = region_stats.get('max')
         if pd.isna(max_val):
@@ -2449,7 +2453,7 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
                 ## Map country code value from COUNTRY_CODE_MAPPINGS dict to new column df[country_id]
                 country_codes = (
                     df[country_col]
-                    .astype('string')
+                    .astype(str)
                     .str.strip()
                     .str.upper()
                     .map(COUNTRY_CODE_MAPPINGS)
