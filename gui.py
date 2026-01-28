@@ -2126,14 +2126,6 @@ class EmissionGUI:
             sindex = gdf.sindex
         except Exception:
             sindex = None
-            
-        # Pre-calculate bounds once for all handlers (Hover, Stats Update, Animation)
-        if not hasattr(gdf, '_smk_pre_bounds'):
-            try:
-                gdf._smk_pre_bounds = gdf.geometry.bounds
-            except Exception:
-                gdf._smk_pre_bounds = None
-        _pre_bounds = gdf._smk_pre_bounds
 
         def _fmt(x: float, y: float) -> str:
             # Build lon/lat if possible; otherwise fall back to axes coords
@@ -2194,23 +2186,10 @@ class EmissionGUI:
                 
                 # FALLBACK: Use Spatial Index (Intersection) if math failed or no match
                 if not cand_idx:
-                    try:
-                        if sindex is not None:
-                            cand_idx = list(sindex.intersection((x, y, x, y)))
-                    except Exception:
-                        sindex = None
-                    if sindex is None:
-                        # Fallback to vectorized bounding box search (fast in Pandas/NumPy even without rtree)
-                        try:
-                            # Use pre-calculated bounds if available, otherwise fallback
-                            bounds = _pre_bounds if _pre_bounds is not None else gdf.geometry.bounds
-                            cand_idx = gdf.index[
-                                (bounds['minx'] <= x) & (bounds['maxx'] >= x) &
-                                (bounds['miny'] <= y) & (bounds['maxy'] >= y)
-                            ].tolist()
-                        except Exception:
-                            # Extreme fallback if even bounds check fails (should not happen with Valid GDF)
-                            cand_idx = []
+                    if sindex is not None:
+                        cand_idx = list(sindex.intersection((x, y, x, y)))
+                    else:
+                        cand_idx = range(len(gdf))
 
                 best_parts = None
                 best_val = -1.0
@@ -3422,27 +3401,11 @@ class EmissionGUI:
                             from shapely.geometry import box
                             view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
                              
-                            try:
-                                visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
-                            except Exception:
-                                b = view_box.bounds
-                                # Use high-performance pre-calculated bounds if available
-                                bounds = getattr(merged_plot, '_smk_pre_bounds', None)
-                                if bounds is None:
-                                    bounds = merged_plot.geometry.bounds
-                                    merged_plot._smk_pre_bounds = bounds
-                                
-                                visible_idxs = merged_plot.index[
-                                    (bounds['maxx'] >= b[0]) & (bounds['minx'] <= b[2]) &
-                                    (bounds['maxy'] >= b[1]) & (bounds['miny'] <= b[3])
-                                ].tolist()
+                            visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
                              
                             if visible_idxs:
-                                try:
-                                    view_vals = new_vals[visible_idxs]
-                                    filtered = view_vals[~np.isnan(view_vals)]
-                                except Exception:
-                                    filtered = np.array([])
+                                view_vals = new_vals[visible_idxs]
+                                filtered = view_vals[~np.isnan(view_vals)]
                             else:
                                 filtered = np.array([])
 
@@ -3531,24 +3494,10 @@ class EmissionGUI:
                     from shapely.geometry import box
                     bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
                      
-                    try:
-                        sidx = merged_plot.sindex
-                        cand_idxs = list(sidx.intersection(bbox.bounds))
-                    except Exception:
-                        # Manual bounding box fallback if rtree is missing
-                        b = bbox.bounds
-                        cand_idxs = merged_plot.index[
-                            (merged_plot.geometry.bounds['maxx'] >= b[0]) &
-                            (merged_plot.geometry.bounds['minx'] <= b[2]) &
-                            (merged_plot.geometry.bounds['maxy'] >= b[1]) &
-                            (merged_plot.geometry.bounds['miny'] <= b[3])
-                        ].tolist()
-                    
+                    sidx = merged_plot.sindex
+                    cand_idxs = list(sidx.intersection(bbox.bounds))
                     subset = merged_plot.iloc[cand_idxs]
-                    try:
-                        subset = subset[subset.intersects(bbox)]
-                    except Exception:
-                        pass
+                    subset = subset[subset.intersects(bbox)]
                      
                     if subset.empty:
                         self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
@@ -3798,20 +3747,15 @@ class EmissionGUI:
                         except Exception: target = None
                     
                     if target is None:
-                        try:
-                            # Attempt high-speed index search
-                            if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                                cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                                for idx in cands:
-                                    row = merged_plot.iloc[idx]
-                                    if row.geometry.contains(pt):
-                                        target = row
-                                        break
-                        except Exception:
-                            pass
-                        
-                        if target is None:
-                            # Fallback to standard intersection (slower but stable without rtree)
+                        # FALLBACK: Spatial lookup
+                        if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
+                            cands = list(merged_plot.sindex.intersection((x, y, x, y)))
+                            for idx in cands:
+                                row = merged_plot.iloc[idx]
+                                if row.geometry.contains(pt):
+                                    target = row
+                                    break
+                        else:
                             matches = merged_plot[merged_plot.intersects(pt)]
                             if not matches.empty:
                                 target = matches.iloc[0]
@@ -4190,19 +4134,7 @@ class EmissionGUI:
                         idx = list(sidx.intersection(bbox_geom.bounds))
                         sub = gdf_for_stats.iloc[idx]
                     except Exception:
-                        # Manual bounding box fallback if sindex call fails
-                        b = bbox_geom.bounds
-                        # Performance optimization: Reuse pre-cleared bounds
-                        bounds = getattr(gdf_for_stats, '_smk_pre_bounds', None)
-                        if bounds is None:
-                            bounds = gdf_for_stats.geometry.bounds
-                            gdf_for_stats._smk_pre_bounds = bounds
-                            
-                        idx = gdf_for_stats.index[
-                            (bounds['maxx'] >= b[0]) & (bounds['minx'] <= b[2]) &
-                            (bounds['maxy'] >= b[1]) & (bounds['miny'] <= b[3])
-                        ].tolist()
-                        sub = gdf_for_stats.iloc[idx]
+                        sub = gdf_for_stats
                 else:
                     sub = gdf_for_stats
                 try:

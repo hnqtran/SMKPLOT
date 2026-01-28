@@ -13,80 +13,39 @@ and the headless Batch mode. It handles:
 import os
 import sys
 
-def _handle_fast_cache():
-    """
-    Performance optimization: Redirects Matplotlib/Joblib caches to a local 
-    temporary directory to avoid slow network filesystem (NFS) latency.
-    """
-    if "--fast-cache" in sys.argv:
-        import tempfile
-        import getpass
-        try:
-            # Determine a safe, user-specific path in the system's temp directory
-            # Linux: /tmp/smkplot_[user], Mac: /var/folders/..., Win: AppData\Local\Temp
-            tmp_base = tempfile.gettempdir()
-            username = getpass.getuser()
-            fast_dir = os.path.join(tmp_base, f"smkplot_cache_{username}")
-            
-            if not os.path.exists(fast_dir):
-                os.makedirs(fast_dir, exist_ok=True)
-            
-            # Set environment variables that libraries check during import
-            os.environ['MPLCONFIGDIR'] = fast_dir
-            os.environ['JOBLIB_TEMP_FOLDER'] = fast_dir
-        except Exception:
-            pass
-
-_handle_fast_cache()
-
+# Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
+# This MUST happen before any third-party imports (geopandas, pyproj, etc.)
 def _setup_proj_env():
-    """
-    Robust PROJ environment setup for local machine.
-    Prioritizes internal virtual environment data if system paths are missing
-    to prevent version mismatches on certain system environments.
-    """
-    import os
-    import sys
-    import warnings
-    
-    # 1. Respect existing setup if valid (to avoid library version conflicts)
-    current_proj = os.environ.get("PROJ_LIB") or os.environ.get("PROJ_DATA")
-    if current_proj and os.path.exists(os.path.join(current_proj, "proj.db")):
-        return
-
-    # 2. Prioritize Internal Environment (Matches library version)
     try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning, module="pyproj")
-            
-            # Check for PyInstaller bundle
-            meipass = getattr(sys, '_MEIPASS', None)
-            if meipass:
-                for candidate in [
-                    os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
-                    os.path.join(meipass, 'proj_data'),
-                    os.path.join(meipass, 'share', 'proj')
-                ]:
-                    if os.path.isdir(candidate):
-                        os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
-                        return
+        # Check if we are inside a PyInstaller bundle
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            # PyInstaller bundles projection data in these locations
+            for candidate in [
+                os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
+                os.path.join(meipass, 'proj_data'),
+                os.path.join(meipass, 'share', 'proj')
+            ]:
+                if os.path.isdir(candidate):
+                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
+                    return
 
-            # Check pyproj internal
-            import pyproj
-            import pyproj.datadir
-            _proj_data = pyproj.datadir.get_data_dir()
-            if _proj_data and os.path.isdir(_proj_data):
-                os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
-                return
+        # Not in a bundle, or bundle check failed. Try to find via site-packages
+        # We search path without importing if possible, but importing 'pyproj' is the most reliable
+        import pyproj
+        import pyproj.datadir
+        _proj_data = pyproj.datadir.get_data_dir()
+        if _proj_data and os.path.isdir(_proj_data):
+            os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+        else:
+            from pathlib import Path
+            _base = Path(pyproj.__file__).resolve().parent
+            for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
+                if _path.is_dir():
+                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
+                    break
     except Exception:
         pass
-
-    # 3. Last Resort: Search system-wide paths ONLY if library data is missing
-    system_paths = ["/usr/share/proj", "/usr/local/share/proj"]
-    for path in system_paths:
-        if os.path.exists(os.path.join(path, "proj.db")):
-            os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = path
-            return
 
 _setup_proj_env()
 
@@ -237,7 +196,6 @@ def parse_args():
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
-    ap.add_argument('--fast-cache', action='store_true', help='[Performance Feature] Redirect Matplotlib caches to a local temporary directory to bypass slow network drive (NFS) latency.')
 
     args = ap.parse_args()
 

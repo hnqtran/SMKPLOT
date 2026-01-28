@@ -436,13 +436,7 @@ def _batch_mode(args):
                 # Run smkplot.py with the config
                 cmd = [interpreter, launcher, "-f", cfg_path]
                 try:
-                    result = subprocess.run(
-                        cmd, 
-                        stdout=subprocess.PIPE, 
-                        stderr=subprocess.PIPE, 
-                        universal_newlines=True, 
-                        check=False
-                    )
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
                     if result.returncode != 0:
                         test_failures.append(f"{cfg_name}: Process failed with exit code {result.returncode}\n{result.stderr}")
                         continue
@@ -1290,7 +1284,7 @@ def _batch_mode(args):
         global _PLOT_CONTEXT
         _PLOT_CONTEXT = context
         executor_kwargs = {'max_workers': worker_count}
-        if _PLOT_MP_CONTEXT is not None and sys.version_info >= (3, 7):
+        if _PLOT_MP_CONTEXT is not None:
             executor_kwargs['mp_context'] = _PLOT_MP_CONTEXT
         results: Dict[str, str] = {}
         try:
