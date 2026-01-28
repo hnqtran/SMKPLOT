@@ -2409,7 +2409,14 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
     if region_col:
         lengths = df[region_col].astype('string').str.strip().str.len()
         region_stats = lengths.describe()
-        max_len = int(region_stats['max'])
+        max_val = region_stats.get('max')
+        if pd.isna(max_val):
+            max_len = 0
+        else:
+            try:
+                max_len = int(max_val)
+            except (ValueError, TypeError):
+                max_len = 0
 
         if max_len < 6:
             # Locate country_cd column if exists

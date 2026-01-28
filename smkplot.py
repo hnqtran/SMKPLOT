@@ -68,24 +68,31 @@ def _setup_proj_env():
 
     # 3. Fallback: Try to find data directory via libraries (internal venv)
     try:
-        # Check if we are inside a PyInstaller bundle
-        meipass = getattr(sys, '_MEIPASS', None)
-        if meipass:
-            for candidate in [
-                os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
-                os.path.join(meipass, 'proj_data'),
-                os.path.join(meipass, 'share', 'proj')
-            ]:
-                if os.path.isdir(candidate):
-                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
-                    return
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="pyproj")
+            
+            # Check if we are inside a PyInstaller bundle
+            meipass = getattr(sys, '_MEIPASS', None)
+            if meipass:
+                for candidate in [
+                    os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
+                    os.path.join(meipass, 'proj_data'),
+                    os.path.join(meipass, 'share', 'proj')
+                ]:
+                    if os.path.isdir(candidate):
+                        os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
+                        return
 
-        # Last resort: use pyproj internal datadir
-        import pyproj
-        import pyproj.datadir
-        _proj_data = pyproj.datadir.get_data_dir()
-        if _proj_data and os.path.isdir(_proj_data):
-            os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+            # Last resort: use pyproj internal datadir
+            try:
+                import pyproj
+                import pyproj.datadir
+                _proj_data = pyproj.datadir.get_data_dir()
+                if _proj_data and os.path.isdir(_proj_data):
+                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
+            except (ImportError, AttributeError):
+                pass
     except Exception:
         pass
 

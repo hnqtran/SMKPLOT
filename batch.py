@@ -1290,7 +1290,7 @@ def _batch_mode(args):
         global _PLOT_CONTEXT
         _PLOT_CONTEXT = context
         executor_kwargs = {'max_workers': worker_count}
-        if _PLOT_MP_CONTEXT is not None:
+        if _PLOT_MP_CONTEXT is not None and sys.version_info >= (3, 7):
             executor_kwargs['mp_context'] = _PLOT_MP_CONTEXT
         results: Dict[str, str] = {}
         try:
