@@ -42,18 +42,17 @@ _handle_fast_cache()
 def _setup_proj_env():
     """
     Robust PROJ environment setup for local machine.
-    Prioritizes internal virtual environment data to prevent 
-    DATABASE.LAYOUT.VERSION mismatches on certain system environments.
+    Prioritizes internal virtual environment data if system paths are missing
+    to prevent version mismatches on certain system environments.
     """
     import os
     import sys
     import warnings
     
-    # 1. Clean existing PROJ variables to avoid version cross-contamination
-    # This is critical for users who have 'module load proj' or similar active.
-    for var in ['PROJ_LIB', 'PROJ_DATA']:
-        if var in os.environ:
-            del os.environ[var]
+    # 1. Respect existing setup if valid (to avoid library version conflicts)
+    current_proj = os.environ.get("PROJ_LIB") or os.environ.get("PROJ_DATA")
+    if current_proj and os.path.exists(os.path.join(current_proj, "proj.db")):
+        return
 
     # 2. Prioritize Internal Environment (Matches library version)
     try:

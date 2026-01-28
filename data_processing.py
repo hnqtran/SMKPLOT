@@ -462,24 +462,21 @@ def _safe_pivot(df: pd.DataFrame, index_cols: List[str], pol_col: str, emis_col:
         original_dtypes = df[index_cols].dtypes
 
         # Pre-aggregate to reduce duplicate index combinations before pivoting
-        # For older pandas (< 1.1), dropna=False is not supported. 
-        # We handle this by filling NaNs with a unique string and restoring them.
         try:
             df_agg = df.groupby(index_cols + [pol_col], observed=True, as_index=False, dropna=False)[emis_col].sum()
         except (TypeError, ValueError):
-            # Fallback for environments with older pandas versions (< 1.1)
-            # We must manually handle NaNs because dropna=False isn't supported.
+            # Fallback for older pandas versions (< 1.1) which delete NaNs in groupby.
+            # We preserve them using a temporary placeholder in index columns.
             df_temp = df.copy()
             for c in index_cols:
-                # Category columns need special handling for fillna
                 if hasattr(df_temp[c], 'cat'):
                     if "__NA__" not in df_temp[c].cat.categories:
                         df_temp[c] = df_temp[c].cat.add_categories("__NA__")
                 df_temp[c] = df_temp[c].fillna("__NA__")
-                
+            
             df_agg = df_temp.groupby(index_cols + [pol_col], observed=True, as_index=False)[emis_col].sum()
             
-            # Restore NaNs in the result
+            # Cleanly restore NaNs to maintain original data structure
             for c in index_cols:
                 if df_agg[c].dtype == object or hasattr(df_agg[c], 'cat'):
                     df_agg[c] = df_agg[c].replace("__NA__", np.nan)
@@ -2288,10 +2285,10 @@ def map_latlon2grd(emis_df: pd.DataFrame, base_geom: gpd.GeoDataFrame, verbose: 
 
     # Ensure numeric for older pandas/Python 3.6
     for col in [lon_col, lat_col]:
-        if str(emis_df[col].dtype) not in ('float64', 'float32', 'int64', 'int32'):
+        if not pd.api.types.is_numeric_dtype(emis_df[col]):
             emis_df[col] = pd.to_numeric(emis_df[col], errors='coerce')
 
-    # Unique locations
+    # Unique locations (strip potential whitespace from index)
     coords = emis_df[[lon_col, lat_col]].dropna().drop_duplicates()
     if coords.empty:
         raise ValueError('No valid longitude/latitude pairs found to map onto the grid.')
@@ -2374,8 +2371,8 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
     }
     detected = [
         c for c in df.columns
-        if c.lower() not in id_like
-        and not str(c).lower().startswith('unnamed')
+        if str(c).strip().lower() not in id_like
+        and not str(c).strip().lower().startswith('unnamed')
         and pd.api.types.is_numeric_dtype(df[c])
     ]
     try:
