@@ -628,7 +628,8 @@ def _batch_mode(args):
             flter_val=getattr(args, 'filter_values', None),
             return_raw=False,
             ncf_params=ncf_params,
-            notify=batch_notify
+            notify=batch_notify,
+            workers=getattr(args, 'workers', 0)
         )
 
     except Exception as e:

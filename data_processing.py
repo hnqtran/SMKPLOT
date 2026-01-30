@@ -704,6 +704,7 @@ def read_inputfile(
     return_raw: bool = True,
     ncf_params: Optional[Dict[str, Any]] = None,
     lazy: bool = False,
+    workers: int = 0,
 ):
     """Check file format identifier to select appropriate parser.
     Rules:
@@ -763,7 +764,13 @@ def read_inputfile(
         if not paths:
             return None, None
             
-        max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+        if workers > 0:
+            max_workers = workers
+        else:
+            max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+        
+        # capped by number of files
+        max_workers = min(max_workers, len(paths))
         
         if len(paths) == 1 or max_workers <= 1:
             for p in paths:
@@ -773,7 +780,8 @@ def read_inputfile(
                         p, sector, delim, skiprows, comment, encoding, header_last, 
                         flter_col, flter_start, flter_end, flter_val, notify,
                         return_raw=return_raw,
-                        lazy=lazy
+                        lazy=lazy,
+                        workers=workers
                     )
                     if d is not None:
                         dfs.append(d)
@@ -798,7 +806,8 @@ def read_inputfile(
                         flter_col, flter_start, flter_end, flter_val, None, # notify cannot be passed
                         return_raw,
                         None, # ncf_params
-                        lazy
+                        lazy,
+                        0 # sub-workers
                     )
                     futures[fut] = p
                 
@@ -958,6 +967,7 @@ def read_inputfile(
             delim=delim,
             encoding=encoding,
             notify=notify,
+            workers=workers
         )
     else:
         if "#Label" in first_line or "# County" in first_line:
@@ -1347,6 +1357,7 @@ def read_listfile(
     flter_end: Optional[str] = None,
     flter_val: Optional[Sequence[str]] = None,
     notify: Optional[Callable[[str, str], None]] = None,
+    workers: int = 0,
 ) -> pd.DataFrame:
 
     _emit_user_message(notify, 'INFO', f'Reading LIST file: {fpath}')
@@ -1358,7 +1369,13 @@ def read_listfile(
 
     # Use parallel processing to read files
     # Determine number of workers (leave one core free, max 32)
-    max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+    if workers > 0:
+        max_workers = workers
+    else:
+        max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+    
+    # capped by number of files
+    max_workers = min(max_workers, len(filepaths))
     
     # If only 1 file or 1 worker, run sequentially to avoid overhead
     if len(filepaths) == 1 or max_workers <= 1:
