@@ -1,5 +1,5 @@
 #!/proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/.venv/bin/python
-NetCDF and Inline processing for SMKPLOT.
+"""NetCDF and Inline processing for SMKPLOT.
 
 ##############################################################################
 # STRICT PARAMETER SOURCE RULES
