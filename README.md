@@ -1,339 +1,98 @@
 # SMKPLOT - Emissions Visualization Tool
 
-A comprehensive tool for visualizing emissions data from SMOKE reports, FF10 files, NetCDF, and CSV formats. Supports both interactive GUI and automated batch processing modes.
+A comprehensive tool for visualizing emissions data from SMOKE reports, FF10 files, NetCDF, and CSV formats. Supports both a modern interactive GUI (Qt-based) and automated batch processing modes.
 
 ## Features
 
-*   **Dual Mode Operation**: Interactive GUI for exploration or headless batch mode for automation
-*   **Multiple Data Formats**: SMOKE reports, FF10 point/nonpoint, NetCDF (including inline sources), CSV/TXT
-*   **Flexible Plotting**: County-based (FIPS) or grid-based visualization
-*   **Tribal Remapping**: Automatic mapping of tribal area emissions (88xxx) to underlying counties for standard visualization
-*   **Spatial Filtering**: Filter data by geographic regions using overlay shapefiles with robust boundary detection
-*   **Projections**: Automatic projection handling (WGS84, Lambert Conformal Conic)
-*   **Configuration Management**: Load complete run configurations via YAML/JSON
-*   **Parallel Processing**: Multi-core batch processing for large datasets
+*   **Modern Interactive GUI**: High-performance Qt-based interface (via PySide6) with a sleek, modern light theme.
+*   **Legacy Support**: Fallback support for Tkinter-based GUI on legacy systems.
+*   **Dual Mode Operation**: Interactive exploration or headless batch mode for cluster automation.
+*   **Multiple Data Formats**: SMOKE reports, FF10 point/nonpoint, NetCDF (including inline sources), CSV/TXT.
+*   **Large Dataset Handling**: Support for multi-column pollutant selection (grid view) for files with hundreds of chemical species.
+*   **Spatial Filtering**: Filter data by geographic regions using overlay shapefiles with robust centroid/representative-point detection.
+*   **Flexible Plotting**: County-based (FIPS) or grid-based visualization.
+*   **Automatic Projections**: Smart handling of WGS84, Lambert Conformal Conic, and IOAPI NetCDF coordinate systems.
+*   **Parallel Processing**: Multi-core batch processing for large temporal or spatial datasets.
 
 ## Installation
 
 ### Prerequisites
-*   Python 3.9 or higher
-*   `tkinter` for GUI mode (usually included; on Linux: `sudo apt-get install python3-tk`)
+*   Python 3.9 or higher.
+*   X11 or Wayland display (for GUI mode).
 
 ### Quick Setup
 
-Use the provided installation script:
+Use the provided installation script to create a virtual environment and install all dependencies (including the Qt runtime):
 ```bash
+chmod +x install.sh
 ./install.sh
 ```
 
-This creates a virtual environment, installs dependencies, and configures the tool.
+This ensures the tool uses its own isolated environment and does not depend on system-wide libraries like `python3-tk`.
 
 ### Manual Installation
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-### GUI Mode
+### GUI Mode (Preferred)
 
-Launch the interactive interface:
+Launch the modern Qt interface:
 ```bash
+./smkplot.py --gui-lib qt
+# OR simply (defaults to Qt if installed)
 ./smkplot.py
-# OR with a data file
-./smkplot.py -f emissions.csv
 ```
 
-The GUI provides:
-*   File selection and preview
-*   Interactive plot settings (colormap, scale, bins)
-*   Spatial filtering controls
-*   Real-time plot generation
+The new GUI features:
+*   **Multi-column Pollutant Selection**: Efficiently browse and select from long lists of pollutants.
+*   **Real-time Status Updates**: Thread-safe status bar with progress indicators for data loading and rendering.
+*   **Harden Shutdown**: Immediate process termination on window close, preventing hanging background tasks.
 
 ### Batch Mode
 
-Generate plots automatically without GUI:
+Generate plots automatically without a display:
 
-**Basic County Plot:**
 ```bash
 ./smkplot.py --run-mode batch \
   -f emissions.csv \
   --county-shapefile counties.gpkg \
-  --pollutant "NOX,VOC,PM2_5" \
+  --pollutant "NOX,VOC" \
   --outdir ./output_maps
 ```
 
-**Grid Plot:**
+## NetCDF & Grid Plotting
+
+SMKPLOT excels at handling gridded data:
+*   **IOAPI Support**: Direct reading of IOAPI-formatted NetCDF files.
+*   **Auto-Grid Detection**: Automatically extracts domain parameters (NCOLS, NROWS, XORIG, etc.) from NetCDF headers.
+*   **Dimensional Operations**: Easily aggregate across time (`avg`, `sum`, `max`) or layers directly from the command line or GUI.
+
 ```bash
 ./smkplot.py --run-mode batch \
+  -f CCTM_emissions.ncf \
   --pltyp grid \
-  --griddesc GRIDDESC.txt \
-  --gridname 12US1_459X299 \
-  -f emissions.csv \
-  --pollutant CO \
-  --outdir ./grid_maps
+  --ncf-tdim sum \
+  --ncf-zdim 0
 ```
 
-**With Spatial Filtering:**
-```bash
-./smkplot.py --run-mode batch \
-  -f emissions.csv \
-  --county-shapefile counties.gpkg \
-  --overlay-shapefile California.shp \
-  --filtered-by-overlay within \
-  --pollutant NOX \
-  --outdir ./ca_maps
-```
-
-### Configuration Files
-
-Configuration files allow you to save complete run settings for reproducibility.
-
-**Using a Configuration File:**
-
-Simply pass a `.yaml` or `.json` file to `-f` / `--filepath`. The tool automatically detects configuration files by extension:
-
-```bash
-./smkplot.py -f my_config.yaml
-```
-
-## Self-Testing
-
-The tool includes a comprehensive self-test suite that verifies parsing, spatial processing, and QA/QC sums for all supported formats (FF10 Point/Nonpoint, SMOKE Report, and NetCDF) using realistic **12LISTOS** parameters.
-
-**To run the self-test:**
-```bash
-./smkplot.py --run-mode batch --self-test
-```
-
-### What to Check
-When the self-test completes, verify the following:
-
-1.  **Terminal Output (QA/QC Sums)**:
-    *   Look for `INFO [QA/QC] Sum match for NOX: ...` and `VOC: ...`.
-    *   This confirms that the data processed by the tool (and saved in the pivoted CSV) exactly matches the total emissions in the input files.
-    *   The test must finish with: `ALL SELF-TESTS PASSED SUCCESSFULLY`.
-
-2.  **Exported Data (`./test_outputs/`)**:
-    *   Navigate to the subfolders (e.g., `./test_outputs/ff10_point_grid/`).
-    *   Open the `...pivotted.csv` files.
-    *   Verify that columns like `FIPS` are correctly zero-padded (e.g., `034013`) and that `GRID_RC` values (e.g., `3_4`) are present for gridded tests.
-
-3.  **Visual Plots**:
-    *   Inspect the generated PNG maps in the test output folders.
-    *   Check for consistent geographic placement (e.g., points over New Jersey, New York, and Texas).
-    *   Verify the colorbar limits and the statistics (Sum/Max/Min) displayed in the plot footer or legend.
-
-### Standalone Protected Build
-
-If you need to distribute the tool without sharing the source code, use the provided `build_protected.py` script. This will obfuscate the Python logic and bundle it with all dependencies into a single binary.
-
-**Prerequisites**: A C compiler (like `gcc`) must be installed on the system.
-
-**To build**:
-```bash
-./.venv/bin/python build_protected.py
-```
-
-**Result**:
-A single executable file `smkplot` will be created in the `dist/` directory. This file can be shared with users who do not have Python installed.
-
-> **Note**: Executables are OS-specific. You must run the build script on Linux to get a Linux binary, and on Windows to get a Windows `.exe`.
-
-**Configuration File Structure:**
-
-```yaml
-timestamp_utc: '2026-01-21T12:00:00Z'
-arguments:
-  filepath: /path/to/emissions.csv
-  sector: my_sector
-  county_shapefile: /path/to/counties.gpkg
-  overlay_shapefile: /path/to/state_lines.shp; /path/to/major_roads.shp
-  filter_shapefile: /path/to/my_region.shp
-  filter_shapefile_opt: within
-  pltyp: county
-  pollutant: NOX,VOC
-  cmap: viridis
-  log_scale: true
-  zoom_to_data: true
-  outdir: ./outputs
-  export_csv: true
-outputs:
-  # Auto-generated by the tool
-```
-
-**Note:** Batch mode automatically saves a configuration snapshot after each run for easy replication.
-
-## Command Line Arguments
-
-### Input/Output
-| Argument | Description |
-| :--- | :--- |
-| `-f`, `--filepath` | Path to emissions file (CSV, TXT, NetCDF, FF10) **OR** configuration file (`.yaml`, `.json`) |
-| `--sector` | Sector name for output file prefixes |
-| `--outdir` | Output directory (default: `outputs`) |
-| `--export-csv` | Export processed data to CSV |
-
-### Execution Mode
-| Argument | Description |
-| :--- | :--- |
-| `--run-mode` | Execution mode: `gui` or `batch` (auto-detected if omitted) |
-| `--self-test` | Run synthetic data test to verify installation |
-| `--workers` | Number of parallel workers for batch (0=auto, default) |
-
-### Plot Settings
-| Argument | Description |
-| :--- | :--- |
-| `--pltyp` | Plot type: `county` (default) or `grid` |
-| `--pollutant` | Pollutant(s) to plot (comma/space-separated) |
-| `--cmap` | Colormap name (default: `viridis`; e.g., `jet`, `plasma`, `turbo`) |
-| `--log-scale` | Use logarithmic color scale |
-| `--bins` | Custom colorbar bin edges (comma/space-separated) |
-| `--fill-nan` | Value for missing data (e.g., `0.0`) |
-| `--zoom-to-data` | Zoom to data extent (auto-enabled with spatial filtering) |
-| `--zoom-pad` | Padding fraction for zoom (default: 0.02) |
-
-### Geometry & Projections
-| Argument | Description |
-| :--- | :--- |
-| `--county-shapefile` | Path to county boundary shapefile (required for county plots) |
-| `--griddesc` | Path to GRIDDESC file (required for grid plots, except NetCDF) |
-| `--gridname` | Grid name from GRIDDESC |
-| `--overlay-shapefile` | Path to overlay shapefile (can specify multiple times) |
-| `--projection` | Projection mode: `auto` (default), `wgs84`, or `lcc` |
-| `--force-lcc` | Force legacy CONUS LCC projection (deprecated) |
-
-### Spatial Filtering
-| Argument | Description |
-| :--- | :--- |
-| `--filter-shapefile` | Path/URL to shapefile(s) for spatial filtering (can specify multiple times) |
-| `--filter-shapefile-opt` | Filter operation: `within`, `intersect`, or `clipped` (default: `intersect`) |
-| `--filtered-by-overlay` | [DEPRECATED] Use `--filter-shapefile-opt` instead |
-
-**Filter Operations:**
-*   **`within`**: Keeps features whose center (centroid/representative point) is inside the filter shapefile.
-*   **`intersect`**: Keeps features that touch any part of the filter shapefile.
-*   **`clipped`**: Geometrically clips features (like grid cells) to match the filter shapefile boundary.
-
-### Data Filtering
-| Argument | Description |
-| :--- | :--- |
-| `--filter-col` | Column name to filter by (e.g., `SCC`, `region_cd`) |
-| `--filter-start` | Start value for range filter (inclusive) |
-| `--filter-end` | End value for range filter (inclusive) |
-| `--filter-val` | Discrete value(s) to keep (repeat flag or use commas) |
-
-### File Parsing
-| Argument | Description |
-| :--- | :--- |
-| `--delim` | Delimiter: `comma`, `tab`, `pipe`, `semicolon`, or literal character |
-| `--skiprows` | Skip first N lines before header |
-| `--comment` | Comment character (e.g., `#`) |
-| `--encoding` | File encoding (e.g., `utf-8`, `latin1`) |
-
-### NetCDF Options
-| Argument | Description |
-| :--- | :--- |
-| `--ncf-tdim` | Time dimension operation: `avg`, `sum`, `max`, `min`, or index (default: `avg`) |
-| `--ncf-zdim` | Layer dimension operation: `avg`, `sum`, `max`, `min`, or index (default: `0`) |
-| `--stack-groups` | Path to STACK_GROUPS file for inline point sources |
-
-### Logging
-| Argument | Description |
-| :--- | :--- |
-| `--log-level` | Verbosity: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL` |
-| `--log-file` | Write logs to file (appends; creates timestamped file if directory given) |
-
-## Advanced Features
-
-### Multiple Overlays and Filters
-You can specify multiple shapefiles for either visual overlays or spatial filters:
-*   **CLI**: Use the flag multiple times: `--overlay-shapefile file1.shp --overlay-shapefile file2.shp`
-*   **GUI**: Separate paths with semicolons: `/path/to/file1.shp; /path/to/file2.shp`
-*   **Automatic Coloring**: Visual overlays are automatically assigned distinct colors (cyan, magenta, yellow, etc.) to differentiate between boundaries.
-
-### Spatial Filtering with Dual-Check Strategy
-The `within` filter mode uses a robust dual-check approach:
-1.  Checks if feature **centroid** is within overlay
-2.  Checks if feature **representative point** is within overlay
-3.  Includes feature if **either** check passes
-
-This ensures accurate filtering for complex geometries like coastal counties where centroids may fall in water.
-
-### Automatic Zoom Behavior
-When spatial filtering is active (using `--filter-shapefile-opt`), the tool automatically enables `--zoom-to-data` to focus the map on the filtered region, eliminating empty space.
-
-### NetCDF Grid Handling
-NetCDF files (including inline point sources) automatically derive grid parameters from file headers. External `--griddesc` arguments are ignored for NetCDF inputs.
-
-### Warning Management
-Python warnings (e.g., from matplotlib, geopandas) are captured and routed through the logging system, respecting the `--log-level` setting.
+## Experimental: Headless Operation
+If you are running on a cluster without an X-server, always use `--run-mode batch`. The tool will automatically switch to the `Agg` backend to avoid display errors.
 
 ## Troubleshooting
 
 | Issue | Solution |
 | :--- | :--- |
-| **"No module named 'tkinter'"** | Install: `sudo apt-get install python3-tk` (Linux) or reinstall Python with Tk support |
-| **"No module named 'yaml'"** | Install: `pip install PyYAML` |
-| **Display issues on remote server** | Use `--run-mode batch` to force headless operation |
-| **Missing counties in spatial filter** | Verify overlay shapefile CRS matches data; try `intersect` mode |
-| **Tight layout warnings** | These are now handled internally and can be ignored |
-| **Empty plots** | Check that pollutant names match data columns exactly (case-sensitive) |
+| **GUI won't quit** | Ensure you are using the latest `gui_qt.py` which uses `os._exit` for hardening. |
+| **"Could not determine file format"** | This is INFO only; it means the file lacks a header but will be parsed as a standard SMKREPORT. |
+| **Pollutant list is empty** | Verify the `--delim` setting matches your file structure. |
+| **Qt launch failed** | Ensure `PySide6` is installed in the local `.venv`. Use `./install.sh` to fix. |
 
-## Examples
-
-**1. Quick GUI exploration:**
-```bash
-./smkplot.py -f report.csv
-```
-
-**2. Batch process multiple pollutants:**
-```bash
-./smkplot.py --run-mode batch \
-  -f emissions.csv \
-  --county-shapefile counties.gpkg \
-  --pollutant "NOX,VOC,SO2,PM2_5" \
-  --cmap jet \
-  --log-scale \
-  --outdir ./batch_output
-```
-
-**3. Powerful Spatial Filtering (State-specific analysis):**
-```bash
-./smkplot.py --run-mode batch \
-  -f national_emissions.csv \
-  --county-shapefile us_counties.gpkg \
-  --filter-shapefile texas.shp \
-  --filter-shapefile-opt within \
-  --pollutant NOX \
-  --zoom-to-data \
-  --outdir ./texas_maps
-```
-
-**4. Grid plotting with NetCDF:**
-```bash
-./smkplot.py --run-mode batch \
-  -f CCTM_output.nc \
-  --pltyp grid \
-  --pollutant NO2 \
-  --ncf-tdim avg \
-  --ncf-zdim 0 \
-  --outdir ./netcdf_maps
-```
-
-**5. Multiple Visual Overlays:**
-```bash
-./smkplot.py --run-mode batch \
-  -f report.csv \
-  --overlay-shapefile state_lines.shp \
-  --overlay-shapefile pipelines.shp \
-  --pollutant CO
-```
-
-**6. Reuse saved configuration:**
-```bash
-./smkplot.py -f previous_run.yaml
-```
+---
+**Version**: 1.0 (Modernized)  
+**Author**: tranhuy@email.unc.edu

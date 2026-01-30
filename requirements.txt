@@ -13,3 +13,6 @@ xarray
 dask[complete]
 toolz
 cytoolz
+PySide6
+PyQt5
+openpyxl

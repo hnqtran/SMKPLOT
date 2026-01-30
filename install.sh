@@ -22,17 +22,6 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
-# 1b. Check for Tkinter (Optional but needed for GUI)
-if ! python3 -c "import tkinter" &> /dev/null; then
-    echo "WARNING: 'tkinter' module not found in $(which python3)."
-    echo "         GUI mode will NOT work. You can only use '--no-gui' / batch mode."
-    echo "         To invoke GUI, try 'module load python' or install python3-tk."
-    echo "         Continuing setup for batch-only mode..."
-    sleep 3
-else
-    echo "INFO: Tkinter detected. GUI mode supported."
-fi
-
 # 2. Create Virtual Environment
 if [ ! -d "$VENV_DIR" ]; then
     echo "[1/3] Creating virtual environment ($VENV_DIR)..."
@@ -61,14 +50,13 @@ else
     echo "WARNING: $REQUIREMENTS not found. Skipping package installation."
 fi
 
-# 4. Update Shebang in smkplot.py
+# 4. Update Shebang in smkplot.py and utilities
 echo "[3/3] Configuring $MAIN_SCRIPT..."
 if [ -f "$MAIN_SCRIPT" ]; then
     # Create a temporary file with the new shebang
     echo "#!$PYTHON_EXEC" > "${MAIN_SCRIPT}.tmp"
     
     # Append the original file content, skipping the first line (old shebang)
-    # We use 'sed' to print from line 2 to end to avoid issues if file is < 2 lines
     sed -n '2,$p' "$MAIN_SCRIPT" >> "${MAIN_SCRIPT}.tmp"
     
     # Replace the original file
@@ -77,22 +65,47 @@ if [ -f "$MAIN_SCRIPT" ]; then
     # Make executable
     chmod +x "$MAIN_SCRIPT"
     echo "      Updated shebang to: $PYTHON_EXEC"
+
+    # Also update optional GUI/Utility scripts if they exist
+    for script in "gui_qt.py" "ncf_processing.py" "batch.py"; do
+        if [ -f "$script" ]; then
+             echo "#!$PYTHON_EXEC" > "${script}.tmp"
+             sed -n '2,$p' "$script" >> "${script}.tmp"
+             mv "${script}.tmp" "$script"
+             chmod +x "$script"
+             echo "      Updated shebang for $script"
+        fi
+    done
 else
     echo "ERROR: $MAIN_SCRIPT not found."
     exit 1
 fi
 
-# 5. Check for Tkinter (Required for GUI)
-"$PYTHON_EXEC" -c "import tkinter" &> /dev/null
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "WARNING: 'tkinter' not found in this environment."
-    echo "         GUI mode will not work. Batch mode is unaffected."
-    echo "         On Ubuntu/Debian, install it with: sudo apt-get install python3-tk"
-    echo "         On RHEL/CentOS, install it with: sudo yum install python3-tkinter"
+# 5. Final Capability Check
+echo "========================================================"
+echo "Checking GUI capabilities..."
+
+# Check Qt (Preferred)
+"$PYTHON_EXEC" -c "import PySide6" &> /dev/null
+if [ $? -eq 0 ]; then
+    echo "SUCCESS: Qt GUI (PySide6) detected. Modern GUI is ready."
+else
+    # Fallback check for Tkinter
+    "$PYTHON_EXEC" -c "import tkinter" &> /dev/null
+    if [ $? -eq 0 ]; then
+        echo "INFO: Tkinter detected. Legacy GUI is available."
+    else
+        echo "WARNING: No GUI libraries (Qt or Tk) detected."
+        echo "         Only Batch Mode (--run-mode batch) will be available."
+    fi
+fi
+
+# Check for Display
+if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+    echo "NOTE: No X11/Wayland display detected. Use --run-mode batch for headless operation."
 fi
 
 echo "========================================================"
 echo "Setup Complete!"
-echo "You can now run the tool using: ./$MAIN_SCRIPT"
+echo "Run the tool using: ./$MAIN_SCRIPT"
 echo "========================================================"

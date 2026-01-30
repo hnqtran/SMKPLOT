@@ -1,4 +1,4 @@
-"""
+#!/proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/.venv/bin/python
 NetCDF and Inline processing for SMKPLOT.
 
 ##############################################################################
@@ -176,9 +176,12 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
                 raise ValueError("Could not determine grid parameters.")
 
     # Read STACK_GROUPS
+    logging.info(f"DEBUG: Reading STACK_GROUPS: {stack_groups_path}")
     with netCDF4.Dataset(stack_groups_path) as nc_stack:
         lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
         lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+
+    logging.info(f"DEBUG: Projecting {len(lats)} sources...")
 
     # Project
     proj_crs = get_proj_object_from_info(gi)
@@ -778,6 +781,7 @@ def read_ncf_emissions(
         try:
             # Lazy In-Memory Reading - For NetCDF input, ignore GRIDDESC to strictly use headers
             # User requirement: GRIDDESC is not used for netcdf/inline.
+            logging.info(f"DEBUG: Calling read_inline_emissions_lazy for {ncf_path}")
             data_dict, nrows, ncols = read_inline_emissions_lazy(
                 ncf_path, stack_groups, pollutants, 
                 tstep_idx, layer_idx, tstep_op, layer_op, 
@@ -856,9 +860,11 @@ def read_ncf_emissions(
                 geoms = [box(x0[i], y0[i], x1[i], y1[i]) for i in range(len(df))]
             _notify('INFO', f"Inline geometry: {time.time()-_t_geom:.2f}s for {len(df)} cells")
             
+            logging.info("DEBUG: Creating GeoDataFrame...")
             gdf = gpd.GeoDataFrame(df, geometry=geoms)
             
             # Add GRID_RC after filtering to be faster
+            logging.info("DEBUG: Adding GRID_RC...")
             gdf['GRID_RC'] = [f"{r:d}_{c:d}" for r, c in zip(gdf['ROW'], gdf['COL'])]
             
             # Set CRS

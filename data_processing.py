@@ -1608,8 +1608,11 @@ def read_smkreport(
         return chunk
 
     try:
+        logging.info("Starting CSV read via Pandas...")
         df = _read_and_process_chunks(pd.read_csv, read_kwargs, _process_rpt_chunk)
-    except Exception:
+        logging.info("Finished CSV read.")
+    except Exception as e:
+        logging.info(f"C-engine read failed ({e}), attempting Python engine fallback...")
         # Fallback: force python engine
         # Do not pass low_memory here as it is not supported by python engine
         fallback_kwargs = {

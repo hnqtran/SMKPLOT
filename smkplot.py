@@ -60,7 +60,7 @@ from typing import List, Set
 
 from utils import USING_TK, tk, _prune_incompatible_bundled_libs, _import_numpy_with_diagnostics
 
-SMKPLOT_VERSION = "2.1"
+SMKPLOT_VERSION = "1.0"
 
 _POLLUTANT_SPLIT_RE = re.compile(r'[\s,]+')
 
@@ -196,6 +196,7 @@ def parse_args():
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
+    ap.add_argument('--gui-lib', choices=['tk', 'qt'], default='qt', help='GUI toolkit to use: qt (default) or tk.')
 
     args = ap.parse_args()
 
@@ -311,44 +312,77 @@ def main():
         else:
             logging.info("Run mode not specified; defaulting to GUI mode.")
 
-    # GUI requested
-    reason = None
-    if not USING_TK:
-        reason = f"Matplotlib backend '{matplotlib.get_backend()}' is not TkAgg"
-    elif not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-        reason = 'No DISPLAY environment variable'
+    # GUI requested logic
+    has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     
-    # Since user explicitly requested 'gui', we attempt to force it:
-    if reason is not None:
-        logging.info("GUI mode requested but environment issues detected (%s). Attempting to force TkAgg...", reason)
-        if not matplotlib.get_backend().lower().startswith('tk'):
-            try:
-                matplotlib.use('TkAgg')
-            except Exception as e:
-                logging.warning("Backend switch failed: %s", e)
-        # Re-evaluate
-        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-                # Try legacy naive check
-                try:
-                    import tkinter as tk
-                    t = tk.Tk(); t.withdraw(); t.destroy()
-                    reason = None
-                    logging.info("Forced GUI: Tkinter display connection succeeded.")
-                except Exception as e:
-                    logging.error("Forced GUI failed: %s", e)
-        else:
-                reason = None # Assume success if DISPLAY exists or backend switch worked
+    # Selection of engine
+    gui_engine = args.gui_lib or 'qt'
     
-    # Fallback to batch if GUI is impossible and force failed
-    if reason is not None:
-        logging.error("Unable to initialize GUI: %s. Falling back to batch mode.", reason)
+    # Special case: check if GUI is actually possible
+    if not has_display:
+        # One last attempt to see if we can connect to a display (might be needed for some X11 forwarding)
+        try:
+            if gui_engine == 'qt':
+                from PySide6.QtWidgets import QApplication
+                app = QApplication.instance() or QApplication([sys.argv[0]])
+                has_display = True
+            else:
+                import tkinter as tk
+                t = tk.Tk(); t.withdraw(); t.destroy()
+                has_display = True
+        except Exception:
+            has_display = False
+
+    # Fallback to batch if GUI is impossible
+    if not has_display:
+        logging.error("Unable to initialize GUI: No DISPLAY detected. Falling back to batch mode.")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
-        from batch import _batch_mode  # Lazy import
+        from batch import _batch_mode
         return _batch_mode(args)
 
     # GUI path
     try:
+        # Qt Dispatch
+        if gui_engine == 'qt':
+            logging.info("Launching Qt GUI (Local .venv)...")
+            try:
+                from PySide6.QtWidgets import QApplication
+                from PySide6.QtGui import QFont
+                # Import the Shimmed GUI and its fake 'tk' module to get Root
+                from gui_qt import EmissionGUI as QtGUI, tk as qt_tk
+                
+                app = QApplication.instance() or QApplication(sys.argv)
+                try:
+                    font = QFont()
+                    font.setPointSize(10)
+                    app.setFont(font)
+                except: pass
+                
+                # Create Root (QMainWindow wrapped)
+                root = qt_tk.Tk() 
+                
+                # Instantiate
+                app_gui = QtGUI(
+                    root,
+                    args.filepath,
+                    args.county_shapefile,
+                    emissions_delim=args.delim,
+                    cli_args=args,
+                    app_version=SMKPLOT_VERSION
+                )
+                
+                root.show()
+                sys.exit(app.exec())
+            except ImportError as ie:
+                logging.error(f"Qt launch failed: {ie}. Check PySide6 installation in .venv.")
+                return 1
+            except Exception as e:
+                logging.error(f"Qt Runtime Error: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
+
         import tkinter as tk  # re-import safe
         from gui import EmissionGUI  # Lazy import
         root = tk.Tk()
@@ -362,7 +396,7 @@ def main():
         )
             
     except Exception as e:
-        logging.exception("Failed creating Tk root (final); falling back to batch mode")
+        logging.exception("Failed creating GUI; falling back to batch mode")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
         from batch import _batch_mode  # Lazy import
