@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 """
-GUI components for SMKPLOT.
+Native PySide6 GUI for SMKPLOT.
 
 ##############################################################################
 # STRICT PARAMETER SOURCE RULES
@@ -15,1793 +16,2740 @@ GUI components for SMKPLOT.
 #    - SMOKE Reports / FF10: MUST use external GRIDDESC file + Grid Name.
 ##############################################################################
 
-This module implements the Tkinter-based graphical user interface for the tool.
-Features include:
-- Interactive selection of input files (Emissions, Shapefiles, GRIDDESC).
-- Asynchronous data loading and processing to prevent UI freezing.
-- Dynamic filtering of data by sector, SCC, or other columns.
-- Interactive map plotting with customizable settings (colormap, scale, bins).
-- Export capabilities for plots and data.
+This module implements the Native Qt-based graphical user interface for the tool.
+Refactored from gui_qt.py/gui_tk.py to remove Tkinter compatibility layer.
+
+Original Author: tranhuy@email.unc.edu
 """
 
 import os
 import sys
+
+# Increase recursion limit for complex matplotlb/cartopy operations
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
+
 import copy
 import logging
 import threading
+import traceback
+import multiprocessing
 from typing import Optional, List, Dict, Any, Union, Tuple
+from functools import partial
+
+import pandas as pd
+import numpy as np
+
+import geopandas as gpd
+from shapely.geometry import Point, box
+import pyproj
+if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+    # Import logging here if needed, or print to stderr
+    import sys
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    sys.stderr.write("WARNING: No DISPLAY detected. Running in headless mode (qt-test). No window will be shown.\n")
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
+    QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
+    QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
+    QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
+    QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView,
+    QDockWidget, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
+    QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem
+)
+from PySide6.QtCore import (
+    Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings
+)
+from PySide6.QtGui import (
+    QAction, QIcon, QFont, QIntValidator, QDoubleValidator, 
+    QTextCursor, QColor
+)
 
 import pandas as pd
 import numpy as np
 import geopandas as gpd
-import matplotlib
-from matplotlib.colors import LogNorm
-from matplotlib import cm as mplcm
-from matplotlib.colors import BoundaryNorm
 import pyproj
-from shapely.geometry import Polygon
+import shapely
+import matplotlib
+# matplotlib.use('qtagg') # Let MPL auto-detect
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm, BoundaryNorm
+from matplotlib import cm as mplcm
+import matplotlib.patches as mpatches
 
-from config import (
-    US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
-    DEFAULT_ONLINE_COUNTIES_URL
-)
-from utils import normalize_delim, is_netcdf_file
-from data_processing import (
-    read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
-    merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
-)
-from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
-
-# Backend selection: try Tk if DISPLAY exists, otherwise Agg
-_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+# Local imports
 try:
-    if _display:
-        matplotlib.use('TkAgg')
-    else:
-        matplotlib.use('Agg')
-except Exception:
-    matplotlib.use('Agg')
+    from config import (
+        US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
+        DEFAULT_ONLINE_COUNTIES_URL
+    )
+    from utils import normalize_delim, is_netcdf_file
+    from data_processing import (
+        read_inputfile, read_shpfile, extract_grid, create_domain_gdf, 
+        detect_pollutants, map_latlon2grd, merge_emissions_with_geometry, 
+        filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, 
+        apply_spatial_filter
+    )
+    from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
+    from ncf_processing import get_ncf_dims, create_ncf_domain_gdf, read_ncf_grid_params
+except ImportError:
+    # Fallback for when running directly
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from config import *
+    from utils import *
+    from data_processing import *
+    from plotting import *
+    from ncf_processing import *
 
-import matplotlib.pyplot as plt  # noqa: E402
+class LogHandler(logging.Handler):
+    """Custom logging handler that emits a signal locally."""
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
 
-USING_TK = matplotlib.get_backend().lower().startswith('tk')
-if USING_TK:
-    try:
-        import tkinter as tk  # type: ignore
-        from tkinter import ttk, filedialog  # type: ignore
-    except Exception:
-        USING_TK = False
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt  # re-import safe
-else:
-    # Provide stubs so type checker / runtime does not fail before GUI branch
-    tk = None  # type: ignore
-    ttk = None  # type: ignore
-    filedialog = None  # type: ignore
-class EmissionGUI:
-    def __init__(self, root, inputfile_path: Optional[str], counties_path: Optional[str], emissions_delim: Optional[str] = None, *, cli_args=None, app_version: str = "1.0"):
-        self.root = root
-        self.root.title(f"SMKPLOT version {app_version} (Author: tranhuy@email.unc.edu)")
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        # UI scaling based on screen resolution (baseline ~1600px width)
+    def emit(self, record):
         try:
-            sw = max(1, int(self.root.winfo_screenwidth()))
+            msg = self.format(record)
+            if self.callback:
+                self.callback(msg)
+        except (RuntimeError, AttributeError):
+            pass # Avoid crash if UI deleted during logging
         except Exception:
-            sw = 1600
+            pass
+
+class TableWindow(QMainWindow):
+    """Modern window to display a DataFrame in a searchable, sortable table."""
+    def __init__(self, df, title="Data Preview", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1100, 700)
+        
+        # UI Setup
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header Area
+        header_layout = QHBoxLayout()
+        info = f"Showing {min(len(df), 2000):,} of {len(df):,} rows | {len(df.columns)} Columns"
+        self.info_lbl = QLabel(info)
+        self.info_lbl.setStyleSheet("font-weight: bold; color: #4b5563;")
+        header_layout.addWidget(self.info_lbl)
+        
+        header_layout.addStretch()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Filter rows...")
+        self.search_input.setFixedWidth(200)
+        self.search_input.textChanged.connect(self._filter_table)
+        header_layout.addWidget(QLabel("Search:"))
+        header_layout.addWidget(self.search_input)
+        
+        layout.addLayout(header_layout)
+        
+        # Table Setup
+        df_show = df.head(2000) # Increased limit for modern systems
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setRowCount(len(df_show))
+        self.table.setColumnCount(len(df_show.columns))
+        self.table.setHorizontalHeaderLabels([str(c) for c in df_show.columns])
+        
+        # Populate
+        self._all_items = []
+        for i, row in enumerate(df_show.itertuples(index=False)):
+            row_items = []
+            for j, val in enumerate(row):
+                item = QTableWidgetItem(str(val))
+                self.table.setItem(i, j, item)
+                row_items.append(item)
+            self._all_items.append(row_items)
+        
+        self.table.setSortingEnabled(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setMinimumSectionSize(80)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setStyleSheet("""
+            QTableWidget { border: 1px solid #d1d5db; background-color: #ffffff; gridline-color: #f3f4f6; }
+            QHeaderView::section { background-color: #f9fafb; padding: 4px; border: 1px solid #e5e7eb; font-weight: bold; }
+        """)
+        
+        layout.addWidget(self.table)
+        
+        # Footer
+        footer_layout = QHBoxLayout()
+        btn_copy = QPushButton("Copy Selected")
+        btn_copy.clicked.connect(self._copy_selection)
+        footer_layout.addWidget(btn_copy)
+        
+        footer_layout.addStretch()
+        
+        btn_export = QPushButton("Export to CSV")
+        btn_export.setObjectName("primaryBtn")
+        btn_export.clicked.connect(lambda: self.export_csv(df))
+        footer_layout.addWidget(btn_export)
+        
+        layout.addLayout(footer_layout)
+
+    def _filter_table(self, text):
+        text = text.lower()
+        for i in range(self.table.rowCount()):
+            match = False
+            for j in range(self.table.columnCount()):
+                item = self.table.item(i, j)
+                if item and text in item.text().lower():
+                    match = True
+                    break
+            self.table.setRowHidden(i, not match)
+
+    def _copy_selection(self):
+        selected = self.table.selectedRanges()
+        if not selected: return
+        s = ""
+        for r in range(selected[0].topRow(), selected[0].bottomRow() + 1):
+            for c in range(selected[0].leftColumn(), selected[0].rightColumn() + 1):
+                item = self.table.item(r, c)
+                s += (item.text() if item else "") + "\t"
+            s = s.strip() + "\n"
+        QApplication.clipboard().setText(s)
+
+    def export_csv(self, df):
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "CSV Files (*.csv)")
+        if path:
+            try:
+                df.to_csv(path, index=False)
+                QMessageBox.information(self, "Export Successful", f"Data saved to: {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", f"Failed to save CSV: {str(e)}")
+
+class MetadataWindow(QDialog):
+    """Shows raw metadata (attrs) of a DataFrame."""
+    def __init__(self, data_obj, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Data Metadata / Attributes")
+        self.resize(600, 500)
+        layout = QVBoxLayout(self)
+        
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setFont(QFont("Monospace", 9))
+        
+        summary = "--- Dataset Metadata ---\n"
+        if hasattr(data_obj, 'attrs'):
+            for k, v in data_obj.attrs.items():
+                if k == 'per_file_summaries': continue
+                summary += f"{k}: {v}\n"
+        else:
+            summary += "No attributes found.\n"
+            
+        # Special handling for per-file summaries
+        summaries = data_obj.attrs.get('per_file_summaries')
+        if summaries:
+            summary += "\n\n--- Individual File Statistics ---\n"
+            for i, s in enumerate(summaries):
+                summary += f"\nFile {i+1}: {s.get('source')}\n"
+                pols = s.get('pollutants', {})
+                if not pols:
+                    summary += "  (No pollutant statistics found for this file)\n"
+                for p, stats in pols.items():
+                    summary += f"  - {p}:\n"
+                    summary += f"    Sum: {stats['sum']:.4g}, Max: {stats['max']:.4g}, Mean: {stats['mean']:.4g}, Count: {stats['count']}\n"
+                
+                # Also list unique attributes of this file if they differ
+                # (For now just show some relevant ones)
+                f_attrs = s.get('attrs', {})
+                if f_attrs:
+                    summary += "    Metadata: "
+                    meta_bits = []
+                    for k in ['source_type', 'is_netcdf', 'units_map']:
+                        if k in f_attrs: meta_bits.append(f"{k}={f_attrs[k]}")
+                    summary += (", ".join(meta_bits) if meta_bits else "None") + "\n"
+
+        if hasattr(data_obj, 'columns'):
+            summary += "\n--- Columns ---\n"
+            summary += "\n".join(list(data_obj.columns))
+            
+        self.text.setText(summary)
+        layout.addWidget(self.text)
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+class DetailedStatsWindow(QDialog):
+    """Shows a detailed table of statistics per file and combined."""
+    def __init__(self, emissions_df, pollutant, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Detailed Statistics: {pollutant}")
+        self.resize(800, 400)
+        layout = QVBoxLayout(self)
+        
+        from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QLabel
+        
+        self.table = QTableWidget()
+        layout.addWidget(self.table)
+        
+        # Prepare data
+        summaries = emissions_df.attrs.get('per_file_summaries', [])
+        
+        # Combined stats
+        combined = {}
         try:
-            self._ui_scale = max(0.85, min(1.6, sw / 1600.0))
-        except Exception:
-            self._ui_scale = 1.0
-        # helpers for scalable widget sizes (character widths)
-        def _w_chars(n: int, min_chars: int = 10, max_chars: int = 120) -> int:
-            try:
-                return int(max(min_chars, min(max_chars, round(n * self._ui_scale))))
-            except Exception:
-                return n
-        self._w_chars = _w_chars  # store for use in layout
-
-        self.cli_args = cli_args
-        self.json_payload = getattr(cli_args, 'json_payload', None) if cli_args else None
-        self.json_path = getattr(cli_args, 'json', None) if cli_args else None
-        self._json_arguments = self.json_payload.get('arguments', {}) if isinstance(self.json_payload, dict) else {}
+            # First try the currently matched data (filtered by SCC/PlotBy)
+            # If we are in the main GUI, we might want the global stats of the DF
+            vals = pd.to_numeric(emissions_df[pollutant], errors='coerce').dropna()
+            if not vals.empty:
+                combined = {
+                    'source': 'TOTAL (Combined)',
+                    'sum': float(vals.sum()),
+                    'max': float(vals.max()),
+                    'mean': float(vals.mean()),
+                    'count': len(vals)
+                }
+        except Exception: pass
         
-        # Prioritize arguments from CLI before configuration snapshot        
-        self.emissions_delim = getattr(cli_args, 'delim', None) if cli_args else None or self._json_arguments.get('delim', None)
-        self.emissions_delim = normalize_delim(self.emissions_delim)
-        self.sector = getattr(cli_args, 'sector', None) if cli_args else None or self._json_arguments.get('sector', None)
-        self.skiprows = getattr(cli_args, 'skiprows', None) if cli_args else None or self._json_arguments.get('skiprows', None)
-        self.comment_token = getattr(cli_args, 'comment', None) if cli_args else None or self._json_arguments.get('comment', None)
-        self.encoding = getattr(cli_args, 'encoding', None) if cli_args else None or self._json_arguments.get('encoding', None)
+        rows = []
+        for s in summaries:
+            pstats = s.get('pollutants', {}).get(pollutant)
+            if pstats:
+                rows.append({
+                    'source': os.path.basename(str(s.get('source'))),
+                    'sum': pstats['sum'],
+                    'max': pstats['max'],
+                    'mean': pstats['mean'],
+                    'count': pstats['count']
+                })
         
-        # fill_nan logic
-        self.fill_nan_arg = getattr(cli_args, 'fill_nan', None) if cli_args else None or self._json_arguments.get('fill_nan', None)
-        
-        # Fill NaN with Zero checkbox state
-        # If fill_nan_arg is approximately 0, default to checked
-        default_zero = False
-        if self.fill_nan_arg is not None:
-            try:
-                if abs(float(self.fill_nan_arg)) < 1e-9:
-                    default_zero = True
-            except Exception:
-                pass
-        self.fill_zero_var = tk.BooleanVar(value=default_zero)
-
-        self.filter_col = getattr(cli_args, 'filter_col', None) if cli_args else None or self._json_arguments.get('filter_col', None)
-        self.filter_start = getattr(cli_args, 'filter_start', None) if cli_args else None or self._json_arguments.get('filter_start', None)
-        self.filter_end = getattr(cli_args, 'filter_end', None) if cli_args else None or self._json_arguments.get('filter_end', None)
-        
-        raw_filter_vals = getattr(cli_args, 'filter_val', None) if cli_args else None or self._json_arguments.get('filter_val', None)
-        if isinstance(raw_filter_vals, (list, tuple, set)):
-            self.filter_values = [str(v) for v in raw_filter_vals if v is not None]
-        elif raw_filter_vals is None:
-            self.filter_values = None
+        if combined:
+            rows.append(combined)
+            
+        if not rows:
+            layout.addWidget(QLabel(f"No individual file statistics available for {pollutant}.\nEnsure you have loaded multiple files via a list or configuration."))
         else:
-            self.filter_values = [str(raw_filter_vals)]
-        if not self.filter_values:
-            self.filter_values = None
+            self.table.setRowCount(len(rows))
+            self.table.setColumnCount(5)
+            self.table.setHorizontalHeaderLabels(['Source', 'Sum', 'Max', 'Mean', 'Count'])
+            
+            for i, r in enumerate(rows):
+                self.table.setItem(i, 0, QTableWidgetItem(r['source']))
+                self.table.setItem(i, 1, QTableWidgetItem(f"{r['sum']:.4g}"))
+                self.table.setItem(i, 2, QTableWidgetItem(f"{r['max']:.4g}"))
+                self.table.setItem(i, 3, QTableWidgetItem(f"{r['mean']:.4g}"))
+                self.table.setItem(i, 4, QTableWidgetItem(str(r['count'])))
+            
+            self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
 
-        # NetCDF Dimension Config (from CLI/JSON)
-        self.ncf_tdim = getattr(cli_args, 'ncf_tdim', 'avg') if cli_args else 'avg'
-        self.ncf_zdim = getattr(cli_args, 'ncf_zdim', '0') if cli_args else '0'
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
 
-        # GUI state for delimiter selection (auto/comma/tab/pipe/space/other)
-        self.delim_var: Optional[tk.StringVar] = None
-        self.custom_delim_var: Optional[tk.StringVar] = None
-        self._last_loaded_delim_state: Optional[Tuple[str, str, str]] = None
-        self._merged_cache: Dict[
-            Tuple,
-            Tuple[gpd.GeoDataFrame, Optional[pd.DataFrame], Optional[str]],
-        ] = {}
-        self.emissions_df: Optional[pd.DataFrame] = None
-        self.raw_df: Optional[pd.DataFrame] = None
-        self.counties_gdf: Optional[gpd.GeoDataFrame] = None
-        self.overlay_gdf: Optional[gpd.GeoDataFrame] = None
-        self.grid_gdf: Optional[gpd.GeoDataFrame] = None
-        self.pollutants: List[str] = []
-        self.units_map: Dict[str, str] = {}
-        self.fig = None
-        self.ax = None
-        self.canvas = None
-        self.toolbar = None
-        self.cbar_ax = None  # track colorbar axis for cleanup
-        self._preview_win = None  # popup preview window
-        # Interactive zoom state
-        self._zoom_rect = None
-
-        # State for "Update, Don't Replot" optimization
-        # Mapping: pollutant -> { 'win': Toplevel, 'fig': Figure, 'ax': Axes, 'canvas': Canvas, 'stats_cbids': list }
-        self._plot_windows = {}
+class PlotWindow(QMainWindow):
+    """Pop-out window for a specific plot."""
+    def __init__(self, gdf, column, meta, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Plot: {column}")
+        self.resize(1000, 800)
         
-        # Restore UI state first
-        self._zoom_press = None
-        self._zoom_cids = []
-        # Base view (xlim, ylim) to support Reset View behavior
-        self._base_view = None
-        # Custom scale bar state
-        self.scale_var: Optional[tk.StringVar] = None
-        # Custom bins (used as colorbar ticks) state
-        self.class_bins_var: Optional[tk.StringVar] = None
-        # Plot-by mode: auto, county, grid
-        self.plot_by_var: Optional[tk.StringVar] = None
-        # SCC selection dropdown (enabled only when SCC/SCC Description exist)
-        self.scc_select_var: Optional[tk.StringVar] = None
-        self._scc_display_to_code: Dict[str, str] = {}
-        self._has_scc_cols: bool = False
-        if USING_TK:
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        
+        self.figure = Figure(figsize=(10, 8), dpi=100)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        
+        from plotting import create_map_plot, _label_colorbar
+        ax = self.figure.add_subplot(111)
+        try:
+            ax.set_aspect('equal', adjustable='box')
+        except: pass
+        
+        # Plotting parameters
+        cmap = meta.get('cmap', 'viridis')
+        use_log = meta.get('use_log', True)
+        bins = meta.get('bins', [])
+        unit = meta.get('unit', '')
+        vmin = meta.get('vmin')
+        vmax = meta.get('vmax')
+        
+        # Render the map
+        create_map_plot(
+            gdf=gdf,
+            column=column,
+            title=f"{column} Emissions",
+            ax=ax,
+            cmap_name=cmap,
+            bins=bins,
+            log_scale=use_log,
+            unit_label=unit,
+            crs_proj=gdf.crs,
+            vmin=vmin,
+            vmax=vmax
+        )
+        _label_colorbar(ax, unit)
+        
+        # Calculate stats for the title
+        try:
+            vals = pd.to_numeric(gdf[column], errors='coerce').dropna()
+            if not vals.empty:
+                s_min, s_max = vals.min(), vals.max()
+                s_mean, s_sum = vals.mean(), vals.sum()
+                stats_str = f"Min: {s_min:.4g}  Mean: {s_mean:.4g}  Max: {s_max:.4g}  Sum: {s_sum:.4g} {unit}"
+                ax.set_title(f"{column} Emissions\n{stats_str}", fontsize=12)
+        except: pass
+            
+        self.canvas.draw()
+
+class NativeEmissionGUI(QMainWindow):
+    """
+    Main Application Window (Native PySide6 implementation).
+    Inherits from QMainWindow but remains strictly compatible with
+    legacy Tkinter-based entry points via manual signal handling.
+    """
+    # Signals for cross-thread communication
+    notify_signal = Signal(str, str) # level, message
+    update_log_signal = Signal(str)
+    data_loaded_signal = Signal(list, bool) # pollutants, is_netcdf
+    plot_ready_signal = Signal(object, str, dict) # gdf, column, meta
+    
+    def __init__(self, 
+                 inputfile_path: Optional[str] = None, 
+                 counties_path: Optional[str] = None, 
+                 emissions_delim: Optional[str] = None, 
+                 grid_name: Optional[str] = None, 
+                 griddesc: Optional[str] = None, 
+                 pollutant: Optional[str] = None, 
+                 json_payload: Any = None,
+                 cli_args: Any = None, 
+                 app_version: str = "2.0"):
+        super().__init__()
+
+        # --- Monkey-patch for Graticule Recursion Guard ---
+        # Since we cannot touch plotting.py directly, we wrap the function here.
+        import plotting
+        original_draw_graticule = plotting._draw_graticule
+        
+        def guarded_draw_graticule(*args, **kwargs):
+            ax = args[0] if args else kwargs.get('ax')
+            if ax is None: return original_draw_graticule(*args, **kwargs)
+            
+            # Use a specialized guard to prevent infinite recursion during zoom events
+            if getattr(ax, '_smk_drawing_graticule', False):
+                return None
+            ax._smk_drawing_graticule = True
             try:
-                self.status_var = tk.StringVar(value='Ready.')
-            except Exception:
-                self.status_var = None
-        else:
-            self.status_var = None
-        self.status_label = None
-        self._last_attrs_summary = ''
-        self._loader_messages: List[Tuple[str, str]] = []
-        self._preview_has_data = False
-        self._source_type: Optional[str] = None
+                # Force autoscale off during graticule drawing to prevent zoom loops
+                original_autoscale = ax.get_autoscale_on()
+                ax.set_autoscale_on(False)
+                res = original_draw_graticule(*args, **kwargs)
+                ax.set_autoscale_on(original_autoscale)
+                return res
+            finally:
+                ax._smk_drawing_graticule = False
+        
+        plotting._draw_graticule = guarded_draw_graticule
+        
+        # Update local alias to ensure internal methods use the guarded version
+        import sys
+        module = sys.modules[__name__]
+        setattr(module, '_draw_graticule_fn', guarded_draw_graticule)
+        # --------------------------------------------------
+
+        self.setWindowTitle(f"SMKPLOT v{app_version} (Native Qt) (Author: tranhuy@email.unc.edu)")
+        self.resize(1600, 900)
+        
+        # --- State Variables ---
+        # Handle being passed from smkplot.py (cli_args or json_payload as Namespace/dict)
+        self.cli_args = cli_args or json_payload
+        
+        # We want _json_arguments to be a flat dict of parameters
+        self._json_arguments = {}
+        try:
+            if isinstance(self.cli_args, dict):
+                # If passed a dict, it might be the raw config or a param dict
+                payload = self.cli_args.get('json_payload', self.cli_args)
+                if isinstance(payload, dict):
+                    # Try to flatten if it has an 'arguments' key
+                    self._json_arguments = payload.get('arguments', payload).copy() if isinstance(payload.get('arguments'), dict) else payload.copy()
+                else:
+                    self._json_arguments = payload.__dict__.copy() if hasattr(payload, '__dict__') else {}
+            elif self.cli_args is not None:
+                # It's likely an argparse Namespace
+                self._json_arguments = self.cli_args.__dict__.copy()
+                # If it has a raw payload, merge in any missing keys
+                raw_payload = getattr(self.cli_args, 'json_payload', None)
+                if isinstance(raw_payload, dict):
+                    flat_json = raw_payload.get('arguments', raw_payload)
+                    if isinstance(flat_json, dict):
+                        # Merge CLI values take precedence
+                        merged = flat_json.copy()
+                        merged.update(self._json_arguments)
+                        self._json_arguments = merged
+        except Exception as e:
+            logging.warning(f"Parameter extraction failed: {e}. Using defaults.")
+            self._json_arguments = {} 
+
+        self.inputfile_path = inputfile_path or getattr(self.cli_args, 'filepath', None) or self._json_arguments.get('filepath')
+        self.counties_path = counties_path or getattr(self.cli_args, 'county_shapefile', None) or self._json_arguments.get('county_shapefile')
+        self.griddesc_path = griddesc or getattr(self.cli_args, 'griddesc', None) or self._json_arguments.get('griddesc')
+        self.grid_name = grid_name or getattr(self.cli_args, 'gridname', None) or self._json_arguments.get('gridname')
+        self.emissions_delim = emissions_delim or getattr(self.cli_args, 'delim', None)
+        
+        # Store initial pollutant request
+        self.preselected_pollutant = pollutant or getattr(self.cli_args, 'pollutant_first', None) or getattr(self.cli_args, 'pollutant', None) or self._json_arguments.get('pollutant')
+        
+        # User selections
+        self.input_files_list = [] # For multiple file support
+        self.pollutants = []
+        self.units_map = {}
+        
+        # DataFrames
+        self.emissions_df = None
+        self.raw_df = None
+        self.grid_gdf = None # Equivalent to self.grid_gdf
+        self.counties_gdf = None # Equivalent to self.counties_gdf
+        self.overlay_gdf = None
+        self.filter_gdf = None
+        self._merged_gdf = None
+        self._hover_enabled = True
+        self._last_stats_calc = None
+        
+        # Syncing variables with gui_qt.py for higher fidelity logic replication
+        self._loader_messages = []
         self._ff10_ready = False
         self._ff10_grid_ready = False
+        self._merged_cache = {}
+        self._plot_windows = []
+        self._zoom_press = None
+        self._zoom_cids = []
+        self._base_view = None
+        self.initial_filter_overlay = None
+        self.filter_values = {}
+        self.ncf_tdim = 1
+        self.ncf_zdim = 1
+        self._last_attrs_summary = ""
 
-        # --- Pre-calculate settings for UI initialization ---
-        # Load optional overlay shapefile
-        self.overlay_path  = getattr(cli_args, 'overlay_shapefile', None) if cli_args else None or self._json_arguments.get('overlay_shapefile', None)
+        # Animation / Time Nav State
+        self._t_data_cache = None
+        self._t_idx = 0
+        self._is_showing_agg = False
+        self._anim_timer = QTimer()
+        self._anim_timer.timeout.connect(lambda: self._step_time(1))
         
-        # Load filter shapefile (new parameter)
-        self.filter_path = getattr(cli_args, 'filter_shapefile', None) if cli_args else None or self._json_arguments.get('filter_shapefile', None)
+        # Add a debouncer for plot title/stats updates to maintain responsiveness
+        self._title_timer = QTimer()
+        self._title_timer.setSingleShot(True)
+        self._title_timer.timeout.connect(self._exec_title_update)
+        self._current_ax_for_title = None
 
-        # Load filter_shapefile_opt setting (new parameter)
-        val_filter_opt = getattr(cli_args, 'filter_shapefile_opt', None)
-        if val_filter_opt is None:
-            val_filter_opt = self._json_arguments.get('filter_shapefile_opt', None)
-
-        # Load filtered_by_overlay setting (deprecated, backward compatibility)
-        val_filter = getattr(cli_args, 'filtered_by_overlay', None) 
-        if val_filter is None:
-            val_filter = self._json_arguments.get('filtered_by_overlay', None)
+        # UI State
+        self.class_bins_var = "" 
+        self._last_loaded_delim_state = None
+        self._scc_display_to_code = {} # Mapping for display-to-code filtering
+        self._data_collection = None # Matplotlib collection
+        self._table_window = None # To hold reference to summary table window
         
-        # Determine initial filter mode
-        initial_filter_mode = 'False'
-        raw_filter = val_filter_opt if val_filter_opt is not None else val_filter
-        if raw_filter:
-            if isinstance(raw_filter, bool):
-                initial_filter_mode = 'intersect' if raw_filter else 'False'
-            elif isinstance(raw_filter, str):
-                s_filter = raw_filter.strip().lower()
-                if s_filter in ('true', 'yes', 'on'):
-                    initial_filter_mode = 'intersect'
-                elif s_filter in ('false', 'no', 'off', 'none', 'null', ''):
-                    initial_filter_mode = 'False'
-                else:
-                    initial_filter_mode = raw_filter
-        self.initial_filter_overlay = initial_filter_mode
-        # --- End pre-calculation ---
+        # --- Apply Modern Theme ---
+        self._apply_styles()
 
-        self._build_layout()
-
-        # Restore UI choices (linear/log, bins, cmap, delim, etc.)
-        if self._json_arguments.get('log_scale') is True:
-            self.scale_var.set('log')
-        elif self._json_arguments.get('log_scale') is False:
-            self.scale_var.set('linear')
-        else:
-            self.scale_var.set('linear')
-
-        bins_val = self._json_arguments.get('bins')
-        if bins_val is not None:
-            self.class_bins_var.set(str(bins_val))
-        else:
-            self.class_bins_var.set('')
-
-        cmap_val = self._json_arguments.get('cmap')
-        if cmap_val:
-            self.cmap_var.set(str(cmap_val))
-        else:
-            self.cmap_var.set('viridis')
-
-        # Restore from CLI or JSON snapshot
-        self.inputfile_path = inputfile_path or (getattr(cli_args, 'filepath', None) if cli_args else None) or self._json_arguments.get('filepath')
-
-        # --- Initialize logic-heavy fields and trigger loaders ---
+        # --- Initialize UI ---
+        self._init_ui()
         
-        # 1. Emissions Input
-        if isinstance(self.inputfile_path, (list, tuple)):
-            self.inputfile_path = "; ".join([str(p) for p in self.inputfile_path if p])
+        # --- Logger Setup ---
+        self.log_handler = LogHandler(self._append_log)
+        fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        self.log_handler.setFormatter(fmt)
+        logging.getLogger().addHandler(self.log_handler)
+        logging.getLogger().setLevel(logging.INFO)
+        
+        # Connect signals
+        self.notify_signal.connect(self._handle_notification)
+        self.update_log_signal.connect(self.log_text.append)
+        self.data_loaded_signal.connect(self._post_load_update)
+        self.plot_ready_signal.connect(self._render_plot_on_main)
+        
+        # --- Auto-Load if arguments present ---
+        QTimer.singleShot(100, self._startup_load)
+
+    def _apply_styles(self):
+        """Apply a high-contrast, polished theme that ensures readability."""
+        style = """
+            /* Base Styles */
+            QWidget { 
+                font-family: 'Segoe UI', 'Roboto', 'Ubuntu', sans-serif; 
+                font-size: 11px; 
+                color: #212529; 
+                background: transparent;
+            }
             
-        if self.inputfile_path:
-            try:
-                self.emis_entry.delete(0, tk.END)
-                self.emis_entry.insert(0, str(self.inputfile_path))
-            except Exception:
-                pass
-            # Auto-load if coming from CLI or JSON snapshot
-            if self.json_payload or (cli_args and getattr(cli_args, 'filepath', None)):
-                self.root.after(200, lambda: self.load_inputfile(show_preview=False))
+            QMainWindow, QDialog, QMessageBox {
+                background-color: #f0f2f5;
+            }
 
-        # 2. GRIDDESC
-        self.griddesc_path = getattr(cli_args, 'griddesc', None) or self._json_arguments.get('griddesc')
-        if self.griddesc_path == "(NetCDF Attributes)":
-            self.griddesc_path = None
-
-        if self.griddesc_path:
-            try:
-                self.griddesc_entry.delete(0, tk.END)
-                self.griddesc_entry.insert(0, str(self.griddesc_path))
-            except Exception:
-                pass
-            self.load_griddesc()
+            /* Containers */
+            QGroupBox {
+                font-weight: bold; 
+                border: 1px solid #d1d5db;
+                border-radius: 6px; 
+                margin-top: 20px; 
+                padding-top: 15px;
+                background-color: #ffffff;
+                color: #374151;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; 
+                left: 10px; 
+                padding: 0 5px; 
+                color: #3b82f6;
+            }
             
-            # Restore selected grid name (Priority: CLI/Config)
-            grid_name = getattr(cli_args, 'gridname', None) or self._json_arguments.get('gridname')
-            if self.grid_name_var and grid_name and grid_name != "Select Grid":
-                self.grid_name_var.set(grid_name)
-                self.load_grid_shape()
-
-        # 3. SCC Selection (Handled by load_inputfile if present)
-
-        # 4. Counties Shapefile
-        self.counties_path = counties_path or getattr(cli_args, 'county_shapefile', None) or self._json_arguments.get('county_shapefile')
-        if self.counties_path:
-            try:
-                self.county_entry.delete(0, tk.END)
-                self.county_entry.insert(0, str(self.counties_path))
-            except Exception:
-                pass
-            self.load_shpfile()
-        else:
-            self.use_online_counties()
-
-        # 5. Overlays and Filters
-        if self.overlay_path:
-            ov_str = ";".join(self.overlay_path) if isinstance(self.overlay_path, list) else str(self.overlay_path)
-            try:
-                self.overlay_entry.delete(0, tk.END)
-                self.overlay_entry.insert(0, ov_str)
-            except Exception:
-                pass
+            /* Inputs - Guaranteed Contrast */
+            QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {
+                background-color: #ffffff;
+                color: #111827;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 3px 5px;
+                min-height: 22px;
+            }
+            QLineEdit:focus, QComboBox:focus { 
+                border: 1.5px solid #3b82f6; 
+                background-color: #fcfdfe;
+            }
             
-        if self.filter_path:
-            fl_str = ";".join(self.filter_path) if isinstance(self.filter_path, list) else str(self.filter_path)
-            try:
-                self.filter_entry.delete(0, tk.END)
-                self.filter_entry.insert(0, fl_str)
-            except Exception:
-                pass
+            QComboBox::drop-down { border-left: 0px; }
+            QComboBox QAbstractItemView {
+                background-color: #ffffff;
+                color: #111827;
+                selection-background-color: #3b82f6;
+                selection-color: #ffffff;
+                border: 1px solid #d1d5db;
+            }
 
-        # Trigger loader for overlays/filters
-        if self.overlay_path or self.filter_path:
-            self.load_overlay()
+            /* Buttons */
+            QPushButton {
+                background-color: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 5px 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover { background-color: #f9fafb; border-color: #9ca3af; }
+            QPushButton:pressed { background-color: #f3f4f6; }
+            
+            QPushButton#primaryBtn {
+                background-color: #2563eb;
+                color: #ffffff !important;
+                border: 1px solid #1e3a8a;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton#primaryBtn:hover { background-color: #1d4ed8; }
+            QPushButton#primaryBtn:disabled { background-color: #93c5fd; color: #f3f4f6; }
 
-    # ---- Projection helpers (LCC + graticule) ----
-    def _default_conus_lcc_crs(self):
-        """Return a default CONUS Lambert Conformal Conic CRS and transformers.
-        Uses standard parallels 33/45 and center 40N, 96W. Honors USE_SPHERICAL_EARTH.
+            /* Tabs */
+            QTabWidget::pane { 
+                border: 1px solid #d1d5db; 
+                top: -1px; 
+                background: #ffffff; 
+                border-radius: 0 0 6px 6px; 
+            }
+            QTabBar::tab {
+                background: #e5e7eb; border: 1px solid #d1d5db;
+                padding: 6px 12px; margin-right: 1px;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+                color: #4b5563;
+            }
+            QTabBar::tab:selected { 
+                background: #ffffff; border-bottom-color: #ffffff; 
+                font-weight: bold; color: #2563eb; 
+            }
+            
+            /* Logs & Progress */
+            QTextEdit#log_text { background-color: #ffffff; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; }
+            QProgressBar {
+                background-color: #f3f4f6; 
+                border: 1px solid #d1d5db;
+                border-radius: 10px; 
+                text-align: center; 
+                color: #1f2937;
+                font-weight: bold;
+                height: 18px;
+            }
+            QProgressBar::chunk { background-color: #3b82f6; border-radius: 8px; }
+            
+            /* Status Bar */
+            QStatusBar { background-color: #ffffff; border-top: 1px solid #e5e7eb; color: #4b5563; }
         """
+        self.setStyleSheet(style)
+        if QApplication.instance():
+            QApplication.instance().setStyleSheet(style)
+
+    def _init_ui(self):
+        """Initialize the complete UI layout with tightened margins and a modern look."""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
+
+        # Use Splitter for resizable panels
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        
+        # --- Left Control Panel ---
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(400)
+        left_layout = QVBoxLayout(left_panel)
+        self.control_layout = left_layout 
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+        
+        # Tabbed config
+        self.tabs = QTabWidget()
+        
+        # Page 1: Data Source
+        page_source = QWidget(); l_source = QVBoxLayout(page_source)
+        l_source.setContentsMargins(6, 6, 6, 6)
+        l_source.setSpacing(2)
+        self._init_inputs_section(l_source)
+        self._init_variable_section(l_source)
+        l_source.addStretch()
+        self.tabs.addTab(page_source, "Source")
+        
+        # Page 2: Filtering
+        page_filter = QWidget(); l_filter = QVBoxLayout(page_filter)
+        l_filter.setContentsMargins(6, 6, 6, 6)
+        self._init_filter_section(l_filter)
+        l_filter.addStretch()
+        self.tabs.addTab(page_filter, "Filter")
+        
+        # Page 3: Map View
+        page_visuals = QWidget(); l_visuals = QVBoxLayout(page_visuals)
+        l_visuals.setContentsMargins(6, 6, 6, 6)
+        l_visuals.setSpacing(2)
+        self._init_plot_settings_section(l_visuals)
+        
+        # Reset View helper
+        btn_reset = QPushButton("Reset View to All Data")
+        btn_reset.setIcon(self.style().standardIcon(QStyle.SP_FileDialogToParent))
+        btn_reset.clicked.connect(self.reset_home_view)
+        l_visuals.addWidget(btn_reset)
+        
+        self._init_animation_section(l_visuals)
+        l_visuals.addStretch()
+        self.tabs.addTab(page_visuals, "View")
+        
+        # Page 4: Analysis
+        page_stats = QWidget(); l_stats = QVBoxLayout(page_stats)
+        l_stats.setContentsMargins(6, 6, 6, 6)
+        self._init_summary_section(l_stats)
+        self._init_stats_panel(l_stats)
+        l_stats.addStretch()
+        self.tabs.addTab(page_stats, "Stats")
+
+        left_layout.addWidget(self.tabs)
+        
+        # Always-visible footer buttons
+        footer = QFrame()
+        footer.setFrameShape(QFrame.NoFrame)
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(2, 4, 2, 4)
+        footer_layout.setSpacing(10)
+        
+        self.btn_main_plot = QPushButton("GENERATE PLOT")
+        self.btn_main_plot.setObjectName("primaryBtn")
+        self.btn_main_plot.setMinimumHeight(40)
+        self.btn_main_plot.clicked.connect(self.update_plot)
+        footer_layout.addWidget(self.btn_main_plot, 1)
+
+        btn_exp_all = QPushButton("Quick CSV")
+        btn_exp_all.setToolTip("Export plot data to CSV immediately")
+        btn_exp_all.clicked.connect(self.export_data)
+        footer_layout.addWidget(btn_exp_all, 0)
+        
+        left_layout.addWidget(footer)
+        
+        btn_export_all = QPushButton("Export Tool")
+        btn_export_all.setMinimumHeight(45)
+        btn_export_all.clicked.connect(self.export_data)
+        footer_layout.addWidget(btn_export_all, 1)
+        
+        left_layout.addWidget(footer)
+        
+        self.main_splitter.addWidget(left_panel)
+
+        # --- Right Panel (Plot + Logs) ---
+        right_splitter = QSplitter(Qt.Vertical)
+        
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.figure = Figure(figsize=(10, 8), dpi=100)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, plot_container)
+        
+        plot_layout.addWidget(self.toolbar)
+        plot_layout.addWidget(self.canvas)
+        
+        self.plot_controls_frame = QFrame()
+        self.plot_controls_frame.setVisible(False)
+        self.plot_controls_frame.setFrameShape(QFrame.StyledPanel)
+        self.pc_layout = QHBoxLayout(self.plot_controls_frame)
+        self.pc_layout.setContentsMargins(2, 2, 2, 2)
+        plot_layout.addWidget(self.plot_controls_frame)
+
+        right_splitter.addWidget(plot_container)
+        
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout(log_group)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Monospace", 9))
+        self.log_text.setFrameShape(QFrame.NoFrame)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False); self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(3)
+        self.status_label = QLabel("Ready")
+        
+        log_layout.addWidget(self.log_text)
+        log_layout.addWidget(self.progress_bar)
+        log_layout.addWidget(self.status_label)
+        
+        right_splitter.addWidget(log_group)
+        right_splitter.setStretchFactor(0, 5)
+        right_splitter.setStretchFactor(1, 1)
+        
+        self.main_splitter.addWidget(right_splitter)
+        self.main_splitter.setStretchFactor(0, 2)
+        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setSizes([550, 1050])
+        
+        main_layout.addWidget(self.main_splitter)
+
+    def _init_inputs_section(self, parent_layout=None):
+        group = QGroupBox("1. Input Data")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setSpacing(4)
+        form = QFormLayout()
+        form.setVerticalSpacing(4)
+        form.setLabelAlignment(Qt.AlignRight)
+        
+        # Emissions
+        self.txt_input = QLineEdit()
+        self.txt_input.setPlaceholderText("Paste emissions file path(s) here...")
+        self.txt_input.editingFinished.connect(self._on_input_path_edit)
+        form.addRow("Emissions:", self.txt_input)
+        
+        btns = QHBoxLayout()
+        btns.setSpacing(4)
+        btn_load = QPushButton("Add File(s)")
+        btn_load.clicked.connect(self.select_input_file)
+        btns.addWidget(btn_load, 2)
+        
+        btn_preview = QPushButton("Preview")
+        btn_preview.clicked.connect(self.preview_data)
+        btns.addWidget(btn_preview, 1)
+        
+        btn_meta = QPushButton("Meta")
+        btn_meta.clicked.connect(self.show_metadata)
+        btns.addWidget(btn_meta, 1)
+
+        btn_stats = QPushButton("Stats")
+        btn_stats.clicked.connect(self.show_detailed_stats)
+        btns.addWidget(btn_stats, 1)
+
+        layout.addLayout(form)
+        layout.addLayout(btns)
+        
+        # Settings 
+        settings_form = QFormLayout()
+        settings_form.setLabelAlignment(Qt.AlignRight)
+        
+        self.cmb_delim = QComboBox()
+        self.cmb_delim.addItems(['auto', 'comma', 'semicolon', 'tab', 'pipe', 'space', 'other'])
+        self.cmb_delim.currentTextChanged.connect(self._on_delim_toggle)
+        
+        delim_layout = QHBoxLayout()
+        delim_layout.addWidget(self.cmb_delim)
+        self.txt_custom_delim = QLineEdit()
+        self.txt_custom_delim.setPlaceholderText("Other...")
+        self.txt_custom_delim.setFixedWidth(50)
+        self.txt_custom_delim.setVisible(False)
+        delim_layout.addWidget(self.txt_custom_delim)
+        settings_form.addRow("Delim:", delim_layout)
+        
+        # Counties
+        self.txt_counties = QLineEdit()
+        self.txt_counties.setPlaceholderText("Standard or online counties...")
+        self.txt_counties.editingFinished.connect(self._on_counties_path_edit)
+        settings_form.addRow("Counties:", self.txt_counties)
+        
+        cnt_btns = QHBoxLayout()
+        btn_counties = QPushButton("Browse Shp")
+        btn_counties.clicked.connect(self.select_county_file)
+        cnt_btns.addWidget(btn_counties)
+        
+        self.cmb_online_year = QComboBox()
+        self.cmb_online_year.addItems(['2020', '2023'])
+        cnt_btns.addWidget(QLabel("Yr:"))
+        cnt_btns.addWidget(self.cmb_online_year)
+        btn_online = QPushButton("Fetch")
+        btn_online.clicked.connect(self.use_online_counties)
+        cnt_btns.addWidget(btn_online)
+        settings_form.addRow("", cnt_btns)
+        
+        # GRIDDESC
+        self.txt_griddesc = QLineEdit()
+        self.txt_griddesc.setPlaceholderText("GRIDDESC path...")
+        self.txt_griddesc.editingFinished.connect(self._on_griddesc_path_edit)
+        settings_form.addRow("GRIDDESC:", self.txt_griddesc)
+        
+        grid_row = QHBoxLayout()
+        btn_griddesc = QPushButton("Browse")
+        btn_griddesc.clicked.connect(self.select_griddesc_file)
+        grid_row.addWidget(btn_griddesc)
+        
+        self.cmb_gridname = QComboBox()
+        self.cmb_gridname.addItem("Select Grid")
+        self.cmb_gridname.currentTextChanged.connect(self._grid_name_changed)
+        grid_row.addWidget(self.cmb_gridname, 1)
+        settings_form.addRow("", grid_row)
+        
+        # NetCDF Controls
+        self.ncf_frame = QFrame()
+        ncf_lyt = QHBoxLayout(self.ncf_frame)
+        ncf_lyt.setContentsMargins(0,0,0,0)
+        self.cmb_ncf_layer = QComboBox()
+        self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        self.cmb_ncf_time = QComboBox()
+        self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        ncf_lyt.addWidget(QLabel("Lay:"))
+        ncf_lyt.addWidget(self.cmb_ncf_layer)
+        ncf_lyt.addWidget(QLabel("TS:"))
+        ncf_lyt.addWidget(self.cmb_ncf_time)
+        self.ncf_frame.setVisible(False)
+        settings_form.addRow("NCF Dims:", self.ncf_frame)
+        
+        extra_lyt = QHBoxLayout()
+        self.spin_skip = QSpinBox()
+        extra_lyt.addWidget(QLabel("Skip:"))
+        extra_lyt.addWidget(self.spin_skip)
+        self.txt_comment = QLineEdit("#")
+        self.txt_comment.setFixedWidth(30)
+        extra_lyt.addWidget(QLabel("Com:"))
+        extra_lyt.addWidget(self.txt_comment)
+        settings_form.addRow("Parse Opts:", extra_lyt)
+        
+        layout.addLayout(settings_form)
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_variable_section(self, parent_layout=None):
+        group = QGroupBox("2. Variable Selection")
+        layout = QFormLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setVerticalSpacing(4)
+        layout.setLabelAlignment(Qt.AlignRight)
+        
+        pol_layout = QHBoxLayout()
+        pol_layout.setSpacing(4)
+        self.cmb_pollutant = QComboBox()
+        self.cmb_pollutant.currentIndexChanged.connect(self._pollutant_changed)
+        pol_layout.addWidget(self.cmb_pollutant, 3)
+        
+        self.txt_pol_search = QLineEdit()
+        self.txt_pol_search.setPlaceholderText("Search...")
+        self.txt_pol_search.setMinimumWidth(80)
+        self.txt_pol_search.textChanged.connect(self._filter_pollutant_list)
+        pol_layout.addWidget(self.txt_pol_search, 1)
+        layout.addRow("Pollutant:", pol_layout)
+        
+        self.lbl_units = QLabel("Unit: -")
+        self.lbl_units.setStyleSheet("color: #2563eb; font-weight: bold; font-size: 10px;")
+        layout.addRow("", self.lbl_units)
+        
+        self.cmb_pltyp = QComboBox()
+        self.cmb_pltyp.addItems(['auto', 'grid', 'county'])
+        layout.addRow("Plot Type:", self.cmb_pltyp)
+        
+        self.cmb_proj = QComboBox()
+        self.cmb_proj.addItems(['auto', 'wgs84', 'lcc'])
+        layout.addRow("Projection:", self.cmb_proj)
+        
+        scc_layout = QHBoxLayout()
+        scc_layout.setSpacing(4)
+        self.cmb_scc = QComboBox()
+        self.cmb_scc.setEditable(True)
+        self.cmb_scc.setInsertPolicy(QComboBox.NoInsert)
+        self.cmb_scc.addItem("All SCC")
+        self.cmb_scc.setEnabled(False)
+        scc_layout.addWidget(self.cmb_scc, 3)
+        
+        self.txt_scc_search = QLineEdit()
+        self.txt_scc_search.setPlaceholderText("Find...")
+        self.txt_scc_search.setMinimumWidth(60)
+        self.txt_scc_search.textChanged.connect(self._filter_scc_list)
+        scc_layout.addWidget(self.txt_scc_search, 1)
+        layout.addRow("SCC Filter:", scc_layout)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_filter_section(self, parent_layout=None):
+        group = QGroupBox("3. Filtering")
+        layout = QFormLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setVerticalSpacing(4)
+        layout.setLabelAlignment(Qt.AlignRight)
+        
+        shp_row = QHBoxLayout()
+        shp_row.setSpacing(4)
+        self.txt_filter_shp = QLineEdit()
+        self.txt_filter_shp.setPlaceholderText("Selection Shapefile...")
+        self.txt_filter_shp.editingFinished.connect(self._on_filter_path_edit)
+        shp_row.addWidget(self.txt_filter_shp, 1)
+        btn_shp = QPushButton("Browse")
+        btn_shp.clicked.connect(self.browse_filter_shpfile)
+        shp_row.addWidget(btn_shp, 0)
+        layout.addRow("Shape:", shp_row)
+        
+        self.cmb_filter_col = QComboBox()
+        self.cmb_filter_col.setEditable(True)
+        layout.addRow("Column:", self.cmb_filter_col)
+        
+        self.txt_filter_val = QLineEdit()
+        self.txt_filter_val.setPlaceholderText("Value1, Value2...")
+        layout.addRow("Values:", self.txt_filter_val)
+        
+        range_layout = QHBoxLayout()
+        self.txt_range_min = QLineEdit()
+        self.txt_range_min.setPlaceholderText("Min")
+        self.txt_range_max = QLineEdit()
+        self.txt_range_max.setPlaceholderText("Max")
+        range_layout.addWidget(self.txt_range_min)
+        range_layout.addWidget(QLabel("to"))
+        range_layout.addWidget(self.txt_range_max)
+        layout.addRow("Range:", range_layout)
+        
+        self.cmb_filter_op = QComboBox()
+        self.cmb_filter_op.addItems(['clipped', 'intersect', 'within', 'False'])
+        self.cmb_filter_op.setCurrentText('False')
+        layout.addRow("Spat Op:", self.cmb_filter_op)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_plot_settings_section(self, parent_layout=None):
+        group = QGroupBox("4. View Options")
+        layout = QFormLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setVerticalSpacing(4)
+        layout.setLabelAlignment(Qt.AlignRight)
+        
+        self.txt_bins = QLineEdit()
+        self.txt_bins.setPlaceholderText("e.g. 0, 1, 10, 100")
+        layout.addRow("Custom Bins:", self.txt_bins)
+        
+        self.cmb_cmap = QComboBox()
+        self.cmb_cmap.addItems(sorted([m for m in plt.colormaps() if not m.endswith('_r')]))
+        self.cmb_cmap.setCurrentText('viridis')
+        layout.addRow("Colormap:", self.cmb_cmap)
+        
+        ov_row = QHBoxLayout()
+        ov_row.setSpacing(4)
+        self.txt_overlay_shp = QLineEdit()
+        self.txt_overlay_shp.setPlaceholderText("Roads, Cities, etc...")
+        self.txt_overlay_shp.editingFinished.connect(self._on_overlay_path_edit)
+        ov_row.addWidget(self.txt_overlay_shp, 1)
+        btn_ov = QPushButton("Browse")
+        btn_ov.clicked.connect(self.browse_overlay_shpfile)
+        ov_row.addWidget(btn_ov, 0)
+        layout.addRow("Overlay:", ov_row)
+        
+        # Limits
+        lim_layout = QHBoxLayout()
+        self.txt_rmin = QLineEdit(); self.txt_rmin.setPlaceholderText("Min")
+        self.txt_rmax = QLineEdit(); self.txt_rmax.setPlaceholderText("Max")
+        lim_layout.addWidget(self.txt_rmin)
+        lim_layout.addWidget(QLabel("to"))
+        lim_layout.addWidget(self.txt_rmax)
+        layout.addRow("Fixed Scale:", lim_layout)
+        
+        # Toggles
+        check_layout = QGridLayout()
+        check_layout.setSpacing(10)
+        
+        self.chk_log = QCheckBox("Log Scale")
+        self.chk_log.setChecked(True)
+        self.chk_log.setToolTip("Scale data logarithmically (recommended for emissions)")
+        
+        self.chk_zoom = QCheckBox("Zoom to Data")
+        self.chk_zoom.setChecked(True)
+        self.chk_zoom.setToolTip("Auto-zoom to areas with valid emissions")
+        
+        self.chk_nan0 = QCheckBox("Fill NaN values with 0")
+        self.chk_nan0.setToolTip("Fill NaN values with 0.0. This affects both the map visualization and the calculated statistics (Sum, Mean).")
+        
+        self.chk_graticule = QCheckBox("Graticule")
+        self.chk_graticule.setChecked(True)
+        self.chk_graticule.setToolTip("Show lat/lon grid lines")
+        
+        self.chk_rev_cmap = QCheckBox("Reverse CMap")
+        self.chk_rev_cmap.setToolTip("Invert the colormap colors")
+        
+        self.chk_quadmesh = QCheckBox("Fast QuadMesh")
+        self.chk_quadmesh.setChecked(True)
+        self.chk_quadmesh.setToolTip("Dramatically faster plotting for large grids")
+        
+        check_layout.addWidget(self.chk_log, 0, 0)
+        check_layout.addWidget(self.chk_zoom, 0, 1)
+        check_layout.addWidget(self.chk_nan0, 1, 0)
+        check_layout.addWidget(self.chk_graticule, 1, 1)
+        check_layout.addWidget(self.chk_rev_cmap, 2, 0)
+        check_layout.addWidget(self.chk_quadmesh, 2, 1)
+        layout.addRow("Controls:", check_layout)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_export_section(self, parent_layout=None):
+        group = QGroupBox("5. Export")
+        layout = QHBoxLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setSpacing(6)
+        
+        btn_save = QPushButton("Save PNG")
+        btn_save.clicked.connect(self.save_plot)
+        layout.addWidget(btn_save, 1)
+        
+        btn_export = QPushButton("Export Data")
+        btn_export.clicked.connect(self.export_data)
+        layout.addWidget(btn_export, 1)
+        
+        btn_pop = QPushButton("Pop-out")
+        btn_pop.setToolTip("Open current plot in a new resizable window")
+        btn_pop.clicked.connect(self.pop_out_plot)
+        layout.addWidget(btn_pop, 1)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_animation_section(self, parent_layout=None):
+        self.anim_group = QGroupBox("6. Animation / Time Nav")
+        layout = QVBoxLayout(self.anim_group)
+        self.anim_group.setVisible(False)
+        
+        self.lbl_anim_time = QLabel("Time: -")
+        layout.addWidget(self.lbl_anim_time)
+        
+        nav_layout = QHBoxLayout()
+        btn_prev = QPushButton("< Prev")
+        btn_prev.clicked.connect(lambda: self._step_time(-1))
+        btn_next = QPushButton("Next >")
+        btn_next.clicked.connect(lambda: self._step_time(1))
+        nav_layout.addWidget(btn_prev)
+        nav_layout.addWidget(btn_next)
+        layout.addLayout(nav_layout)
+        
+        agg_layout = QGridLayout()
+        btn_tot = QPushButton("Total")
+        btn_tot.clicked.connect(lambda: self._show_agg('total'))
+        btn_avg = QPushButton("Avg")
+        btn_avg.clicked.connect(lambda: self._show_agg('avg'))
+        btn_max = QPushButton("Max")
+        btn_max.clicked.connect(lambda: self._show_agg('max'))
+        btn_min = QPushButton("Min")
+        btn_min.clicked.connect(lambda: self._show_agg('min'))
+        
+        agg_layout.addWidget(btn_tot, 0, 0)
+        agg_layout.addWidget(btn_avg, 0, 1)
+        agg_layout.addWidget(btn_max, 1, 0)
+        agg_layout.addWidget(btn_min, 1, 1)
+        layout.addLayout(agg_layout)
+        
+        if parent_layout: parent_layout.addWidget(self.anim_group)
+        else: self.control_layout.addWidget(self.anim_group)
+
+    def _init_summary_section(self, parent_layout=None):
+        group = QGroupBox("7. Table Summary")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 14, 8, 8)
+        layout.setSpacing(6)
+        
+        h_layout = QHBoxLayout()
+        h_layout.addWidget(QLabel("By:"))
+        self.cmb_summary_mode = QComboBox()
+        self.cmb_summary_mode.addItems(['county', 'state', 'scc', 'grid'])
+        h_layout.addWidget(self.cmb_summary_mode, 1)
+        layout.addLayout(h_layout)
+        
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(4)
+        btn_sum_pre = QPushButton("Preview")
+        btn_sum_pre.clicked.connect(self._on_preview_summary)
+        btn_layout.addWidget(btn_sum_pre, 1)
+        
+        btn_sum_exp = QPushButton("Export")
+        btn_sum_exp.clicked.connect(self._on_export_summary)
+        btn_layout.addWidget(btn_sum_exp, 1)
+        layout.addLayout(btn_layout)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    def _init_stats_panel(self, parent_layout=None):
+        """Panel to show stats of the current plot."""
+        group = QGroupBox("8. Current View Statistics")
+        layout = QGridLayout(group)
+        
+        self.lbl_stats_sum = QLabel("-")
+        self.lbl_stats_max = QLabel("-")
+        self.lbl_stats_mean = QLabel("-")
+        self.lbl_stats_count = QLabel("-")
+        
+        for w in [self.lbl_stats_sum, self.lbl_stats_max, self.lbl_stats_mean, self.lbl_stats_count]:
+            w.setStyleSheet("font-weight: bold; color: #2563eb;")
+            w.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            
+        layout.addWidget(QLabel("Sum:"), 0, 0)
+        layout.addWidget(self.lbl_stats_sum, 0, 1)
+        layout.addWidget(QLabel("Max:"), 1, 0)
+        layout.addWidget(self.lbl_stats_max, 1, 1)
+        layout.addWidget(QLabel("Mean:"), 2, 0)
+        layout.addWidget(self.lbl_stats_mean, 2, 1)
+        layout.addWidget(QLabel("Count:"), 3, 0)
+        layout.addWidget(self.lbl_stats_count, 3, 1)
+        
+        # New: Metadata and Detailed Stats buttons
+        btn_box = QHBoxLayout()
+        btn_meta = QPushButton("Meta Info")
+        btn_meta.clicked.connect(self.show_metadata)
+        btn_box.addWidget(btn_meta)
+        
+        btn_stats = QPushButton("Detailed Stats")
+        btn_stats.clicked.connect(self.show_detailed_stats)
+        btn_box.addWidget(btn_stats)
+        
+        layout.addLayout(btn_box, 4, 0, 1, 2)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
+
+    # --- Logic Implementation ---
+    
+    @Slot(str, str)
+    def _handle_notification(self, level, message):
+        """Handle log messages from worker threads."""
+        is_headless = QApplication.instance().platformName() == 'offscreen'
+        
+        if level == "ERROR":
+            logging.error(message)
+            self.progress_bar.setVisible(False)
+            if not is_headless:
+                QMessageBox.critical(self, "Error", message)
+        elif level == "WARNING":
+            self.status_label.setText(f"Warning: {message}")
+            logging.warning(message)
+            self.progress_bar.setVisible(False)
+        else:
+            self.status_label.setText(message)
+            logging.info(message)
+            # Pulse progress if busy
+            busy_keywords = ["Loading", "Plotting", "Generating", "Computing", "Extracting"]
+            stop_keywords = ["Ready", "finished", "Plotted", "available", "loaded", "complete"]
+            
+            if any(k in message for k in busy_keywords):
+                self.progress_bar.setRange(0, 0) # Pulse
+                self.progress_bar.setVisible(True)
+            elif any(k in message for k in stop_keywords):
+                self.progress_bar.setVisible(False)
+            
+    def _append_log(self, text):
         try:
-            from config import USE_SPHERICAL_EARTH
-            a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
-            proj4 = (
-                f"+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-96 {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
-            )
+            self.update_log_signal.emit(text)
+        except RuntimeError:
+            pass # Signal source deleted
+
+    def _startup_load(self):
+        """Called once after UI is shown to load CLI/JSON args."""
+        # 1. First apply any generic settings from config (bins, projection, etc)
+        self._apply_initial_settings()
+
+        # 2. Trigger loading of paths
+        if self.inputfile_path:
+            self.load_input_file(self.inputfile_path)
+            
+        if self.griddesc_path:
+            self.load_griddesc(self.griddesc_path)
+            
+        if self.counties_path:
+             self._load_shapes()
+        
+        # 3. Load extra shapefiles if in config
+        cli = getattr(self, '_json_arguments', {})
+        
+        # Overlay Shapefiles
+        ov_shp = cli.get('overlay_shapefile')
+        if ov_shp:
+            # Handle both list (from YAML/argparse) and string
+            if isinstance(ov_shp, list):
+                self.txt_overlay_shp.setText("; ".join([str(x) for x in ov_shp]))
+            else:
+                self.txt_overlay_shp.setText(str(ov_shp))
+            self._load_overlay_shpfile(ov_shp)
+        
+        # Filter Shapefiles
+        flt_shp = cli.get('filter_shapefile') or cli.get('filtered_by_shp')
+        if flt_shp:
+            if isinstance(flt_shp, list):
+                self.txt_filter_shp.setText("; ".join([str(x) for x in flt_shp]))
+            else:
+                self.txt_filter_shp.setText(str(flt_shp))
+            self._load_filter_shpfile(flt_shp)
+        
+        # Spatial Filter Opt
+        flt_opt = cli.get('filter_shapefile_opt') or cli.get('filtered_by_overlay')
+        if flt_opt:
+            self.cmb_filter_op.setCurrentText(str(flt_opt))
+
+    def _apply_initial_settings(self):
+        """Map _json_arguments keys to UI widgets."""
+        cli = getattr(self, '_json_arguments', {})
+        if not cli: return
+        
+        # 1. Delimiter
+        delim = cli.get('delim')
+        if delim:
+            # Normalize common delimiters
+            mapping = {',':'comma', ';':'semicolon', '\t':'tab', '|':'pipe', ' ':'space'}
+            if delim in mapping:
+                self.cmb_delim.setCurrentText(mapping[delim])
+            else:
+                self.cmb_delim.setCurrentText('other')
+                self.txt_custom_delim.setText(delim)
+        
+        # 2. Filtering
+        if cli.get('filtered_by_column') or cli.get('filter_col'): 
+            self.cmb_filter_col.setCurrentText(str(cli.get('filtered_by_column') or cli.get('filter_col')))
+        if cli.get('filtered_by_val') or cli.get('filter_val'): 
+            self.txt_filter_val.setText(str(cli.get('filtered_by_val') or cli.get('filter_val')))
+        if cli.get('filtered_by_op') or cli.get('filter_shapefile_opt'): 
+            self.cmb_filter_op.setCurrentText(str(cli.get('filtered_by_op') or cli.get('filter_shapefile_opt')))
+        
+        # 3. Plotting Options
+        # BINS
+        bins_val = cli.get('bins')
+        if bins_val:
+             if isinstance(bins_val, list): 
+                 self.txt_bins.setText(", ".join(map(str, bins_val)))
+             else: 
+                 self.txt_bins.setText(str(bins_val))
+             
+        # COLORMAP (Support both cmap and colormap)
+        cmap_val = cli.get('cmap') or cli.get('colormap')
+        if cmap_val:
+             cmap = str(cmap_val)
+             is_rev = cmap.endswith('_r')
+             base_cmap = cmap[:-2] if is_rev else cmap
+             # Try exact match first
+             idx = self.cmb_cmap.findText(base_cmap)
+             if idx >= 0:
+                 self.cmb_cmap.setCurrentIndex(idx)
+             else:
+                 # Try case-insensitive or partial
+                 idx = self.cmb_cmap.findText(base_cmap, Qt.MatchContains)
+                 if idx >= 0: self.cmb_cmap.setCurrentIndex(idx)
+             
+             self.chk_rev_cmap.setChecked(is_rev)
+
+        # 4. View State
+        use_log = cli.get('log_scale') if cli.get('log_scale') is not None else cli.get('use_log')
+        if use_log is not None: self.chk_log.setChecked(bool(use_log))
+        
+        zoom = cli.get('zoom_to_data') if cli.get('zoom_to_data') is not None else cli.get('zoom')
+        if zoom is not None: self.chk_zoom.setChecked(bool(zoom))
+        
+        nan_val = cli.get('fill_nan')
+        if nan_val is not None:
+             self.chk_nan0.setChecked(True)
+             # Logic in GUI is typically binary (use 0 or not), but we can store the val
+             if hasattr(self, 'txt_nan_val'): self.txt_nan_val.setText(str(nan_val))
+
+        low = cli.get('fixed_min') or cli.get('fixed_range_min') or cli.get('vmin')
+        high = cli.get('fixed_max') or cli.get('fixed_range_max') or cli.get('vmax')
+        if low is not None: self.txt_rmin.setText(str(low))
+        if high is not None: self.txt_rmax.setText(str(high))
+
+    def select_input_file(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Emissions File(s)", 
+            self._json_arguments.get('initialdir', ''),
+            "All Files (*);;CSV Files (*.csv);;NetCDF (*.nc *.ncf);;Text Files (*.txt)"
+        )
+        if files:
+            self.load_input_file(files)
+
+    def load_input_file(self, file_paths):
+        """Orchestrate the loading of input files."""
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+            
+        self.input_files_list = file_paths
+        
+        # Update Input entry
+        if len(file_paths) == 1:
+            self.txt_input.setText(file_paths[0])
+        else:
+            self.txt_input.setText("; ".join(file_paths))
+            
+        # Start Worker Thread
+        self._start_progress("Loading data...")
+        
+        # Use partial to pass args to thread
+        threading.Thread(target=self._load_worker, args=(file_paths,), daemon=True).start()
+
+    @Slot()
+    def _on_delim_toggle(self, text):
+        self.txt_custom_delim.setVisible(text == 'other')
+
+    @Slot()
+    def select_county_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select Counties Shapefile", "", "Shapefiles (*.shp *.zip *.gpkg)")
+        if f:
+            self.counties_path = f
+            self.txt_counties.setText(f)
+            self._start_progress(f"Loading shapefile...")
+            # Load in background
+            threading.Thread(target=self._load_counties_worker, args=(f,), daemon=True).start()
+
+    @Slot()
+    def _on_input_path_edit(self):
+        path = self.txt_input.text().strip()
+        if not path: return
+        if path != getattr(self, 'inputfile_path', None):
+            paths = [p.strip() for p in path.split(';') if p.strip()]
+            self.load_input_file(paths)
+
+    @Slot()
+    def _on_counties_path_edit(self):
+        path = self.txt_counties.text().strip()
+        if not path: return
+        if path != getattr(self, 'counties_path', None):
+            self.counties_path = path
+            threading.Thread(target=self._load_counties_worker, args=(path,), daemon=True).start()
+
+    @Slot()
+    def _on_griddesc_path_edit(self):
+        path = self.txt_griddesc.text().strip()
+        if not path: return
+        if path != getattr(self, 'griddesc_path', None):
+            self.load_griddesc(path)
+
+    @Slot()
+    def use_online_counties(self):
+        year = self.cmb_online_year.currentText()
+        url = f"https://www2.census.gov/geo/tiger/GENZ{year}/shp/cb_{year}_us_county_500k.zip"
+        self.notify_signal.emit("INFO", f"Fetching online counties for {year}...")
+        self.counties_path = url
+        self.txt_counties.setText(url)
+        threading.Thread(target=self._load_counties_worker, args=(url,), daemon=True).start()
+
+    @Slot()
+    def _on_overlay_path_edit(self):
+        path = self.txt_overlay_shp.text().strip()
+        if not path:
+             self.overlay_gdf = None
+             return
+        self._load_overlay_shpfile(path)
+
+    @Slot()
+    def _on_filter_path_edit(self):
+        path = self.txt_filter_shp.text().strip()
+        if not path:
+            self.filter_gdf = None
+            return
+        self._load_filter_shpfile(path)
+
+    def _load_counties_worker(self, path):
+        try:
+            gdf = read_shpfile(path, True)
+            if gdf is not None:
+                 self.counties_gdf = gdf
+                 self._invalidate_merge_cache()
+                 self.notify_signal.emit("INFO", f"Loaded counties: {len(gdf)} features")
+        except Exception as e:
+            self.notify_signal.emit("WARNING", f"Counties load error: {e}")
+        finally:
+            QTimer.singleShot(0, self._stop_progress)
+
+    @Slot()
+    def select_griddesc_file(self):
+        f, _ = QFileDialog.getOpenFileName(self, "Select GRIDDESC File", "", "All Files (*)")
+        if f:
+            self.load_griddesc(f)
+
+    def load_griddesc(self, f):
+        """Load and parse a GRIDDESC file."""
+        if not f: return
+        self.griddesc_path = f
+        self.txt_griddesc.setText(f)
+        try:
+            from data_processing import extract_grid
+            grid_names = sorted(extract_grid(f, grid_id=None), key=lambda s: s.lower())
+            self.cmb_gridname.blockSignals(True)
+            self.cmb_gridname.clear()
+            self.cmb_gridname.addItem("Select Grid")
+            self.cmb_gridname.addItems(grid_names)
+            
+            # Auto-select if grid_name provided
+            auto_select_name = None
+            if hasattr(self, 'grid_name') and self.grid_name:
+                if self.grid_name in grid_names:
+                    self.cmb_gridname.setCurrentText(self.grid_name)
+                    auto_select_name = self.grid_name
+                    # Sync to json_arguments immediately
+                    self._json_arguments['gridname'] = self.grid_name
+                    self._json_arguments['griddesc'] = self.griddesc_path
+                else:
+                    logging.warning(f"Requested grid '{self.grid_name}' not found in {f}")
+            
+            self.cmb_gridname.blockSignals(False)
+            
+            # Load grid geometry if a grid was auto-selected (signal won't fire because it was blocked)
+            if auto_select_name:
+                self._grid_name_changed(auto_select_name)
+        except Exception as e:
+            self.notify_signal.emit("ERROR", f"Failed to parse GRIDDESC: {e}")
+
+    @Slot(str)
+    @Slot(str)
+    def _grid_name_changed(self, name):
+        """Update grid definition when name selected in combo."""
+        logging.info(f"Grid selection changed: {name}")
+        self._invalidate_merge_cache()  
+        if not name or name == "Select Grid":
+            self.grid_gdf = None
+            return
+            
+        try:
+            from data_processing import create_domain_gdf
+            self._start_progress(f"Building grid: {name}...")
+            # We can run this in background if it's slow, but create_domain_gdf is usually fast enough for UI.
+            # However, for 12US1 it might take a second. Let's stick to main thread for now as in the code I read,
+            # or move to background if it was already backgrounded (it wasn't in the snippet I read).
+            self.grid_gdf = create_domain_gdf(self.griddesc_path, name)
+            if self.grid_gdf is not None:
+                logging.info(f"Created domain GDF: {name} ({len(self.grid_gdf)} cells)")
+                
+                # Attach grid metadata for QuadMesh optimization (Mirroring ncf_processing logic)
+                try:
+                    from data_processing import extract_grid
+                    coord_params, grid_params = extract_grid(self.griddesc_path, name)
+                    _, xorig, yorig, xcell, ycell, ncols, nrows, _ = grid_params
+                    # Generate proj_str (assuming spherical Earth for standard SMOKE grids if not specified)
+                    # This is a safe assumption for almost all EMP grids.
+                    _, p_alpha, p_beta, p_gamma, x_cent, y_cent = coord_params
+                    proj_str = (
+                        f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} "
+                        f"+lon_0={x_cent} +a=6370000.0 +b=6370000.0 +x_0=0 +y_0=0 +units=m +no_defs"
+                    )
+                    self.grid_gdf.attrs['_smk_grid_info'] = {
+                        'xorig': xorig, 'yorig': yorig, 'xcell': xcell, 'ycell': ycell,
+                        'ncols': ncols, 'nrows': nrows, 'proj_str': proj_str
+                    }
+                except Exception as e:
+                    logging.warning(f"Could not attach grid metadata for QuadMesh: {e}")
+
+                # Immediately ensure FF10 mapping if possible
+                self._ensure_ff10_grid_mapping()
+                self.notify_signal.emit("INFO", f"Grid geometry loaded for '{name}'")
+        except Exception as e:
+            logging.error(f"Failed to create domain GDF: {e}")
+            self.grid_gdf = None
+            self.notify_signal.emit("ERROR", f"Failed to create grid shape: {e}")
+        finally:
+            self._stop_progress()
+
+    def _default_conus_lcc_crs(self):
+        """Standard CONUS LCC projection."""
+        try:
+            proj4 = "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-97 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
             crs_lcc = pyproj.CRS.from_proj4(proj4)
             tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_lcc, always_xy=True)
-            tf_inv = pyproj.Transformer.from_crs(crs_lcc, pyproj.CRS.from_epsg(4326), always_xy=True)
-            return crs_lcc, tf_fwd, tf_inv
+            return crs_lcc, tf_fwd
         except Exception:
-            # Fallback to WGS84 if something goes wrong
+            return None, None
+
+    def _get_plot_crs_info(self, df):
+        """Determine projection and transformers for plotting."""
+        choice = self.cmb_proj.currentText().lower()
+        
+        # If auto, use data crs if it exists and looks like it's already projected
+        if choice == 'auto':
+            if getattr(df, 'crs', None) is not None:
+                try:
+                    df_epsg = df.crs.to_epsg()
+                    # For gridded data (has ROW/COL), prefer projected CRS; for county data, keep as-is
+                    if df_epsg == 4326:  # WGS84
+                        # Check if data is gridded or county-based
+                        is_gridded = 'ROW' in df.columns or 'COL' in df.columns or 'GRID_RC' in df.columns
+                        if is_gridded:
+                            choice = 'lcc'  # Project gridded data
+                        else:
+                            return df.crs, None  # Keep WGS84 for ungridded
+                    else:
+                        # Already projected, use as-is
+                        return df.crs, None
+                except Exception as e:
+                    logging.debug(f"CRS auto-detection failed: {e}")
+                    return df.crs, None
+            else:
+                choice = 'lcc'
+        
+        if choice == 'wgs84':
+            return pyproj.CRS.from_epsg(4326), None
+            
+        if choice == 'lcc':
+            # Try to get from GRIDDESC first
+            if self.griddesc_path and self.cmb_gridname.currentText() != "Select Grid":
+                try:
+                    from data_processing import extract_grid
+                    coord_params, _ = extract_grid(self.griddesc_path, self.cmb_gridname.currentText())
+                    _, p_alpha, p_beta, _, x_cent, y_cent = coord_params
+                    proj4 = f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} +lon_0={x_cent} +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+                    crs = pyproj.CRS.from_proj4(proj4)
+                    return crs, pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs, always_xy=True)
+                except Exception:
+                    pass
+            
+            # Fallback to CONUS LCC
+            crs, tf = self._default_conus_lcc_crs()
+            return crs, tf
+            
+        return None, None
+
+    # --- Loading Logic ---
+    
+    def _get_ncf_params(self):
+        """Extract NetCDF time/layer parameters from UI."""
+        params = {}
+        # Layer
+        lay_txt = self.cmb_ncf_layer.currentText().lower()
+        if 'sum' in lay_txt: params['layer_op'] = 'sum'; params['layer_idx'] = None
+        elif 'avg' in lay_txt or 'mean' in lay_txt: params['layer_op'] = 'mean'; params['layer_idx'] = None
+        elif 'layer' in lay_txt:
+            try:
+                params['layer_idx'] = int(lay_txt.split()[-1]) - 1
+                params['layer_op'] = 'select'
+            except:
+                params['layer_idx'] = 0; params['layer_op'] = 'select'
+        else:
+            params['layer_idx'] = 0; params['layer_op'] = 'select'
+
+        # Time
+        ts_txt = self.cmb_ncf_time.currentText().lower()
+        if 'sum' in ts_txt: params['tstep_op'] = 'sum'; params['tstep_idx'] = None
+        elif 'avg' in ts_txt or 'mean' in ts_txt: params['tstep_op'] = 'mean'; params['tstep_idx'] = None
+        elif 'max' in ts_txt: params['tstep_op'] = 'max'; params['tstep_idx'] = None
+        elif 'step' in ts_txt:
+            try:
+                params['tstep_idx'] = int(ts_txt.split()[-1]) - 1
+                params['tstep_op'] = 'select'
+            except:
+                params['tstep_idx'] = 0; params['tstep_op'] = 'select'
+        else:
+            params['tstep_idx'] = 0; params['tstep_op'] = 'select'
+        
+        return params
+
+    def _load_worker(self, paths):
+        """Background worker for file loading."""
+        try:
+            # Determine params
+            delim_type = self.cmb_delim.currentText()
+            delim = None
+            if delim_type == 'comma': delim = ','
+            elif delim_type == 'semicolon': delim = ';'
+            elif delim_type == 'tab': delim = '\t'
+            elif delim_type == 'pipe': delim = '|'
+            elif delim_type == 'space': delim = ' '
+            elif delim_type == 'other': delim = self.txt_custom_delim.text()
+            
+            skip = self.spin_skip.value()
+            comment = self.txt_comment.text()
+            
+            # Use read_inputfile from data_processing
+            # Combine paths if multiple
+            if len(paths) > 1:
+                fpath = paths
+            else:
+                fpath = paths[0]
+            
+            # --- NetCDF Check ---
+            is_nc = False
+            first_file = paths[0]
+            if is_netcdf_file(first_file):
+                is_nc = True
+                
+            ncf_params = self._get_ncf_params() if is_nc else {}
+                
+            # Safely call read_inputfile
+            # Note: We need a thread-safe notifier
+            def worker_notify(lvl, msg):
+                try:
+                    self.notify_signal.emit(lvl, msg)
+                except RuntimeError:
+                    pass
+
+            # Define localized read function to ensure consistency during stat re-calc
+            # We must define it here to capture the correct delim/skip/comment context
+            def _local_read(p, d=delim, s=skip, c=comment, np=ncf_params):
+                return read_inputfile(
+                    p, delim=d, skiprows=s, comment=c,
+                    notify=lambda *_: None, lazy=True, workers=1, ncf_params=np
+                )
+
+            # Fix for RuntimeError at data_processing.py:803
+            # Bypass library's parallel list-loading by looping manually in GUI thread
+            if isinstance(fpath, list) and len(fpath) > 1:
+                 worker_notify("INFO", f"Sequential load of {len(fpath)} files initiated in GUI...")
+                 from data_processing import _normalize_input_result
+                 dfs = []
+                 raw_dfs = []
+                 for p in fpath:
+                     try:
+                         # Still pass workers=1 to be safe if a #LIST file is inside the list
+                         d, r = read_inputfile(
+                             p, delim=delim, skiprows=skip, comment=comment,
+                             notify=worker_notify, lazy=True, return_raw=True,
+                             workers=1, ncf_params=ncf_params
+                         )
+                         if d is not None: dfs.append(d)
+                         if r is not None: raw_dfs.append(r)
+                     except Exception as e:
+                         worker_notify("ERROR", f"Failed reading {p}: {e}")
+                 
+                 if not dfs:
+                     df, raw = None, None
+                 else:
+                     df = pd.concat(dfs, ignore_index=True)
+                     raw = pd.concat(raw_dfs, ignore_index=True) if raw_dfs else None
+                     # Preserve first file's attributes if possible
+                     if hasattr(df, 'attrs') and dfs[0].attrs:
+                         df.attrs.update(dfs[0].attrs)
+                     df, raw = _normalize_input_result((df, raw))
+            else:
+                 if len(paths) == 1:
+                      worker_notify("INFO", f"Reading 1 file (sequential): {fpath}")
+
+                 df, raw = read_inputfile(
+                     fpath,
+                     delim=delim,
+                     skiprows=skip,
+                     comment=comment,
+                     notify=worker_notify,
+                     lazy=True,
+                     return_raw=True,
+                     workers=1,
+                     ncf_params=ncf_params
+                 )
+            
+            if df is not None:
+                # Flag for native rendering optimization (QuadMesh)
+                try:
+                    is_nc_flag = False
+                    if isinstance(fpath, str) and is_netcdf_file(fpath):
+                        is_nc_flag = True
+                    elif isinstance(fpath, list) and all(is_netcdf_file(f) for f in fpath):
+                        is_nc_flag = True
+                    
+                    source_type = df.attrs.get('source_type')
+                    is_gridded_flag = (source_type == 'gridded_netcdf') or ('ROW' in df.columns and 'COL' in df.columns)
+                    if is_nc_flag or is_gridded_flag:
+                        df._smk_is_native = True
+                        df.attrs['_smk_is_native'] = True
+                except Exception:
+                    pass
+
+                # Re-calculate lost stats for UI (since processor was reverted)
+                try:
+                    summaries = []
+                    file_list = fpath if isinstance(fpath, list) else [fpath]
+                    if len(file_list) > 1:
+                        for f in file_list:
+                            if os.path.exists(f):
+                                f_df, _ = _local_read(f)
+                                if isinstance(f_df, pd.DataFrame):
+                                     p_stats = {}
+                                     for p in detect_pollutants(f_df):
+                                         try:
+                                             vals = pd.to_numeric(f_df[p], errors='coerce').dropna()
+                                             if not vals.empty:
+                                                 p_stats[p] = {
+                                                     'sum': float(vals.sum()),
+                                                     'max': float(vals.max()),
+                                                     'mean': float(vals.mean()),
+                                                     'count': int(len(vals))
+                                                 }
+                                         except Exception: pass
+                                     summaries.append({'source': f, 'pollutants': p_stats})
+                    else:
+                        p_stats = {}
+                        for p in detect_pollutants(df):
+                            try:
+                                vals = pd.to_numeric(df[p], errors='coerce').dropna()
+                                if not vals.empty:
+                                    p_stats[p] = {
+                                        'sum': float(vals.sum()),
+                                        'max': float(vals.max()),
+                                        'mean': float(vals.mean()),
+                                        'count': int(len(vals))
+                                    }
+                            except Exception: pass
+                        summaries.append({'source': file_list[0], 'pollutants': p_stats})
+                    df.attrs['per_file_summaries'] = summaries
+                except Exception as e:
+                    logging.warning(f"Stat re-calc failed: {e}")
+
+                self.emissions_df = df
+                self.raw_df = raw
+                
+                # Re-verify is_nc from loaded attributes (handle config files resolving to NCF)
+                if not is_nc:
+                    attrs = getattr(df, 'attrs', {})
+                    if attrs.get('is_netcdf') or attrs.get('format') == 'netcdf':
+                        is_nc = True
+                    elif attrs.get('source_path') and is_netcdf_file(attrs.get('source_path')):
+                        is_nc = True
+                
+                # Identify pollutants
+                worker_notify("INFO", "Detecting pollutants...")
+                cols = detect_pollutants(df)
+                worker_notify("INFO", f"Pollutants detected: {len(cols)}")
+
+                # --- Auto-Grid for NetCDF ---
+                if is_nc:
+                    try:
+                        worker_notify("INFO", "Generating grid from NetCDF attributes...")
+                        self.grid_gdf = create_ncf_domain_gdf(first_file if isinstance(first_file, str) else first_file[0])
+                        if self.grid_gdf is not None and not self.grid_gdf.empty:
+                            worker_notify("INFO", "Grid geometry loaded from NetCDF.")
+                    except Exception as ge:
+                        worker_notify("WARNING", f"Auto-grid from NetCDF failed: {ge}")
+                
+                # Update UI in main thread
+                worker_notify("INFO", "Triggering UI update...")
+                self.data_loaded_signal.emit(cols, is_nc)
+                
+        except Exception as e:
+            self.notify_signal.emit("ERROR", f"Load failed: {e}")
+            traceback.print_exc()
+        finally:
+            worker_notify("INFO", "Worker finished.")
+            QTimer.singleShot(0, self._stop_progress)
+
+    def _invalidate_merge_cache(self):
+        """Clear the cached merged dataframes."""
+        self._merged_cache = {}
+
+    def _start_progress(self, msg="Processing...", pol=None):
+        """Show progress bar and status message."""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0) # Indeterminate
+        if pol:
+            self.status_label.setText(f"Plotting {pol}...")
+        else:
+            self.status_label.setText(msg)
+        self.btn_main_plot.setEnabled(False)
+
+    def _stop_progress(self):
+        """Hide progress bar and restore UI."""
+        self.progress_bar.setVisible(False)
+        self.status_label.setText("Ready")
+        self.btn_main_plot.setEnabled(True)
+
+    def _ensure_ff10_grid_mapping(self, *, notify_success: bool = True) -> None:
+        """Populate GRID_RC for FF10 point datasets once grid geometry is available."""
+        if not (self._ff10_ready and isinstance(self.emissions_df, pd.DataFrame)):
+            return
+        if self.grid_gdf is None or not isinstance(self.grid_gdf, gpd.GeoDataFrame):
+            return
+        if self._ff10_grid_ready:
+            return
+        logging.info("FF10 point data detected. Mapping to grid cells...")
+        try:
+            mapped = map_latlon2grd(self.emissions_df, self.grid_gdf)
+        except ValueError as exc:
+            logging.warning(f"FF10 Grid Mapping: {exc}")
+            return
+        except Exception as exc:
+            logging.error(f"FF10 Grid Mapping Failed: {exc}")
+            return
+
+        if not isinstance(mapped, pd.DataFrame) or 'GRID_RC' not in mapped.columns:
+            logging.warning('Failed to assign GRID_RC values to FF10 points.')
+            return
+
+        self.emissions_df = mapped
+        if isinstance(self.raw_df, pd.DataFrame):
+            try:
+                self.raw_df = map_latlon2grd(self.raw_df, self.grid_gdf)
+            except Exception:
+                pass
+        self._ff10_grid_ready = True
+        self._invalidate_merge_cache()
+        if notify_success:
+            self.status_label.setText("Mapped FF10 point records to grid cells.")
+
+    def _plot_crs(self):
+        """Determine projection from UI selection and data configuration.
+        Mirroring gui_qt.py: Prefer LCC when available or selected as 'Auto'.
+        """
+        mode = 'auto'
+        try:
+            mode = self.cmb_proj.currentText().lower()
+        except: pass
+
+        if mode == 'wgs84':
             c = pyproj.CRS.from_epsg(4326)
             tf = pyproj.Transformer.from_crs(c, c, always_xy=True)
             return c, tf, tf
 
-    def _lcc_from_griddesc(self):
-        """Build an LCC CRS from the current GRIDDESC selection if available."""
-        try:
-            if not self.griddesc_path or self.griddesc_path == "(NetCDF Attributes)":
-                return None
-            grid_name = self.grid_name_var.get() if getattr(self, 'grid_name_var', None) else None
-            if not grid_name or grid_name == 'Select Grid':
-                return None
-            from .data_processing import extract_grid
-            coord_params, _ = extract_grid(self.griddesc_path, grid_name)
-            # coord_params: proj_type, p_alpha, p_beta, p_gamma, x_cent, y_cent
-            _, p_alpha, p_beta, _p_gamma, x_cent, y_cent = coord_params
-            from config import USE_SPHERICAL_EARTH
-            a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
-            proj4 = (
-                f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} +lon_0={x_cent} {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
-            )
-            crs_lcc = pyproj.CRS.from_proj4(proj4)
-            tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_lcc, always_xy=True)
-            tf_inv = pyproj.Transformer.from_crs(crs_lcc, pyproj.CRS.from_epsg(4326), always_xy=True)
-            return crs_lcc, tf_fwd, tf_inv
-        except Exception:
-            return None
-
-    def _current_lcc_crs(self):
-        """Select an LCC CRS using GRIDDESC when available, else a CONUS default."""
-        """(Deprecated) Retained for backward compatibility; now only used internally if needed."""
-        return self._lcc_from_griddesc() or self._default_conus_lcc_crs()
-
-    def _plot_crs(self):
-        """Return (crs, forward_transformer, inverse_transformer) for plotting.
-
-        New behavior: ONLY use an LCC projection when a GRIDDESC file is provided AND a valid
-        grid name is selected. Otherwise,        fallback to WGS84 (EPSG:4326). This ensures geographic coordinate rendering
-        when no specific grid context is available.
-        """
-        choice = None
-        try:
-            choice = (self.projection_var.get() if getattr(self, 'projection_var', None) else 'auto')
-        except Exception:
-            choice = 'auto'
-        choice = (choice or 'auto').strip().lower()
-
-        if choice == 'wgs84':
+        # Helper to get the absolute default CONUS LCC
+        def get_default_lcc():
             try:
-                crs = pyproj.CRS.from_epsg(4326)
-                tf = pyproj.Transformer.from_crs(crs, crs, always_xy=True)
-                return crs, tf, tf
-            except Exception:
-                return None, None, None
+                from plotting import _default_conus_lcc_crs
+                return _default_conus_lcc_crs()
+            except: return None, None, None
 
-        if choice == 'lcc':
-            candidate = self._lcc_from_griddesc() or self._default_conus_lcc_crs()
-            if candidate:
-                return candidate
-
-        try:
-            # Require explicit grid specification for LCC
-            if self.griddesc_path and self.griddesc_path != "(NetCDF Attributes)" and getattr(self, 'grid_name_var', None):
-                gname = self.grid_name_var.get()
-                if gname and gname not in (None, '', 'Select Grid'):
-                    lcc = self._lcc_from_griddesc()
-                    if lcc:  # (crs, tf_fwd, tf_inv)
-                        return lcc
-        except Exception:
-            pass
-        # Fallback: geographic WGS84 with identity transformers
-        try:
-            crs = pyproj.CRS.from_epsg(4326)
-            tf = pyproj.Transformer.from_crs(crs, crs, always_xy=True)
-            return crs, tf, tf
-        except Exception:
-            return None, None, None
-
-    def _draw_graticule(self, ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, lon_step=None, lat_step=None, with_labels=True):
-        """Draw longitude/latitude lines (in degrees) on the given axes using provided transformers.
-        The axes must be in the projected (LCC) coordinates. Optionally label lines along edges.
-        """
-
-
-        if ax is None:
-            return _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
-
-        def _remove_existing():
-            artists = getattr(ax, '_smk_graticule_artists', None)
-            if isinstance(artists, dict):
-                for key in ('lines', 'texts'):
-                    try:
-                        group = artists.get(key, [])
-                    except Exception:
-                        group = []
-                    for art in group or []:
-                        try:
-                            art.remove()
-                        except Exception:
-                            pass
-            ax._smk_graticule_artists = {'lines': [], 'texts': []}  # type: ignore[attr-defined]
-
-        def _disconnect():
-            cids = getattr(ax, '_smk_graticule_cids', [])
-            for cid in cids or []:
-                try:
-                    ax.callbacks.disconnect(cid)
-                except Exception:
-                    pass
-            ax._smk_graticule_cids = []  # type: ignore[attr-defined]
-            ax._smk_graticule_callback = None  # type: ignore[attr-defined]
-
-        try:
-            _remove_existing()
-        except Exception:
-            pass
-        try:
-            _disconnect()
-        except Exception:
-            pass
-
-        artists = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
-        if not isinstance(artists, dict):
-            artists = {'lines': [], 'texts': []}
-        ax._smk_graticule_artists = artists  # type: ignore[attr-defined]
-
-        def _on_limits(_axis):
+        # 1. Try to extract LCC from specific GRIDDESC if provided
+        gd = self.griddesc_path
+        gn = self.cmb_gridname.currentText()
+        if gd and gn and gn != 'Select Grid':
             try:
-                _remove_existing()
-                refreshed = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
-                if not isinstance(refreshed, dict):
-                    refreshed = {'lines': [], 'texts': []}
-                ax._smk_graticule_artists = refreshed  # type: ignore[attr-defined]
-                try:
-                    ax.figure.canvas.draw_idle()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        try:
-            cid1 = ax.callbacks.connect('xlim_changed', _on_limits)
-        except Exception:
-            cid1 = None
-        try:
-            cid2 = ax.callbacks.connect('ylim_changed', _on_limits)
-        except Exception:
-            cid2 = None
-        ax._smk_graticule_cids = [cid for cid in (cid1, cid2) if cid is not None]  # type: ignore[attr-defined]
-        ax._smk_graticule_callback = _on_limits  # type: ignore[attr-defined]
-        return artists
-
-
-
-    def _set_status(self, message: str, level: Optional[str] = None) -> None:
-        """Update the GUI status bar, collapsing whitespace and capping length."""
-        if not USING_TK:
-            return
-        try:
-            if self.status_var is None:
-                self.status_var = tk.StringVar(master=self.root, value='')
-            prefix = f"{level.upper()}: " if level else ''
-            collapsed = ' '.join(message.strip().split()) if message else ''
-            self.status_var.set((prefix + collapsed)[:512])
-            if self.status_label is not None:
-                self.status_label.update_idletasks()
-        except Exception:
-            pass
-
-    def _format_attrs_for_display(self, source=None, *, max_units: int = 12, max_chars: int = 4000) -> str:
-        """Return a human-friendly summary of DataFrame attrs for GUI display."""
-        attrs: Dict[str, object] = {}
-        if source is None and isinstance(self.emissions_df, pd.DataFrame):
-            try:
-                attrs = dict(getattr(self.emissions_df, 'attrs', {}))
-            except Exception:
-                attrs = {}
-        elif isinstance(source, pd.DataFrame):
-            try:
-                attrs = dict(getattr(source, 'attrs', {}))
-            except Exception:
-                attrs = {}
-        elif isinstance(source, dict):
-            attrs = dict(source)
-        if not attrs:
-            return ''
-        lines: List[str] = []
-        for key, value in attrs.items():
-            if key == 'units_map' and isinstance(value, dict):
-                pairs: List[str] = []
-                for idx, (k, v) in enumerate(value.items()):
-                    if idx >= max_units:
-                        pairs.append('...')
-                        break
-                    pairs.append(f"{k}: {v}")
-                lines.append(f"{key}: " + ', '.join(pairs))
-            elif isinstance(value, dict):
-                snippets: List[str] = []
-                for idx, (k, v) in enumerate(value.items()):
-                    if idx >= max_units:
-                        snippets.append('...')
-                        break
-                    snippets.append(f"{k}: {v}")
-                lines.append(f"{key}: " + ', '.join(snippets))
-            elif isinstance(value, (list, tuple)) and len(value) > max_units:
-                subset = ', '.join(str(v) for v in value[:max_units])
-                lines.append(f"{key}: {subset}, ... ({len(value)} items)")
-            else:
-                lines.append(f"{key}: {value}")
-        text = '\n'.join(lines)
-        if len(text) > max_chars:
-            text = text[:max_chars - 3] + '...'
-        return text
-
-    def _loader_notify(self, level: str, message: str) -> None:
-        lvl = (level or 'INFO').upper()
-        msg = ' '.join(str(message).strip().split()) if message else ''
-        if not msg:
-            return
-        self._loader_messages.append((lvl, msg))
-        if len(self._loader_messages) > 10:
-            self._loader_messages = self._loader_messages[-10:]
-        self._set_status(msg, level=lvl)
-        if USING_TK and getattr(self, 'preview', None) is not None and not getattr(self, '_preview_has_data', False):
-            self._render_loader_messages()
-
-    def _render_loader_messages(self) -> None:
-        if not USING_TK or getattr(self, 'preview', None) is None:
-            return
-        try:
-            self.preview.delete('1.0', tk.END)
-            if not self._loader_messages:
-                self.preview.insert(tk.END, "Load Messages\n(no recent messages)\n")
-            else:
-                self.preview.insert(tk.END, "Load Messages\n")
-                for lvl, msg in self._loader_messages:
-                    self.preview.insert(tk.END, f"[{lvl}] {msg}\n")
-            self.preview.see(tk.END)
-            self._preview_has_data = False
-        except Exception:
-            pass
-
-    def _append_loader_messages_to_preview(self) -> None:
-        if (not USING_TK) or getattr(self, 'preview', None) is None or not self._loader_messages:
-            return
-        try:
-            self.preview.insert(tk.END, "\n\nLoad Messages\n")
-            for lvl, msg in self._loader_messages:
-                self.preview.insert(tk.END, f"[{lvl}] {msg}\n")
-            self.preview.see(tk.END)
-        except Exception:
-            pass
-
-    def _on_close(self):
-        """Harden shutdown: close plots, and force exit."""
-        try:
-            # Close all matplotlib figures to release memory and resources
-            plt.close('all')
-        except Exception:
-            pass
-        try:
-            # Explicitly destroy the main window
-            self.root.destroy()
-        except Exception:
-            pass
-        # Force exit to ensure the process terminates, especially if non-daemon threads are running.
-        # This helps return control to the terminal promptly.
-        sys.exit(0)
-
-    # ---- Unified notification / logging helper ----
-    def _notify(self, level: str, title: str, message: str, exc: Optional[Exception] = None, *, popup: Optional[bool] = None):
-        """Log the message and show a GUI dialog (if Tk available). Levels: INFO, WARNING, ERROR.
-        If an exception object is supplied, logs stack trace at ERROR level."""
-        lvl = level.upper()
-        if popup is None:
-            # Default: Show popups for WARNING and ERROR, but NOT for INFO
-            popup = (lvl != 'INFO')
-        if exc is not None and lvl == 'ERROR':
-            logging.error("%s: %s", title, message, exc_info=exc)
-        else:
-            log_fn = getattr(logging, lvl.lower(), logging.info)
-            log_fn("%s: %s", title, message)
-        summary = message.strip().splitlines()[0] if message else ''
-        if summary:
-            self._set_status(summary, level=lvl)
-        # Show dialog if Tk is active
-        if popup and USING_TK:
-            try:
-                from tkinter import messagebox
-                if lvl == 'INFO':
-                    messagebox.showinfo(title, message)
-                elif lvl == 'WARNING':
-                    messagebox.showwarning(title, message)
-                elif lvl == 'ERROR':
-                    messagebox.showerror(title, message)
-            except Exception:
-                pass  # Suppress any UI errors after logging
-
-    def _build_layout(self):
-        frm = ttk.Frame(self.root, padding=8)
-        frm.grid(row=0, column=0, sticky='nsew')
-        # keep a reference to the main frame for later configuration
-        self.frm = frm
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        # SMOKE report + delimiter controls
-        ttk.Label(frm, text="SMKREPORT/FF10/NETCDF Input:").grid(row=0, column=0, sticky='w')
-        self.emis_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.emis_entry.grid(row=0, column=1, sticky='we')
-        self.emis_entry.bind('<Return>', self._on_emissions_entry_change)
-        self.emis_entry.bind('<FocusOut>', self._on_emissions_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_inputfile).grid(row=0, column=2, padx=4)
-        # Delimiter state (widgets will be placed in button row)
-        self.delim_var = tk.StringVar()
-        self.custom_delim_var = tk.StringVar()
-        # Determine initial delimiter token from provided CLI arg
-        def _initial_delim_token(raw: Optional[str]) -> str:
-            if not raw:
-                return 'auto'
-            raw_norm = normalize_delim(raw)
-            if raw_norm == ',' : return 'comma'
-            if raw_norm == ';' : return 'semicolon'
-            if raw_norm == '\t' : return 'tab'
-            if raw_norm == '|' : return 'pipe'
-            if raw_norm == ' ' : return 'space'
-            # treat as custom
-            self.custom_delim_var.set(raw_norm)
-            return 'other'
-        self.delim_var.set(_initial_delim_token(self.emissions_delim))
-
-        # Counties file
-        ttk.Label(frm, text="Counties Shapefile / Zip / URL:").grid(row=1, column=0, sticky='w')
-        self.county_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.county_entry.grid(row=1, column=1, sticky='we')
-        self.county_entry.bind('<Return>', self._on_counties_entry_change)
-        self.county_entry.bind('<FocusOut>', self._on_counties_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_shpfile).grid(row=1, column=2, padx=4)
-        # Online year selector and button
-        self.counties_year_var = tk.StringVar(value='2020')
-        ttk.OptionMenu(frm, self.counties_year_var, '2020', '2020', '2023', command=lambda *_: self.use_online_counties()).grid(row=1, column=3, sticky='we')
-
-        # Overlay Shapefile (Optional)
-        ttk.Label(frm, text="Overlay Shapefile (optional):").grid(row=2, column=0, sticky='w')
-        self.overlay_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.overlay_entry.grid(row=2, column=1, sticky='we')
-        self.overlay_entry.bind('<Return>', self._on_overlay_entry_change)
-        self.overlay_entry.bind('<FocusOut>', self._on_overlay_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_overlay_shpfile).grid(row=2, column=2, padx=4)
-
-        # Filter by Overlay Shapefile
-        self.filter_overlay_var = tk.StringVar(value=str(getattr(self, 'initial_filter_overlay', 'False')))
-        ttk.Label(frm, text="Filter Operation:").grid(row=3, column=3, sticky='e', padx=(10, 2))
-        self.filter_overlay_menu = ttk.OptionMenu(frm, self.filter_overlay_var, self.filter_overlay_var.get(), "False", "clipped", "intersect", "within")
-        self.filter_overlay_menu.grid(row=3, column=4, sticky='we')
-
-        # Filter Shapefile (Optional - for spatial filtering)
-        ttk.Label(frm, text="Filter Shapefile (optional):").grid(row=3, column=0, sticky='w')
-        self.filter_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.filter_entry.grid(row=3, column=1, sticky='we')
-        self.filter_entry.bind('\u003cReturn\u003e', self._on_filter_entry_change)
-        self.filter_entry.bind('\u003cFocusOut\u003e', self._on_filter_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_filter_shpfile).grid(row=3, column=2, padx=4)
-
-        # GRIDDESC file
-        ttk.Label(frm, text="GRIDDESC File (optional):").grid(row=4, column=0, sticky='w')
-        self.griddesc_entry = ttk.Entry(frm, width=self._w_chars(60))
-        self.griddesc_entry.grid(row=4, column=1, sticky='we')
-        self.griddesc_entry.bind('<Return>', self._on_griddesc_entry_change)
-        self.griddesc_entry.bind('<FocusOut>', self._on_griddesc_entry_change)
-        ttk.Button(frm, text="Browse", command=self.browse_griddesc).grid(row=4, column=2, padx=4)
-
-        # Grid Name selector
-        self.grid_name_var = tk.StringVar()
-        self.grid_name_menu = ttk.OptionMenu(frm, self.grid_name_var, "Select Grid", command=lambda *_: self.load_grid_shape())
-        self.grid_name_menu.grid(row=4, column=3, sticky='we')
-
-        # Pollutant selector
-        ttk.Label(frm, text="Pollutant:").grid(row=5, column=0, sticky='w')
-        self.pollutant_var = tk.StringVar()
-        self.pollutant_menu = ttk.OptionMenu(frm, self.pollutant_var, None)
-        self.pollutant_menu.grid(row=5, column=1, sticky='we')
-
-        # (Scale and Zoom moved to button row to avoid horizontal expansion)
-        # Custom bins state (widgets placed later in button row)
-        self.class_bins_var = tk.StringVar(value='')
-        # Colormap selector state (widget placed later in button row)
-        self.cmap_var = tk.StringVar(value='jet')
-        cmap_choices = [
-            'jet', 'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'turbo',
-            'Blues','Greens','Reds','Purples','Oranges','Greys',
-            'YlGn','YlGnBu','YlOrRd','OrRd','PuBuGn'
-        ]
-        self._cmap_choices = cmap_choices
-
-        # Buttons
-        btn_frame = ttk.Frame(frm)
-        btn_frame.grid(row=6, column=0, columnspan=5, pady=6, sticky='we')
-        # Column stretching: let the bins entry grow
-        for c in (11,):
-            try:
-                btn_frame.columnconfigure(c, weight=1)
-            except Exception:
-                pass
-        self.plot_btn = ttk.Button(btn_frame, text="Plot", command=self.plot)
-        self.plot_btn.grid(row=0, column=0, padx=4, sticky='w')
-        ttk.Button(btn_frame, text="Preview Data", command=self.preview_data).grid(row=0, column=1, padx=8, sticky='w')
-        # Place Delim controls
-        self.delim_label = ttk.Label(btn_frame, text="Delim:")
-        self.delim_label.grid(row=0, column=2, sticky='e', padx=(12,2))
-        self.delim_menu_widget = ttk.OptionMenu(btn_frame, self.delim_var, self.delim_var.get(), 'auto','comma','semicolon','tab','pipe','space','other', command=lambda *_: self._on_delim_change())
-        self.delim_menu_widget.grid(row=0, column=3, sticky='w')
-        self.custom_delim_entry = ttk.Entry(btn_frame, width=self._w_chars(6, min_chars=4, max_chars=10), textvariable=self.custom_delim_var)
-        self.custom_delim_entry.grid(row=0, column=4, sticky='w', padx=(4,0))
-        # Hide initially unless other selected
-        if self.delim_var.get() != 'other':
-            self.custom_delim_entry.grid_remove()
-        # Bind events to reload if custom delim changes (focus out / return)
-        def _reload_event(*_):
-            if not self.inputfile_path:
-                return
-            current_state = self._current_delimiter_state()
-            if current_state == self._last_loaded_delim_state:
-                return
-            self.load_inputfile(show_preview=False)
-        self.custom_delim_entry.bind('<FocusOut>', _reload_event)
-        self.custom_delim_entry.bind('<Return>', _reload_event)
-        # Zoom to Data next to Delim
-        self.zoom_var = tk.BooleanVar(value=True)
-        self.zoom_check = ttk.Checkbutton(btn_frame, text='Zoom to Data', variable=self.zoom_var)
-        self.zoom_check.grid(row=0, column=5, sticky='w', padx=(12,0))
+                from plotting import _plot_crs as get_crs
+                res = get_crs(gd, gn)
+                # res is (crs, fwd, inv)
+                if res and res[0]:
+                    # If plotting._plot_crs returned WGS84 fallback, ignore it if we want LCC
+                    if (mode == 'lcc' or mode == 'auto') and res[0].is_geographic:
+                        pass 
+                    else:
+                        return res
+            except Exception: pass
         
-        # Fill NaN=0 Checkbox
-        self.fill_zero_check = ttk.Checkbutton(btn_frame, text='Fill NaN=0', variable=self.fill_zero_var)
-        self.fill_zero_check.grid(row=0, column=6, sticky='w', padx=(8,0))
-        
-        # NCF Controls (Layer / TStep) - initially enabled but state set to disabled
-        self.ncf_layer_var = tk.StringVar(value='')
-        self.ncf_tstep_var = tk.StringVar(value='')
-        
-        self.ncf_layer_label = ttk.Label(btn_frame, text='Lay:')
-        self.ncf_layer_menu = ttk.Combobox(btn_frame, textvariable=self.ncf_layer_var, state='disabled', width=8)
-        self.ncf_tstep_label = ttk.Label(btn_frame, text='Time:')
-        self.ncf_tstep_menu = ttk.Combobox(btn_frame, textvariable=self.ncf_tstep_var, state='disabled', width=26)
-        
-        # Bind events
-        def _on_ncf_param_change(event):
-            if not self.inputfile_path: return
-            # Only trigger if NCF and valid selections
-            if not (self.ncf_layer_menu.get() and self.ncf_tstep_menu.get()): return
-            self.load_inputfile(show_preview=False)
+        # 2. Try to extract from currently loaded data attributes (Native LCC)
+        if hasattr(self, 'emissions_df') and self.emissions_df is not None:
+             try:
+                 info = getattr(self.emissions_df, 'attrs', {}).get('_smk_grid_info')
+                 if info and info.get('proj_str'):
+                      p_str = info['proj_str']
+                      crs = pyproj.CRS.from_user_input(p_str)
+                      # If it's geographic, we might still want LCC for visualization
+                      if (mode == 'lcc' or mode == 'auto') and crs.is_geographic:
+                          pass
+                      else:
+                          tf_inv = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                          tf_fwd = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                          return crs, tf_fwd, tf_inv
+             except Exception: pass
 
-        self.ncf_layer_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
-        self.ncf_tstep_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
-        
-        # Initially grid them (they will be disabled)
-        self.ncf_layer_label.grid(row=0, column=7, sticky='e', padx=2)
-        self.ncf_layer_menu.grid(row=0, column=8, sticky='w')
-        self.ncf_tstep_label.grid(row=0, column=9, sticky='e', padx=2)
-        self.ncf_tstep_menu.grid(row=0, column=10, sticky='w')
+        # 3. Fallback to default CONUS LCC if we want any LCC or Auto
+        if mode in ('auto', 'lcc'):
+             res = get_default_lcc()
+             if res and res[0]:
+                  return res
 
-        # Shift subsequent columns due to insertion
-        # Scale next to Zoom to Data and before Bins
-        self.scale_label = ttk.Label(btn_frame, text="Scale:")
-        self.scale_label.grid(row=0, column=11, sticky='e', padx=(12,2)) # Was 7
-        self.scale_var = tk.StringVar(value='linear')
-        self.scale_menu_widget = ttk.OptionMenu(btn_frame, self.scale_var, 'linear', 'linear', 'log')
-        self.scale_menu_widget.grid(row=0, column=12, sticky='w') # Was 8
-        # Plot-by control (Auto/County/Grid)
-        self.plotby_label = ttk.Label(btn_frame, text='Plot by:')
-        self.plotby_label.grid(row=0, column=13, sticky='e', padx=(12,2)) # Was 9
-        self.plot_by_var = tk.StringVar(value='auto')
-        self.plotby_menu_widget = ttk.OptionMenu(btn_frame, self.plot_by_var, 'auto', 'auto', 'county', 'grid')
-        self.plotby_menu_widget.grid(row=0, column=14, sticky='w') # Was 10
-        # Projection selection (Auto / WGS84 / LCC)
-        self.proj_label = ttk.Label(btn_frame, text='Proj:')
-        self.proj_label.grid(row=0, column=15, sticky='e', padx=(12,2)) # Was 11
-        self.projection_var = tk.StringVar(value='lcc')
-        self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'lcc', 'auto', 'wgs84', 'lcc')
-        self.proj_menu_widget.grid(row=0, column=16, sticky='w') # Was 12
-        # Bins and Colormap controls
-        self.bins_label = ttk.Label(btn_frame, text='Bins:')
-        self.bins_label.grid(row=0, column=17, sticky='e', padx=(12,2)) # Was 13
-        self.bins_entry = ttk.Entry(btn_frame, width=self._w_chars(28, min_chars=18, max_chars=40), textvariable=self.class_bins_var)
-        self.bins_entry.grid(row=0, column=18, sticky='we') # Was 14
-        self.cmap_label = ttk.Label(btn_frame, text='Colormap:')
-        self.cmap_label.grid(row=0, column=19, sticky='e', padx=(12,2)) # Was 15
-        self.cmap_menu_widget = ttk.OptionMenu(btn_frame, self.cmap_var, self.cmap_var.get(), *self._cmap_choices)
-        self.cmap_menu_widget.grid(row=0, column=20, sticky='w') # Was 16
+        # 4. Final Absolute Fallback to WGS84
+        c = pyproj.CRS.from_epsg(4326)
+        tf = pyproj.Transformer.from_crs(c, c, always_xy=True)
+        return c, tf, tf
+        return pyproj.CRS.from_epsg(4326), None, None
 
-        # SCC selection dropdown (replaces free-text keyword)
-        self.scc_select_var = tk.StringVar(value='All SCC')
-        self.scc_label = ttk.Label(btn_frame, text='SCC:')
-        # Wider combobox to show long SCC descriptions
-        self.scc_entry = ttk.Combobox(btn_frame, textvariable=self.scc_select_var, values=[], width=self._w_chars(80, min_chars=40, max_chars=120), state='disabled')
-        # place after colormap
-        self.scc_label.grid(row=0, column=21, sticky='e', padx=(12,2)) # Was 17
-        self.scc_entry.grid(row=0, column=22, sticky='w') # Was 18
-        # initially disabled until we detect SCC columns
-        try:
-            self.scc_entry.state(['disabled'])
-            self.scc_label.state(['disabled'])
-        except Exception:
-            pass
-
-        # Responsive layout: reflow Bins/Colormap/SCC onto second row when window is narrow
-        self._btn_frame = btn_frame
-        self._layout_mode = None  # 'wide' or 'compact'
-        try:
-            self.root.bind('<Configure>', self._on_resize)
-        except Exception:
-            pass
-
-        # Text preview widget (persistent)
-        self.preview = tk.Text(frm, height=10, width=90)
-        self.preview.grid(row=7, column=0, columnspan=5, pady=4, sticky='nsew')
-
-        # Embedded plot frame (row 7) - map will display here (pop-out windows draw their own figs)
-        self.plot_frame = ttk.Frame(frm)
-        self.plot_frame.grid(row=8, column=0, columnspan=5, sticky='nsew', pady=(4, 0))
-
-        if USING_TK:
-            try:
-                if self.status_var is None:
-                    self.status_var = tk.StringVar(master=self.root, value='Ready.')
-            except Exception:
-                self.status_var = None
-            if self.status_var is not None:
-                self.status_label = ttk.Label(frm, textvariable=self.status_var, relief='sunken', anchor='w')
-                self.status_label.grid(row=9, column=0, columnspan=5, sticky='we', pady=(4, 0))
-
-        # Configure stretch rows/columns for the main frame
-        try:
-            frm.rowconfigure(7, weight=1)   # text preview
-            frm.rowconfigure(8, weight=3)   # plot area larger
-            frm.rowconfigure(9, weight=0)
-            frm.columnconfigure(1, weight=1)
-        except Exception:
-            pass
-
-    def _configure_button_layout(self, mode: str):
-        # Adjust grid positions depending on mode
-        if mode == 'wide':
-            try:
-                self._btn_frame.columnconfigure(18, weight=1) # Bins entry at col 18
-                for c in (1, 22):
-                    self._btn_frame.columnconfigure(c, weight=0)
-            except Exception:
-                pass
-            # Put all on row 0
-            # Note: NCF widgets (7-10), Scale (11-12), PlotBy (13-14) are typically roughly static or managed by init
-            # We explicitly place the ones that move between rows 0 and 1
-            widgets_map = [
-                (self.ncf_layer_label, 7), (self.ncf_layer_menu, 8),
-                (self.ncf_tstep_label, 9), (self.ncf_tstep_menu, 10),
-                (self.scale_label, 11), (self.scale_menu_widget, 12),
-                (self.plotby_label, 13), (self.plotby_menu_widget, 14),
-                (self.proj_label, 15), (self.proj_menu_widget, 16),
-                (self.bins_label, 17), (self.bins_entry, 18), 
-                (self.cmap_label, 19), (self.cmap_menu_widget, 20),
-                (self.scc_label, 21), (self.scc_entry, 22)
-            ]
-            for widget, col in widgets_map:
-                try:
-                    sticky_val = 'we' if widget in (self.bins_entry, self.scc_entry) else 'w'
-                    if widget in (self.proj_label, self.bins_label, self.cmap_label, self.scc_label, self.scale_label, self.plotby_label, self.ncf_layer_label, self.ncf_tstep_label):
-                        sticky_val = 'e'
-                    widget.grid_configure(row=0, column=col, sticky=sticky_val)
-                except Exception:
-                    pass
-        else:  # compact
-            try:
-                # Make bins entry and scc entry stretch on compact row
-                self._btn_frame.columnconfigure(3, weight=1)
-                # Reset weights for columns used in wide mode
-                for c in (18, 22):
-                    self._btn_frame.columnconfigure(c, weight=0)
-            except Exception:
-                pass
-            # Move Bins/Colormap/SCC/Proj to row 1
-            # Leave Scale and PlotBy on Row 0? 
-            # Row 0: Plot, Preview, Delim, Custom, Zoom, FillZero, Scale, PlotBy
-            # Cols: 0, 1, 2-3, 4, 5, 6, 7-8, 9-10 (shifted indices)
-            
-            # Reposition items that stay on Row 0 but need shifting in compact mode?
-            # Actually, standardizing: keep NCF on row 1 in compact mode for space?
-            
-            mapping_row1 = [
-                (self.ncf_layer_label, 0), (self.ncf_layer_menu, 1), 
-                (self.ncf_tstep_label, 2), (self.ncf_tstep_menu, 3),
-                (self.proj_label, 4), (self.proj_menu_widget, 5),
-                (self.bins_label, 6), (self.bins_entry, 7),
-                (self.cmap_label, 8), (self.cmap_menu_widget, 9),
-                (self.scc_label, 10), (self.scc_entry, 11),
-            ]
-            for widget, col in mapping_row1:
-                try:
-                    # Allow both entry widgets to stretch horizontally
-                    sticky_val = 'we' if widget in (self.bins_entry, self.scc_entry) else 'w'
-                    if widget in (self.proj_label, self.bins_label, self.cmap_label, self.scc_label, self.ncf_layer_label, self.ncf_tstep_label):
-                        sticky_val = 'e'
-                    widget.grid_configure(row=1, column=col, sticky=sticky_val)
-                except Exception:
-                    pass
-                    
-            # Ensure Scale/PlotBy are on Row 0
-            # Scale (11,12 in wide), PlotBy (13,14 in wide) -> might be 7,8 and 9,10 in compact row 0?
-            # Let's just put them after FillZero (col 6)
-            row0_extra = [
-                (self.scale_label, 7), (self.scale_menu_widget, 8),
-                (self.plotby_label, 9), (self.plotby_menu_widget, 10)
-            ]
-            for widget, col in row0_extra:
-                try:
-                    widget.grid_configure(row=0, column=col, sticky='w' if 'label' not in str(widget) else 'e')
-                except Exception:
-                    pass
-
-    def _on_resize(self, event=None):
-        try:
-            w = int(self.root.winfo_width())
-        except Exception:
-            w = 1400
-        # Choose a breakpoint around 1440px (scaled)
-        try:
-            threshold = int(1440 * getattr(self, '_ui_scale', 1.0))
-        except Exception:
-            threshold = 1440
-        mode = 'compact' if w < threshold else 'wide'
-        if mode != self._layout_mode:
-            self._configure_button_layout(mode)
-            self._layout_mode = mode
-        # No widget creation here; just reflow handled by _configure_button_layout
-
-    def browse_inputfile(self):
-        # Prefer directory of current/last SMKREPORT/FF10 if available
-        init_dir = None
-        try:
-            cand = self.inputfile_path
-            if cand and os.path.exists(cand):
-                init = os.path.dirname(cand)
-                if os.path.isdir(init):
-                    init_dir = init
-        except Exception:
-            init_dir = None
-        if init_dir is None:
-            init_dir = DEFAULT_INPUTS_INITIALDIR if os.path.isdir(DEFAULT_INPUTS_INITIALDIR) else None
-        paths = filedialog.askopenfilenames(initialdir=init_dir, filetypes=[("CSV/List/NetCDF", "*.csv *.txt *.lst *.ncf *.nc"), ("All", "*.*")])
-        if not paths:
-            return
-        
-        # Join with semicolon for display
-        joined_path = "; ".join(paths)
-        self.emis_entry.delete(0, tk.END)
-        self.emis_entry.insert(0, joined_path)
-        self.inputfile_path = joined_path
-        self.load_inputfile(show_preview=False)
-
-    def browse_griddesc(self):
-        path = filedialog.askopenfilename(filetypes=[("All files", "*.*")])
-        if not path:
-            return
-        self.griddesc_entry.delete(0, tk.END)
-        self.griddesc_entry.insert(0, path)
-        self.griddesc_path = path
-        self.load_griddesc()
-
-    def browse_shpfile(self):
-        init_dir = DEFAULT_SHPFILE_INITIALDIR if os.path.isdir(DEFAULT_SHPFILE_INITIALDIR) else None
-        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Shapefile / Geopackage / Zip", "*.shp *.gpkg *.zip"), ("All", "*.*")])
-        if not path:
-            return
-        self.county_entry.delete(0, tk.END)
-        self.county_entry.insert(0, path)
-        self.counties_path = path
-        self.load_shpfile()
-
-    def browse_overlay_shpfile(self):
-        init_dir = DEFAULT_SHPFILE_INITIALDIR if os.path.isdir(DEFAULT_SHPFILE_INITIALDIR) else None
-        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Shapefile / Geopackage / Zip", "*.shp *.gpkg *.zip"), ("All", "*.*")])
-        if not path:
-            return
-        self.overlay_entry.delete(0, tk.END)
-        self.overlay_entry.insert(0, path)
-        self.overlay_path = path
-        self.load_overlay()
-
-    def use_online_counties(self):
-        """Set and load the default online US counties shapefile. User selection can override later."""
-        try:
-            year = self.counties_year_var.get()
-        except Exception:
-            year = '2020'
-        if year:
-            url = f"https://www2.census.gov/geo/tiger/GENZ{year}/shp/cb_{year}_us_county_500k.zip"        
-        else:
-            url = DEFAULT_ONLINE_COUNTIES_URL
-        self.counties_path = url
-        try:
-            self.county_entry.delete(0, tk.END)
-            self.county_entry.insert(0, self.counties_path)
-        except Exception:
-            pass
-        self.load_shpfile()
-
-    def _on_emissions_entry_change(self, event=None):
-        path = self.emis_entry.get().strip()
-        if path != getattr(self, 'inputfile_path', None):
-            self.inputfile_path = path
-            self.load_inputfile(show_preview=False)
-
-    def _on_counties_entry_change(self, event=None):
-        path = self.county_entry.get().strip()
-        if path != getattr(self, 'counties_path', None):
-            self.counties_path = path
-            self.load_shpfile()
-
-    def _on_overlay_entry_change(self, event=None):
-        path = self.overlay_entry.get().strip()
-        if path != getattr(self, 'overlay_path', None):
-            self.overlay_path = path
-            self.load_overlay()
-
-    def browse_filter_shpfile(self):
-        init_dir = DEFAULT_SHPFILE_INITIALDIR if os.path.isdir(DEFAULT_SHPFILE_INITIALDIR) else None
-        path = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Shapefile / Geopackage / Zip", "*.shp *.gpkg *.zip *.geojson *.json"), ("All", "*.*")])
-        if not path:
-            return
-        self.filter_entry.delete(0, tk.END)
-        self.filter_entry.insert(0, path)
-        self.filter_path = path
-        self.load_filter()
-
-    def _on_filter_entry_change(self, event=None):
-        path = self.filter_entry.get().strip()
-        if path != getattr(self, 'filter_path', None):
-            self.filter_path = path
-            self.load_filter()
-
-    def _on_griddesc_entry_change(self, event=None):
-        path = self.griddesc_entry.get().strip()
-        if path != getattr(self, 'griddesc_path', None):
-            self.griddesc_path = path
-            self.load_griddesc()
-
-    def _current_delimiter(self) -> Optional[str]:
-        """Return the effective delimiter based on GUI selections.
-        'auto' returns None so pandas does its normal parsing (or uses provided default).
-        """
-        if not self.delim_var:
-            return self.emissions_delim  # fallback (pre-GUI call)
-        token = self.delim_var.get()
-        if token == 'auto':
-            return None
-        mapping = {
-            'comma': ',',
-            'semicolon': ';',
-            'tab': '\t',
-            'pipe': '|',
-            'space': ' ',
-        }
-        if token == 'other':
-            val = self.custom_delim_var.get() if self.custom_delim_var else ''
-            return val or None
-        return mapping.get(token, None)
-
-    def _current_delimiter_state(self) -> Tuple[str, str, str]:
-        if not self.delim_var:
-            fallback = self.emissions_delim if self.emissions_delim is not None else '__AUTO__'
-            return ('', '', fallback)
-        token = self.delim_var.get() or ''
-        custom = self.custom_delim_var.get() if self.custom_delim_var else ''
-        effective = self._current_delimiter()
-        effective_repr = effective if effective is not None else '__AUTO__'
-        return (token, custom or '', effective_repr)
-
-    def _invalidate_merge_cache(self) -> None:
-        try:
-            self._merged_cache.clear()
-        except Exception:
-            self._merged_cache = {}
-
-    def _on_delim_change(self):
-        # Show or hide custom entry
-        if self.delim_var.get() == 'other':
-            self.custom_delim_entry.grid()
-            self.custom_delim_entry.focus_set()
-        else:
-            self.custom_delim_entry.grid_remove()
-        # Reload emissions automatically if a file is present
-        if self.inputfile_path:
-            current_state = self._current_delimiter_state()
-            if current_state != self._last_loaded_delim_state:
-                self.load_inputfile(show_preview=False)
-
-    def _parse_bins(self) -> List[float]:
-        """Parse custom bins from the GUI field (comma or space separated)."""
-        raw = (self.class_bins_var.get() if self.class_bins_var else '').strip()
-        if not raw:
-            return []
-        try:
-            parts = [p for p in raw.replace(',', ' ').split() if p]
-            vals = sorted(set(float(p) for p in parts))
-            return vals
-        except Exception:
-            self._notify('WARNING', 'Bins Parse', 'Could not parse custom bins; expected numbers separated by comma or space.')
-            return []
-
-    def _apply_json_snapshot_defaults(self) -> None:
-        
-        
-        if not self._json_arguments:
-            return
-
-        
-
-    def _finalize_loaded_emissions(self, *, show_preview: bool, source_label: Optional[str] = None, scc_data=None) -> None:
-        if not isinstance(self.emissions_df, pd.DataFrame):
-            self._notify('ERROR', 'Invalid Data', 'Emissions dataset is not a DataFrame; cannot continue.')
-            return
+    @Slot(list, bool)
+    def _post_load_update(self, pollutants, is_ncf):
+        """Update UI after background loading finishes."""
+        if self.emissions_df is None: return
 
         self._invalidate_merge_cache()
+        self._ff10_grid_ready = False
 
         try:
-            self._source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type')
+            source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type')
         except Exception:
-            self._source_type = None
-        self._ff10_ready = bool(self._source_type == 'ff10_point')
-
-        # No-op: Path persistence disabled
+            source_type = None
+        self._ff10_ready = bool(source_type == 'ff10_point')
 
         if self._ff10_ready and self.grid_gdf is not None:
             self._ensure_ff10_grid_mapping()
 
-        self._update_scc_widgets(scc_data=scc_data)
+        # Find raw SCCs for widgets
+        scc_data = []
+        if self.raw_df is not None:
+            scc_cols = [c for c in self.raw_df.columns if c.lower() in ['scc', 'scc code', 'scc_code']]
+            if scc_cols:
+                scc_col = scc_cols[0]
+                desc_cols = [c for c in self.raw_df.columns if c.lower() in ['scc description', 'scc_description', 'scc_desc']]
+                if desc_cols:
+                    desc_col = desc_cols[0]
+                    # Create display strings: "CODE | DESCRIPTION"
+                    scc_df = self.raw_df[[scc_col, desc_col]].drop_duplicates().astype(str)
+                    scc_df = scc_df[scc_df[scc_col].str.strip() != '']
+                    scc_data = scc_df.apply(lambda x: f"{x[scc_col]} | {x[desc_col]}", axis=1).tolist()
+                    self._scc_display_to_code = dict(zip(scc_data, scc_df[scc_col].tolist()))
+                else:
+                    scc_data = self.raw_df[scc_col].drop_duplicates().astype(str).tolist()
+                    scc_data = [s for s in scc_data if s.strip() != '']
+                    self._scc_display_to_code = {s: s for s in scc_data}
 
-        self.pollutants = detect_pollutants(self.emissions_df)
-        if not self.pollutants and isinstance(self.emissions_df, pd.DataFrame):
-            self.pollutants = self.emissions_df.attrs.get('available_pollutants', [])
+        self.cmb_scc.blockSignals(True)
+        self.cmb_scc.clear()
+        self.cmb_scc.addItem("All SCC")
+        if scc_data:
+            self.cmb_scc.addItems(sorted(scc_data))
+            self.cmb_scc.setEnabled(True)
+        else:
+            self.cmb_scc.setEnabled(False)
+        self.cmb_scc.blockSignals(False)
+
+        # Use provided pollutants list or detect
+        if not pollutants:
+            pollutants = detect_pollutants(self.emissions_df)
+            if not pollutants and isinstance(self.emissions_df, pd.DataFrame):
+                pollutants = self.emissions_df.attrs.get('available_pollutants', [])
+        
+        self.pollutants = pollutants
+        
         try:
             self.units_map = dict(self.emissions_df.attrs.get('units_map', {}))
         except Exception:
             self.units_map = {}
+            
         if not self.pollutants:
-            self._notify('WARNING', 'No Pollutants', 'No pollutant columns detected.')
+            self.notify_signal.emit('WARNING', 'No pollutant columns detected.')
             return
 
-        # Sort pollutants alphabetically for easier navigation
+        # Sort pollutants alphabetically
         self.pollutants = sorted(self.pollutants, key=lambda s: s.lower())
 
-        menu = self.pollutant_menu["menu"]
-        try:
-            menu.delete(0, "end")
-        except Exception:
-            pass
-        PER_COLUMN = 25
-        for idx, p in enumerate(self.pollutants):
-            kw = {}
-            if idx > 0 and (idx % PER_COLUMN) == 0:
-                kw['columnbreak'] = 1
+        self.cmb_pollutant.blockSignals(True)
+        self.cmb_pollutant.clear()
+        self.cmb_pollutant.addItems(self.pollutants)
+        
+        # Restore preselected or first pollutant
+        if self.preselected_pollutant in self.pollutants:
+            self.cmb_pollutant.setCurrentText(self.preselected_pollutant)
+        elif self.pollutants:
+            self.cmb_pollutant.setCurrentIndex(0)
+        self.cmb_pollutant.blockSignals(False)
+
+        # Update metadata summary
+        if hasattr(self.emissions_df, 'attrs'):
+            self._last_attrs_summary = "\n".join([f"{k}: {v}" for k, v in self.emissions_df.attrs.items()])
+        
+        # Success status
+        self.status_label.setText(f"Loaded {len(self.emissions_df):,} rows, {len(self.pollutants)} pollutants.")
+        
+        self.ncf_frame.setVisible(is_ncf)
+        self.plot_controls_frame.setVisible(is_ncf)
+        if is_ncf:
+            # Populate NCF dimensions if available
+            fname = self.input_files_list[0]
             try:
-                menu.add_command(label=p, command=lambda v=p: self.pollutant_var.set(v), **kw)
-            except Exception:
-                pass
-        try:
-            self.pollutant_var.set(self.pollutants[0])
-        except Exception:
-            pass
+                dims = get_ncf_dims(fname)
+                # Layers
+                n_lay = dims.get('n_layers', 1)
+                lay_items = ['Sum All', 'Avg All'] + [f"Layer {i+1}" for i in range(n_lay)]
+                self.cmb_ncf_layer.blockSignals(True)
+                self.cmb_ncf_layer.clear()
+                self.cmb_ncf_layer.addItems(lay_items)
+                self.cmb_ncf_layer.blockSignals(False)
+                # Time
+                n_ts = dims.get('n_tsteps', 1)
+                ts_items = ['Sum All', 'Avg All', 'Max'] + [f"Step {i+1}" for i in range(n_ts)]
+                self.cmb_ncf_time.blockSignals(True)
+                self.cmb_ncf_time.clear()
+                self.cmb_ncf_time.addItems(ts_items)
+                self.cmb_ncf_time.blockSignals(False)
 
-        attrs_summary = self._format_attrs_for_display(self.emissions_df)
-        self._last_attrs_summary = attrs_summary
+                # Update GRIDDESC display to show NCF source
+                try:
+                    _, gp = read_ncf_grid_params(fname)
+                    self.txt_griddesc.setText("(NetCDF Attributes)")
+                    self.cmb_gridname.blockSignals(True)
+                    self.cmb_gridname.clear()
+                    self.cmb_gridname.addItem(gp[0])
+                    self.cmb_gridname.setCurrentIndex(0)
+                    self.cmb_gridname.blockSignals(False)
+                except Exception: pass
+            except Exception as e:
+                logging.error(f"Failed to get NCF dims: {e}")
 
-        summary_parts: List[str] = []
-        label = source_label
-        if label is None and self.inputfile_path:
-            label = os.path.basename(self.inputfile_path)
-        if label:
-            summary_parts.append(label)
-        try:
-            summary_parts.append(f"{len(self.emissions_df):,} rows")
-        except Exception:
-            pass
-        try:
-            summary_parts.append(f"{len(self.emissions_df.columns)} columns")
-        except Exception:
-            pass
-        try:
-            if self.pollutants:
-                summary_parts.append(f"{len(self.pollutants)} pollutants")
-        except Exception:
-            pass
-        summary_text = ' • '.join(part for part in summary_parts if part)
-        if summary_text:
-            self._set_status(f"Loaded {summary_text}", level='INFO')
+        # Trigger initial filter column population
+        if self.raw_df is not None:
+            raw_cols = sorted([str(c) for c in self.raw_df.columns])
+            self.cmb_filter_col.clear()
+            self.cmb_filter_col.addItems(raw_cols)
+            
+            # SCC Detection & Mapping
+            scc_col = next((c for c in raw_cols if c.lower() in ['scc', 'scc code', 'scc_code']), None)
+            desc_cols = [c for c in raw_cols if c.lower() in ['scc description', 'scc_description']]
+            desc_col = desc_cols[0] if desc_cols else None
+            
+            self._scc_display_to_code = {}
+            if scc_col:
+                try:
+                    df_scc = self.raw_df[[scc_col]].copy()
+                    df_scc[scc_col] = df_scc[scc_col].astype(str).str.strip()
+                    if desc_col:
+                        df_scc[desc_col] = self.raw_df[desc_col].astype(str).str.strip()
+                        # Create "Code - Description" string
+                        df_scc['display'] = df_scc[scc_col] + " - " + df_scc[desc_col]
+                    else:
+                        df_scc['display'] = df_scc[scc_col]
+                        
+                    unique_sccs = df_scc.drop_duplicates().sort_values(scc_col)
+                    self._scc_display_to_code = { row.display: row[scc_col] for row in unique_sccs.itertuples() }
+                    
+                    self.cmb_scc.blockSignals(True)
+                    self.cmb_scc.clear()
+                    self.cmb_scc.addItem("All SCC")
+                    self.cmb_scc.addItems(sorted(self._scc_display_to_code.keys()))
+                    self.cmb_scc.setEnabled(True)
+                    self._scc_full_list = None # Reset search cache
+                    self.cmb_scc.blockSignals(False)
+                except Exception as e:
+                    logging.warning(f"SCC mapping failed: {e}")
+                    self.cmb_scc.clear()
+                    self.cmb_scc.addItem("All SCC")
+                    self.cmb_scc.setEnabled(False)
+            else:
+                self.cmb_scc.clear()
+                self.cmb_scc.addItem("All SCC")
+                self.cmb_scc.setEnabled(False)
 
-        if attrs_summary and USING_TK and not show_preview:
+        # Set plot type from config (validation happens in _merged() during plot)
+        # Following gui_qt.py pattern: just read the config, don't try to validate/correct
+        requested_pltyp = self._json_arguments.get('pltyp', 'auto')
+        if requested_pltyp in ['auto', 'grid', 'county']:
+            self.cmb_pltyp.setCurrentText(requested_pltyp)
+
+        # Initialize Projection from config
+        requested_proj = self._json_arguments.get('projection', 'lcc')
+        if requested_proj in ['auto', 'wgs84', 'lcc']:
+            self.cmb_proj.setCurrentText(requested_proj)
+
+        logging.info(f"Loaded {len(self.emissions_df)} rows. Found {len(pollutants)} pollutants.")
+        
+        # Load counties if configured
+        if self.counties_path and self.counties_gdf is None:
+             self._load_shapes()
+
+        # Auto-select and plot if configured
+        preselected = getattr(self, 'preselected_pollutant', None)
+        if not preselected:
+            cli = getattr(self, '_json_arguments', {})
+            preselected = cli.get('pollutant')
+
+        if preselected:
+            if isinstance(preselected, list): 
+                preselected = preselected[0]
+            elif isinstance(preselected, str) and ',' in preselected:
+                preselected = preselected.split(',')[0].strip()
+                
+            if preselected in pollutants:
+                logging.info(f"Auto-selecting pollutant: {preselected}")
+                self.cmb_pollutant.setCurrentText(preselected)
+                
+                # Trigger plot after a brief delay to allow UI to settle
+                QTimer.singleShot(500, self.update_plot)
+
+    def _load_shapes(self):
+        """Load county shapefiles."""
+        threading.Thread(target=self._shape_worker, daemon=True).start()
+        
+    def _shape_worker(self):
+        try:
+             gdf = read_shpfile(self.counties_path)
+             if gdf is not None:
+                 self.counties_gdf = gdf
+                 self.notify_signal.emit("INFO", f"Loaded counties: {len(gdf)} features")
+        except Exception as e:
+            self.notify_signal.emit("WARNING", f"Shapefile load error: {e}")
+
+    def _pollutant_changed(self):
+        # Update units label if metadata available
+        pol = self.cmb_pollutant.currentText()
+        unit = self.units_map.get(pol, "-")
+        self.lbl_units.setText(f"Unit: {unit}")
+        # Invalidate animation cache if pollutant changed
+        self._t_data_cache = None
+        self._t_idx = 0
+        self._is_showing_agg = False
+        # Hide animation controls when switching pollutants
+        if hasattr(self, 'anim_group') and self.anim_group:
+            self.anim_group.setVisible(False)
+        # Keep plot_controls_frame visible if NCF data is loaded
+        # (will be reshown if needed by _post_load_update)
+
+    def _ensure_time_data(self):
+        if self._t_data_cache is not None: return True
+        pol = self.cmb_pollutant.currentText()
+        if not pol or self.emissions_df is None: return False
+        
+        try:
+            from ncf_processing import get_ncf_animation_data
+            df = self.emissions_df
+            # Prepare indices for ALL cells in plot
+            r_col = 'ROW'; c_col = 'COL'
+            if 'ROW' not in df.columns and 'ROW_x' in df.columns: r_col = 'ROW_x'
+            if 'COL' not in df.columns and 'COL_x' in df.columns: c_col = 'COL_x'
+             
+            # 0-based indices
             try:
-                self.preview.delete('1.0', tk.END)
-                self.preview.insert(tk.END, "Attributes\n")
-                self.preview.insert(tk.END, attrs_summary)
-                self._append_loader_messages_to_preview()
-                self._preview_has_data = True
-            except Exception:
-                pass
+                rows = df[r_col].fillna(0).astype(int).values - 1
+                cols = df[c_col].fillna(0).astype(int).values - 1
+            except Exception as e:
+                self.notify_signal.emit("WARNING", f"Index extraction failed: {e}")
+                return False
+            
+            # Layer settings
+            l_idx = 0; l_op = 'select'
+            lay_txt = self.cmb_ncf_layer.currentText()
+            if "Sum" in lay_txt: l_op = 'sum'
+            elif "Avg" in lay_txt: l_op = 'mean'
+            elif "Layer" in lay_txt:
+                try: l_idx = int(lay_txt.split()[-1]) - 1
+                except: pass
+                
+            effective_path = ""
+            if hasattr(self, 'input_files_list') and self.input_files_list:
+                effective_path = self.input_files_list[0]
+                
+            stack_groups_path = None
+            if self.emissions_df is not None:
+                attrs = getattr(self.emissions_df, 'attrs', {})
+                if 'proxy_ncf_path' in attrs: effective_path = attrs['proxy_ncf_path']
+                elif 'original_ncf_path' in attrs: effective_path = attrs['original_ncf_path']
+                stack_groups_path = attrs.get('stack_groups_path')
 
-        if show_preview:
-            self.preview_data()
+            if not effective_path or not os.path.exists(effective_path):
+                self.notify_signal.emit("ERROR", "Could not locate original NetCDF source for animation.")
+                return False
 
-    def load_inputfile(self, show_preview: bool = True):
-        # Sync path from entry widget if changed manually
+            self.notify_signal.emit("INFO", "Loading full time series for animation...")
+            res = get_ncf_animation_data(
+                effective_path,
+                pol, 
+                rows.tolist(), 
+                cols.tolist(), 
+                layer_idx=l_idx, 
+                layer_op=l_op,
+                stack_groups_path=stack_groups_path
+            )
+            
+            if res:
+                vals = res['values']
+                res['tot_val'] = np.sum(vals, axis=0)
+                res['avg_val'] = np.mean(vals, axis=0)
+                res['mx_val'] = np.nanmax(vals, axis=0)
+                res['mn_val'] = np.nanmin(vals, axis=0)
+                
+                # Global scale
+                res['vmin'] = np.nanmin(vals)
+                res['vmax'] = np.nanmax(vals)
+                
+                self._t_data_cache = res
+                self._t_idx = 0
+                self._is_showing_agg = False
+                self.notify_signal.emit("INFO", "Animation data loaded.")
+                return True
+        except Exception as e:
+            self.notify_signal.emit("ERROR", f"Animation prep failed: {e}")
+        return False
+
+    def _step_time(self, delta):
+        # We need to distinguish if we are fresh or in an aggregate view
+        is_fresh = self._t_data_cache is None
+        is_agg = self._is_showing_agg
+        
+        if not self._ensure_time_data(): return
+        cache = self._t_data_cache
+        n_steps = len(cache['times'])
+        
+        if n_steps <= 1:
+            self.notify_signal.emit("INFO", "Animation: Only 1 time step available.")
+            return
+
+        # If we just loaded (fresh) or were showing an aggregate,
+        # 'Next' should go to the first step (0), 'Prev' to the last (n-1).
+        if is_fresh or is_agg:
+            if delta > 0: self._t_idx = 0
+            else: self._t_idx = n_steps - 1
+        else:
+            self._t_idx = (self._t_idx + delta) % n_steps
+            
+        self._is_showing_agg = False
+        self._update_view(cache['values'][self._t_idx], cache['times'][self._t_idx])
+
+    def _show_agg(self, mode):
+        if not self._ensure_time_data(): return
+        cache = self._t_data_cache
+        self._is_showing_agg = True
+        if mode == 'total':
+            self._update_view(cache['tot_val'], "Total (Sum)")
+        elif mode == 'avg':
+            self._update_view(cache['avg_val'], "Average (Mean)")
+        elif mode == 'max':
+            self._update_view(cache['mx_val'], "Max All Time")
+        elif mode == 'min':
+            self._update_view(cache['mn_val'], "Min All Time")
+
+    def _on_ts_view_click(self, op_mode):
+        """Extract time series for all cells in current view."""
+        if self._merged_gdf is None or not 'ROW' in self._merged_gdf.columns:
+             self.notify_signal.emit("WARNING", "No gridded data available.")
+             return
+             
+        # 1. Get Bounds
+        ax = self.figure.axes[0]
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        
+        # 2. Filter GDF
+        gdf = self._merged_gdf
         try:
-            val = self.emis_entry.get().strip()
-            if val:
-                self.inputfile_path = val
-        except Exception:
-            pass
+            # Use spatial index for speed
+            from shapely.geometry import box as shp_box
+            bbox = shp_box(xlim[0], ylim[0], xlim[1], ylim[1])
+            
+            # Fast filter
+            cand_idx = []
+            sindex = getattr(gdf, 'sindex', None)
+            if sindex:
+                cand_idx = list(sindex.intersection(bbox.bounds))
+                # Refine
+                sub = gdf.iloc[cand_idx]
+                sub = sub[sub.intersects(bbox)]
+            else:
+                sub = gdf[gdf.intersects(bbox)]
+                
+            if sub.empty:
+                 self.notify_signal.emit("WARNING", "No cells in current view.")
+                 return
+                 
+            self.notify_signal.emit("INFO", f"Extracting TS for {len(sub)} cells ({op_mode})...")
+            
+            # 3. Get ROW/COL lists
+            rows = sub['ROW'].values.astype(int)
+            cols = sub['COL'].values.astype(int)
+            
+            # 4. Exec (Thread or Timer)
+            # Layer/Op
+            l_idx = 0; l_op = 'select'
+            lay_txt = self.cmb_ncf_layer.currentText()
+            if "Sum" in lay_txt: l_op = 'sum'
+            elif "Avg" in lay_txt: l_op = 'mean'
+            elif "Layer" in lay_txt:
+                 try: l_idx = int(lay_txt.split()[-1]) - 1
+                 except: pass
 
+            QTimer.singleShot(0, lambda: self._exec_ts_view(rows, cols, l_idx, l_op, op_mode))
+            
+        except Exception as e:
+            self.notify_signal.emit("ERROR", f"View extraction failed: {e}")
+
+    def _exec_ts_view(self, rows, cols, l_idx, l_op, agg_op):
+         try:
+             # Run extraction
+             effective_path = self.input_files_list[0]
+             stack_groups_path = None
+             if self.emissions_df is not None:
+                 attrs = getattr(self.emissions_df, 'attrs', {})
+                 if 'proxy_ncf_path' in attrs: effective_path = attrs['proxy_ncf_path']
+                 elif 'original_ncf_path' in attrs: effective_path = attrs['original_ncf_path']
+                 stack_groups_path = attrs.get('stack_groups_path')
+
+             from ncf_processing import get_ncf_timeseries
+             res = get_ncf_timeseries(
+                effective_path,
+                self.cmb_pollutant.currentText(),
+                (rows-1).tolist(), (cols-1).tolist(),
+                layer_idx=l_idx, layer_op=l_op, op=agg_op,
+                stack_groups_path=stack_groups_path
+             )
+             
+             if res:
+                 self._show_ts_window(res, f"View ({len(rows)} cells) - {agg_op.upper()}")
+                 self.notify_signal.emit("INFO", "Time Series Plotted.")
+             else:
+                 self.notify_signal.emit("WARNING", "No data found.")
+         except Exception as e:
+             self.notify_signal.emit("ERROR", f"TS Extraction failed: {e}")
+
+    def _update_view(self, new_vals, time_lbl):
+        """Update the plot for a new time step or aggregate."""
         try:
-            self._loader_messages.clear()
-        except Exception:
-            self._loader_messages = []
-        self._preview_has_data = False
-        self._ff10_grid_ready = False
+             if not self.figure.axes: return
+             ax = self.figure.axes[0]
+             
+             # Locate collection
+             coll = None
+             for c in ax.collections:
+                 if getattr(c, 'get_array', lambda: None)() is not None:
+                     coll = c
+                     break
+             
+             if coll:
+                  # 1. Handle Limits (Especially for LogNorm safety)
+                  if self._t_data_cache:
+                      c_vmin = self._t_data_cache.get('vmin', 1e-20)
+                      c_vmax = self._t_data_cache.get('vmax', 1.0)
+                      if isinstance(coll.norm, LogNorm):
+                          if c_vmin <= 0: c_vmin = 1e-20
+                          if c_vmax <= c_vmin: c_vmax = c_vmin * 10.0
+                          coll.norm.vmin = c_vmin
+                          coll.norm.vmax = c_vmax
+                      coll.set_clim(c_vmin, c_vmax)
 
-        # Capture UI state for thread
+                  # 2. Set Data
+                  coll.set_array(new_vals)
+                  ax._smk_current_vals = new_vals
+                  
+                  # 3. Update Colorbar
+                  if hasattr(coll, 'colorbar') and coll.colorbar:
+                      try: coll.colorbar.update_normal(coll)
+                      except: pass
+                  
+                  # 4. Refresh Title Statistics
+                  ax._smk_time_lbl = time_lbl
+                  self._update_plot_title(ax, immediate=True)
+                  
+                  self.canvas.draw_idle()
+                  
+                  # 5. Update Status Labels
+                  n_steps = len(self._t_data_cache['times']) if self._t_data_cache else 1
+                  if "Sum" in str(time_lbl) or "Mean" in str(time_lbl):
+                      self.lbl_anim_status.setText(str(time_lbl))
+                  else:
+                      self.lbl_anim_status.setText(f"{time_lbl} ({self._t_idx+1}/{n_steps})")
+        except Exception as e:
+            logging.error(f"Update view failed: {e}")
+
+    def _update_plot_title(self, ax, immediate=False):
+        """Update the plot title with dynamic statistics. Debounced by default for responsiveness."""
+        self._current_ax_for_title = ax
+        if immediate:
+            self._exec_title_update()
+        else:
+            # Start/Restart the timer to debounce rapid view changes (pan/zoom)
+            self._title_timer.start(300)
+
+    def _exec_title_update(self):
+        """Perform the actual title update and statistics calculation."""
+        ax = self._current_ax_for_title
+        if ax is None or not hasattr(ax, 'figure'):
+            return
+            
         try:
-            effective_delim = self._current_delimiter()
-            current_delim_state = self._current_delimiter_state()
-        except Exception:
-            effective_delim = None
-            current_delim_state = None
+            pol = self.cmb_pollutant.currentText()
+            unit = self.units_map.get(pol, "")
+            time_lbl = getattr(ax, '_smk_time_lbl', None)
+            
+            # 1. Get current values (Primary: cache, Secondary: collection)
+            vals = getattr(ax, '_smk_current_vals', None)
+            if vals is None:
+                for c in ax.collections:
+                    if hasattr(c, 'get_array') and c.get_array() is not None:
+                        vals = c.get_array()
+                        break
+            
+            if vals is None or not hasattr(vals, 'size') or vals.size == 0:
+                ax.set_title(f"{pol} (No Data)")
+                ax.figure.canvas.draw_idle()
+                return
 
-        # Capture NCF dropdown state to preserve selection across reload
-        ncf_preserve = {}
+            # 2. Check view extent
+            try:
+                xlim = ax.get_xlim(); ylim = ax.get_ylim()
+                x0, x1 = min(xlim), max(xlim)
+                y0, y1 = min(ylim), max(ylim)
+                
+                # Check for Base View (Global Stats optimization)
+                is_base = False
+                if hasattr(self, '_base_view') and self._base_view:
+                    (bx_lim, by_lim) = self._base_view
+                    bx0, bx1 = min(bx_lim), max(bx_lim)
+                    by0, by1 = min(by_lim), max(by_lim)
+                    if abs(x0-bx0) < 1e-4 and abs(x1-bx1) < 1e-4 and \
+                       abs(y0-by0) < 1e-4 and abs(y1-by1) < 1e-4:
+                        is_base = True
+            except:
+                is_base = False
+                x0, x1, y0, y1 = 0, 0, 0, 0
+
+            # 3. Extract Visible Stats
+            try:
+                if is_base:
+                    filtered = vals
+                else:
+                    from shapely.geometry import box
+                    if x0 == x1 or y0 == y1: # Degenerate view
+                        filtered = np.array([])
+                    else:
+                        view_box = box(x0, y0, x1, y1)
+                        filtered = vals
+                        if hasattr(self, '_merged_gdf') and self._merged_gdf is not None:
+                            gdf = self._merged_gdf
+                            # A. Grid Optimization 
+                            info = gdf.attrs.get('_smk_grid_info')
+                            proj_sel = self.cmb_proj.currentText().lower()
+                            is_native = proj_sel in ('auto', 'wgs84', 'native', 'epsg:4326', 'default') 
+                            
+                            if info and is_native and 'ROW' in gdf.columns:
+                                col0 = int(np.floor((x0 - info['xorig']) / info['xcell']))
+                                col1 = int(np.ceil((x1 - info['xorig']) / info['xcell']))
+                                row0 = int(np.floor((y0 - info['yorig']) / info['ycell']))
+                                row1 = int(np.ceil((y1 - info['yorig']) / info['ycell']))
+                                
+                                mask = (gdf['ROW'] > row0) & (gdf['ROW'] <= row1+1) & \
+                                       (gdf['COL'] > col0) & (gdf['COL'] <= col1+1)
+                                filtered = vals[mask.values] if mask.size == vals.size else vals
+                            else:
+                                # B. Precise Spatial Slicing
+                                sidx = getattr(gdf, 'sindex', None)
+                                if sidx:
+                                    idxs = list(sidx.intersection(view_box.bounds))
+                                    if idxs:
+                                        # Validate indices are within bounds
+                                        valid_idxs = [i for i in idxs if 0 <= i < len(gdf)]
+                                        if valid_idxs:
+                                            sub_gdf = gdf.iloc[valid_idxs]
+                                            precise_mask = sub_gdf.geometry.intersects(view_box)
+                                            final_ilocs = np.array(valid_idxs)[precise_mask.values]
+                                            final_ilocs = final_ilocs[(final_ilocs >= 0) & (final_ilocs < len(vals))]
+                                            filtered = vals[final_ilocs] if len(final_ilocs) > 0 else np.array([])
+                                    else:
+                                        filtered = np.array([])
+                                else:
+                                    # Fallback: Brute force intersection
+                                    mask = gdf.geometry.intersects(view_box)
+                                    filtered = vals[mask.values] if mask.size == vals.size else vals
+
+                # Calculate Stats
+                filtered_arr = np.asanyarray(filtered)
+                clean = filtered_arr[~np.isnan(filtered_arr)] if filtered_arr.size > 0 else np.array([])
+                
+                if clean.size > 0:
+                    mn, mx = np.nanmin(clean), np.nanmax(clean)
+                    u, s = np.nanmean(clean), np.nansum(clean)
+                    
+                    def _f(v): 
+                        if abs(v) < 1e-3 or abs(v) > 1e6: return f"{v:.4e}"
+                        return f"{v:.4g}"
+                        
+                    stats_str = f"Min: {_f(mn)}  Mean: {_f(u)}  Max: {_f(mx)}  Sum: {_f(s)}"
+                    if unit: stats_str += f" {unit}"
+                    
+                    # 4. Construct Multi-line Title
+                    title_lines = [f"{pol} Emissions"]
+                    if unit:
+                        title_lines[0] += f" ({unit})"
+                    
+                    scc = self.cmb_scc.currentText()
+                    if scc and scc != "ALL":
+                        title_lines.append(f"SCC: {scc}")
+                    
+                    if self.cmb_ncf_layer.isVisible():
+                        title_lines.append(f"Layer: {self.cmb_ncf_layer.currentText()}")
+                    
+                    if time_lbl:
+                        title_lines.append(f"Time: {time_lbl}")
+                    elif self.cmb_ncf_time.isVisible():
+                         title_lines.append(f"Time: {self.cmb_ncf_time.currentText()}")
+                    
+                    # Append stats to title (Requested by user)
+                    title_lines.append(stats_str)
+                    
+                    ax.set_title("\n".join(title_lines), fontsize=12, pad=10)
+
+                    # Also update the persistent side panel if it exists
+                    try:
+                        self.lbl_stats_sum.setText(f"{s:.4g}")
+                        self.lbl_stats_max.setText(f"{mx:.4g}")
+                        self.lbl_stats_mean.setText(f"{u:.4g}")
+                        self.lbl_stats_count.setText(str(len(clean)))
+                    except Exception: pass
+                    
+                    # Remove floating stats text box if it exists
+                    if hasattr(ax, '_smk_stats_text'):
+                        try:
+                            ax._smk_stats_text.remove()
+                            del ax._smk_stats_text
+                        except: pass
+                    
+                    self.statusBar().showMessage(f"View Stats | {stats_str}", 3000)
+                else:
+                    ax.set_title(f"{pol} (No Data in View)", fontsize=12)
+                    if hasattr(ax, '_smk_stats_text'):
+                        try:
+                            ax._smk_stats_text.remove()
+                            del ax._smk_stats_text
+                        except: pass
+                
+                ax.figure.canvas.draw_idle()
+            except Exception as e:
+                logging.debug(f"Stats extraction failed: {e}")
+                ax.set_title(f"{pol} Emissions", fontsize=12)
+        except Exception as e:
+            logging.debug(f"Global title update failed: {e}")
+
+    # --- Updated Plot Logic ---
+    def update_plot(self):
+        """Main Plotting Logic, mirroring gui_qt.py exactly."""
+        if self.emissions_df is None:
+            if hasattr(self, 'input_files_list') and self.input_files_list:
+                self.on_load_clicked()
+                return
+            self.notify_signal.emit('WARNING', 'Load smkreport and shapefile first.')
+            return
+
+        pol = self.cmb_pollutant.currentText()
+        if not pol and hasattr(self, 'pollutants') and self.pollutants:
+             pol = self.pollutants[0]
+             self.cmb_pollutant.setCurrentText(pol)
+        
+        if not pol:
+            self.notify_signal.emit('WARNING', 'No pollutant selected.')
+            return
+
+        # Capture UI state (Mirroring gui_qt.py variables)
+        plot_by_mode = self.cmb_pltyp.currentText().lower()
+        scc_selection = self.cmb_scc.currentText()
+        scc_code_map = self._scc_display_to_code.copy() if self._scc_display_to_code else {}
+        
+        # Determine plotting CRS
+        plot_crs_info = self._plot_crs()
+
+        # NEW: Capture Plot Meta on Main Thread (Thread Safety)
         try:
-            if hasattr(self, 'ncf_layer_var'):
-                ncf_preserve['layer'] = self.ncf_layer_var.get()
-            if hasattr(self, 'ncf_tstep_var'):
-                ncf_preserve['tstep'] = self.ncf_tstep_var.get()
-        except Exception:
-            pass
+            is_rev = self.chk_rev_cmap.isChecked()
+            cmap_name = self.cmb_cmap.currentText()
+            if is_rev: cmap_name += '_r'
+            
+            meta_fixed = {
+                'cmap': cmap_name,
+                'use_log': self.chk_log.isChecked(),
+                'bins_txt': self.txt_bins.text(),
+                'bins': self._parse_bins(),
+                'unit': self.units_map.get(pol, ''),
+                'vmin': float(self.txt_rmin.text()) if self.txt_rmin.text() else None,
+                'vmax': float(self.txt_rmax.text()) if self.txt_rmax.text() else None,
+                'show_graticule': self.chk_graticule.isChecked() if hasattr(self, 'chk_graticule') else True,
+                'zoom_to_data': self.chk_zoom.isChecked(),
+                'fill_nan': self.chk_nan0.isChecked()
+            }
+        except Exception as e:
+            logging.error(f"Failed to capture meta: {e}")
+            meta_fixed = {}
 
-        self._set_status("Loading data...", level="INFO")
-
-        # Reset UI elements in main thread before starting background loader
-        try:
-            if hasattr(self, 'ncf_layer_menu'):
-                self.ncf_layer_menu.set('')
-                self.ncf_tstep_menu.set('')
-                self.ncf_layer_menu['values'] = []
-                self.ncf_tstep_menu['values'] = []
-                self.ncf_layer_menu.state(['disabled'])
-                self.ncf_tstep_menu.state(['disabled'])
-            if not self.inputfile_path:
-                self.pollutant_menu['menu'].delete(0, 'end')
-        except Exception:
-            pass
+        self._start_progress(pol=pol)
         
         threading.Thread(
-            target=self._load_inputfile_worker, 
-            args=(show_preview, effective_delim, current_delim_state, ncf_preserve), 
+            target=self._plot_worker, 
+            args=(pol, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed),
             daemon=True
         ).start()
 
-    def _load_inputfile_worker(self, show_preview, effective_delim, current_delim_state, ncf_preserve):
-        if not self.inputfile_path:
-            self.emissions_df = None
-            self.raw_df = None
-            self.pollutants = []
-            self.units_map = {}
-            self._invalidate_merge_cache()
-            self.status_var.set("Emissions data cleared.")
-            return
-
-        try:
-            if True: # Unified loading path (reimport deprecated)
-                try:
-                    # Thread-safe notify wrapper
-                    def safe_notify(level, message):
-                        self.root.after(0, lambda: self._loader_notify(level, message))
-                    
-                    # Handle multiple files (semicolon separated)
-                    f_input = self.inputfile_path
-                    if f_input and ";" in f_input:
-                        f_input = [x.strip() for x in f_input.split(";") if x.strip()]
-
-                    # Prepare NetCDF Params
-                    ncf_params = {}
-                    # Time Dimension
-                    t_arg = getattr(self, 'ncf_tdim', 'avg')
-                    if str(t_arg).isdigit():
-                        ncf_params['tstep_idx'] = int(t_arg)
-                        ncf_params['tstep_op'] = 'select'
-                    else:
-                        op = str(t_arg).lower()
-                        if op in ('avg', 'mean', 'average'): ncf_params['tstep_op'] = 'mean'
-                        elif op in ('sum', 'total'): ncf_params['tstep_op'] = 'sum'
-                        elif op in ('max', 'maximum'): ncf_params['tstep_op'] = 'max'
-                        elif op in ('min', 'minimum'): ncf_params['tstep_op'] = 'min'
-                        else: ncf_params['tstep_op'] = 'mean'
-
-                    # Layer Dimension
-                    z_arg = getattr(self, 'ncf_zdim', '0')
-                    if str(z_arg).isdigit():
-                        ncf_params['layer_idx'] = int(z_arg)
-                        ncf_params['layer_op'] = 'select'
-                    else:
-                        op = str(z_arg).lower()
-                        ncf_params['layer_idx'] = None
-                        if op in ('avg', 'mean', 'average'): ncf_params['layer_op'] = 'mean'
-                        elif op in ('sum', 'total'): ncf_params['layer_op'] = 'sum'
-                        elif op in ('max', 'maximum'): ncf_params['layer_op'] = 'max'
-                        elif op in ('min', 'minimum'): ncf_params['layer_op'] = 'min'
-                        else: 
-                            ncf_params['layer_idx'] = 0
-                            ncf_params['layer_op'] = 'select'
-
-                    emissions_df, raw_df = read_inputfile(
-                        f_input,
-                        sector=self.sector,
-                        delim=effective_delim,
-                        skiprows=self.skiprows,
-                        comment=self.comment_token,
-                        encoding=self.encoding,
-                        flter_col=self.filter_col,
-                        flter_start=self.filter_start,
-                        flter_end=self.filter_end,
-                        flter_val=self.filter_values,
-                        notify=safe_notify,
-                        ncf_params=ncf_params,
-                        lazy=True
-                    )
-                    if isinstance(emissions_df, pd.DataFrame):
-                        emissions_df.attrs['ncf_params'] = ncf_params
-
-                    # Build FIPS to ensure compatibility and consistent attributes
-                    if isinstance(emissions_df, pd.DataFrame):
-                        try:
-                            is_ncf = isinstance(f_input, str) and is_netcdf_file(f_input)
-                            emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
-                        except ValueError:
-                            # Ignore if FIPS columns not found (e.g. gridded data without region_cd)
-                            pass
-                        except Exception as e:
-                            safe_notify('WARNING', f"Error building FIPS: {e}")
-                    
-                    # Apply units_map from JSON arguments if available (overrides input data)
-                    units_map_arg = self._json_arguments.get('units_map')
-                    if isinstance(units_map_arg, dict) and isinstance(emissions_df, pd.DataFrame):
-                        existing_map = emissions_df.attrs.get('units_map', {})
-                        if not isinstance(existing_map, dict): existing_map = {}
-                        for k, v in units_map_arg.items():
-                            existing_map[k] = v
-                        emissions_df.attrs['units_map'] = existing_map
-
-                    # NCF Auto-Grid Logic
-                    if isinstance(f_input, str) and is_netcdf_file(f_input):
-                        try:
-                            # Lazy import
-                            from ncf_processing import create_ncf_domain_gdf, read_ncf_grid_params, get_ncf_dims, read_ncf_emissions
-                            safe_notify('INFO', 'Detected NetCDF input. Auto-configuring grid geometry...')
-                            
-                            # Get dimensions and update UI
-                            dims_info = get_ncf_dims(f_input) # {'n_tsteps': X, 'n_layers': Y, ...}
-                            n_lay = dims_info.get('n_layers', 1)
-                            n_ts = dims_info.get('n_tsteps', 1)
-                            tflags = dims_info.get('tflag_values', [])
-                            
-                            def _update_ncf_ui():
-                                # Enable widgets (must clear disabled state first)
-                                self.ncf_layer_menu.state(['!disabled', 'readonly'])
-                                self.ncf_tstep_menu.state(['!disabled', 'readonly'])
-                                
-                                # Populate values
-                                lay_vals = ['Sum All Layers', 'Average All Layers'] + [f"Layer {i+1}" for i in range(n_lay)]
-                                self.ncf_layer_menu['values'] = lay_vals
-                                
-                                # Attempt to restore preserved selection or default to first
-                                target_lay = ncf_preserve.get('layer')
-                                if target_lay and target_lay in lay_vals:
-                                    self.ncf_layer_menu.set(target_lay)
-                                elif self.ncf_layer_var.get() not in lay_vals:
-                                    # Default to Layer 1 for backward compatibility/preference? Or Sum?
-                                    # Let's keep Layer 1 as default as it's often surface
-                                    if n_lay > 0:
-                                        self.ncf_layer_menu.set(lay_vals[2]) # 0 is Sum, 1 is Avg, 2 is Layer 1
-                                
-                                # Use TFLAG values if available
-                                if tflags and len(tflags) == n_ts:
-                                    ts_vals = ['Sum All Time', 'Average All Time'] + [f"{t}" for i, t in enumerate(tflags)]
-                                else:
-                                    ts_vals = ['Sum All Time', 'Average All Time'] + [f"{i+1}" for i in range(n_ts)]
-                                
-                                self.ncf_tstep_menu['values'] = ts_vals
-
-                                # Attempt to restore preserved selection or default
-                                target_ts = ncf_preserve.get('tstep')
-                                if target_ts and target_ts in ts_vals:
-                                    self.ncf_tstep_menu.set(target_ts)
-                                elif self.ncf_tstep_var.get() not in ts_vals:
-                                    self.ncf_tstep_menu.set(ts_vals[1])
-
-                            self.root.after(0, _update_ncf_ui)
-
-                            # Determine read params - use preserved values as they reflect user intent (which was cleared from var)
-                            curr_lay_str = ncf_preserve.get('layer') or ''
-                            curr_ts_str = ncf_preserve.get('tstep') or ''
-                            
-                            l_idx = 0
-                            l_op = 'select'
-                            if 'Sum All' in curr_lay_str:
-                                l_idx = None
-                                l_op = 'sum'
-                            elif 'Average' in curr_lay_str:
-                                l_idx = None
-                                l_op = 'mean'
-                            elif 'Layer' in curr_lay_str:
-                                try: l_idx = int(curr_lay_str.split()[-1]) - 1
-                                except: l_idx = 0
-                                l_op = 'select'
-                            
-                            ts_idx = None
-                            ts_op = 'mean'
-                            if 'Sum All' in curr_ts_str:
-                                ts_idx = None
-                                ts_op = 'sum'
-                            elif 'Average' in curr_ts_str:
-                                ts_idx = None
-                                ts_op = 'mean'
-                            elif curr_ts_str:
-                                try:
-                                    # Re-construct expected list to find index
-                                    # n_ts and tflags are available here
-                                    flag_list = []
-                                    if tflags and len(tflags) == n_ts:
-                                        flag_list = [f"{t}" for t in tflags]
-                                    else:
-                                        flag_list = [f"{i+1}" for i in range(n_ts)]
-                                     
-                                    if curr_ts_str in flag_list:
-                                        ts_idx = flag_list.index(curr_ts_str)
-                                        ts_op = 'select'
-                                    else:
-                                        # Fallback for old format "Time X ..."
-                                        if 'Time' in curr_ts_str:
-                                                token = curr_ts_str.replace('Time', '', 1).strip().split()[0]
-                                                ts_idx = int(token) - 1
-                                                ts_op = 'select'
-                                except: 
-                                        ts_idx = None
-                                        ts_op = 'sum'
-                            
-                            # Re-read emissions with specific params
-                            # Note: read_inputfile called read_ncf_emissions default inside data_processing.
-                            # We update to use lazy skeleton logic by default
-                            msg = f"Reading NetCDF (Layer: {curr_lay_str or 'Layer 1'}, Time: {curr_ts_str or 'Average'})..."
-                            safe_notify('INFO', msg)
-                            # Pass existing xr_ds if available
-                            old_ds = getattr(emissions_df, 'attrs', {}).get('_smk_xr_ds')
-                            emissions_df = read_ncf_emissions(f_input, layer_idx=l_idx, tstep_idx=ts_idx, layer_op=l_op, tstep_op=ts_op, xr_ds=old_ds, lazy=True)
-                            # Record current params for future lazy fetches
-                            emissions_df.attrs['ncf_params'] = {
-                                'layer_idx': l_idx, 'tstep_idx': ts_idx, 'layer_op': l_op, 'tstep_op': ts_op
-                            }
-                            # Update raw_df too for consistency
-                            raw_df = emissions_df
-                            
-                            # ... (existing grid logic) ...
-                            ncf_grid_gdf = create_ncf_domain_gdf(f_input, full_grid=True)
-                            if not ncf_grid_gdf.empty:
-                                def _set_ncf_grid(gdf):
-                                    self.grid_gdf = gdf
-                                    self.plot_by_var.set('grid')
-                                    # Update UI labels to reflect NCF source
-                                    if self.griddesc_entry:
-                                        self.griddesc_entry.delete(0, tk.END)
-                                        self.griddesc_entry.insert(0, "(NetCDF Attributes)")
-                                    # Extract GRID name for UI
-                                    _, gp = read_ncf_grid_params(f_input)
-                                    if self.grid_name_var:
-                                        self.grid_name_var.set(gp[0])
-                                    
-                                    self.status_var.set("Grid geometry loaded from NetCDF.")
-                                
-                                self.root.after(0, lambda: _set_ncf_grid(ncf_grid_gdf))
-                        except Exception as grid_err:
-                            safe_notify('WARNING', f"Failed to auto-configure grid from NetCDF: {grid_err}")
-
-                except Exception as e:
-                    err_msg = str(e)
-                    if "No valid FIPS code columns found" in err_msg:
-                        self.root.after(0, lambda: self._notify('ERROR', 'Input Not Supported', 'The input file format is not supported (missing FIPS/Region columns).', exc=None))
-                    else:
-                        self.root.after(0, lambda e=e: self._notify('ERROR', 'Emissions Load Error', str(e), exc=e))
-                    return
-                
-                # Apply fill-nan if configured
-                fn_arg = getattr(self, 'fill_nan_arg', None)
-                if fn_arg is not None:
-                    try:
-                        should_fill = False
-                        fill_num = 0.0
-                        if isinstance(fn_arg, bool) and not fn_arg:
-                            should_fill = False
-                        elif isinstance(fn_arg, str) and fn_arg.lower() == 'false':
-                            should_fill = False
-                        else:
-                            try:
-                                fill_num = float(fn_arg)
-                                should_fill = True
-                            except Exception:
-                                pass
-                        
-                        if should_fill:
-                            # Fill emissions_df
-                            cols = emissions_df.select_dtypes(include=[np.number]).columns
-                            if len(cols) > 0:
-                                emissions_df[cols] = emissions_df[cols].fillna(fill_num)
-                            # Fill raw_df
-                            rcols = raw_df.select_dtypes(include=[np.number]).columns
-                            if len(rcols) > 0:
-                                raw_df[rcols] = raw_df[rcols].fillna(fill_num)
-                    except Exception as e:
-                        logging.warning(f"Fill NaN error: {e}")
-
-                self.emissions_df = emissions_df
-                self.raw_df = raw_df
-                if effective_delim is not None:
-                    self.emissions_delim = effective_delim
-                self._last_loaded_delim_state = current_delim_state
-                
-                # Pre-compute SCC data in thread
-                scc_data = self._compute_scc_data(self.raw_df)
-                
-                self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
-        
-        except Exception as e:
-            self.root.after(0, lambda: self._notify('ERROR', 'Async Load Error', str(e), exc=e))
-
-    def _compute_scc_data(self, df):
-        has = False
-        items = []
-        scc_map = {}
-        try:
-            if isinstance(df, pd.DataFrame):
-                lower = {c.lower() for c in df.columns}
-                has = ('scc' in lower) or any(c in lower for c in ['scc description','scc_description'])
-                if has:
-                    # Build unique list of SCC + description
-                    cmap = {c.lower(): c for c in df.columns}
-                    scc_col = cmap.get('scc')
-                    desc_col = cmap.get('scc description') or cmap.get('scc_description')
-                    scc_series = df[scc_col].astype(str) if scc_col else pd.Series(['']*len(df))
-                    desc_series = df[desc_col].astype(str) if desc_col else pd.Series(['']*len(df))
-                    # Use code_key as primary key (prefer SCC, fallback to description)
-                    code_key = scc_series.where(scc_series.str.strip() != '', other=desc_series)
-                    display = code_key.str.strip()
-                    with_desc = desc_series.str.strip()
-                    # Combine display with description when available and not duplicate
-                    display = display.where(with_desc == '' , other=(code_key.str.strip() + ' – ' + with_desc))
-                    # Create unique by code_key keeping first description
-                    tmp = pd.DataFrame({'code': code_key.fillna(''), 'disp': display.fillna('')})
-                    tmp = tmp.drop_duplicates(subset=['code'])
-                    # Sort by code for stability
-                    try:
-                        tmp = tmp.sort_values('code')
-                    except Exception:
-                        pass
-                    items = [('All SCC', '')] + [(row.disp if row.disp else row.code, row.code) for row in tmp.itertuples(index=False)]
-                    scc_map = {d: c for d, c in items}
-        except Exception:
-            has = False
-            items = []
-            scc_map = {}
-        return has, items, scc_map
-
-    def _update_scc_widgets(self, scc_data=None):
-        if scc_data:
-            has, items, scc_map = scc_data
-        else:
-            has, items, scc_map = self._compute_scc_data(self.raw_df)
-        
-        self._has_scc_cols = bool(has)
-        if has:
-            self._scc_display_to_code = scc_map
-            try:
-                self.scc_entry['values'] = [d for d, _ in items]
-                self.scc_select_var.set('All SCC')
-            except Exception:
-                pass
-        
-        # Enable/disable widgets accordingly
-        try:
-            if self._has_scc_cols:
-                self.scc_entry.state(['!disabled'])
-                self.scc_label.state(['!disabled'])
-            else:
-                self.scc_entry.state(['disabled'])
-                self.scc_label.state(['disabled'])
-                if self.scc_select_var:
-                    self.scc_select_var.set('All SCC')
-                self._scc_display_to_code = {}
-        except Exception:
-            pass
-
-    def load_griddesc(self):
-        if not self.griddesc_path or self.griddesc_path == "(NetCDF Attributes)":
-            self.grid_gdf = None
-            try:
-                menu = self.grid_name_menu["menu"]
-                menu.delete(0, "end")
-                self.grid_name_var.set("Select Grid")
-            except Exception:
-                pass
-            self._invalidate_merge_cache()
-            return
-        self._ff10_grid_ready = False
-        try:
-            grid_names = sorted(extract_grid(self.griddesc_path, grid_id=None), key=lambda s: s.lower())
-            menu = self.grid_name_menu["menu"]
-            menu.delete(0, "end")
-            for name in grid_names:
-                # Set variable and trigger load_grid_shape() when user selects
-                try:
-                    menu.add_command(label=name, command=tk._setit(self.grid_name_var, name, lambda *_: self.load_grid_shape()))  # type: ignore[attr-defined]
-                except Exception:
-                    menu.add_command(label=name, command=lambda v=name: (self.grid_name_var.set(v), self.load_grid_shape()))
-            # Do not auto-create domain shapefile; wait until user selects a grid name
-            try:
-                self.grid_name_var.set("Select Grid")
-            except Exception:
-                pass
-            # Clear any existing grid geometry to avoid stale merges
-            self.grid_gdf = None
-            self._invalidate_merge_cache()
-        except Exception as e:
-            self._notify('ERROR', 'GRIDDESC Load Error', str(e), exc=e)
-
-    def load_grid_shape(self):
-        if not self.griddesc_path or not self.grid_name_var.get() or self.grid_name_var.get() == "Select Grid":
-            return
-        self._ff10_grid_ready = False
-        try:
-            self.grid_gdf = create_domain_gdf(self.griddesc_path, self.grid_name_var.get())
-            self._notify('INFO', 'Grid Loaded', f"Successfully created grid shape for '{self.grid_name_var.get()}'.", popup=False)
-            self._invalidate_merge_cache()
-            self._ensure_ff10_grid_mapping()
-        except Exception as e:
-            self._notify('ERROR', 'Grid Creation Error', str(e), exc=e)
-
-    def load_shpfile(self):
-        try:
-            self.counties_gdf = read_shpfile(self.counties_path, True)
-            # Path persistence disabled
-            self._invalidate_merge_cache()
-        except Exception as e:
-            self._notify('ERROR', 'Counties Load Error', str(e), exc=e)
-            return
-
-    def load_overlay(self):
-        """Load optional overlay shapefile(s) for visual reference. Also includes filter shapefiles."""
-        try:
-            # 1. Clear existing visual overlay list
-            self.overlay_gdf = None
-            
-            # 2. Get paths for both overlays and filters
-            ov_paths = getattr(self, 'overlay_path', None)
-            filter_paths = getattr(self, 'filter_path', None)
-            
-            all_parts = []
-            
-            # Helper to load paths into parts list
-            def _load_into(paths, parts_list):
-                if not paths: return
-                file_list = []
-                if isinstance(paths, str):
-                    file_list = [p.strip() for p in paths.split(';') if p.strip()]
-                elif isinstance(paths, (list, tuple)):
-                    for item in paths:
-                        if isinstance(item, str):
-                            file_list.extend([p.strip() for p in item.split(';') if p.strip()])
-                        else:
-                            file_list.append(str(item))
-                else:
-                    file_list = [str(paths)]
-                
-                for fpath in file_list:
-                    try:
-                        part = read_shpfile(fpath, False)
-                        if part is not None and not part.empty:
-                            parts_list.append(part)
-                    except Exception:
-                        self._notify("WARNING", "Load Warning", f"Failed to load shapefile: {fpath}")
-
-            # Load primary overlays
-            _load_into(ov_paths, all_parts)
-            
-            # Load filters (for visual display)
-            filter_parts = []
-            _load_into(filter_paths, filter_parts)
-            
-            # Update filter_gdf for spatial filtering logic
-            self._update_filter_gdf(filter_parts)
-            
-            # Combine all for visual display
-            all_parts.extend(filter_parts)
-            
-            if all_parts:
-                self.overlay_gdf = all_parts
-                  
-        except Exception as e:
-            self._notify('ERROR', 'Overlay Load Error', str(e), exc=e)
-
-    def _update_filter_gdf(self, loaded_filter_parts):
-        """Update the internal filter_gdf used for spatial filtering."""
-        if not loaded_filter_parts:
-            self.filter_gdf = None
-        elif len(loaded_filter_parts) == 1:
-            self.filter_gdf = loaded_filter_parts[0]
-        else:
-            target_crs = loaded_filter_parts[0].crs
-            combined_parts = [loaded_filter_parts[0]]
-            for other in loaded_filter_parts[1:]:
-                if target_crs and other.crs and other.crs != target_crs:
-                    other = other.to_crs(target_crs)
-                combined_parts.append(other)
-            self.filter_gdf = pd.concat(combined_parts, ignore_index=True)
-
-    def load_filter(self):
-        """Update filter data and refresh overlays."""
-        self.load_overlay()
-
-
-    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None) -> Optional[gpd.GeoDataFrame]:
+    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None, fill_nan=False) -> Optional[gpd.GeoDataFrame]:
+        """Prepare and merge emissions with geometry, mirroring gui_qt.py logic exactly."""
         if self.emissions_df is None:
             return None
+
+        # Determine if we have a native NetCDF/already-gridded dataset
+        is_native = getattr(self.emissions_df, 'attrs', {}).get('_smk_is_native', False)
 
         def _do_notify(level, title, msg, exc=None, **kwargs):
             if notify:
                 notify(level, title, msg, exc, **kwargs)
             else:
-                self._notify(level, title, msg, exc=exc, **kwargs)
+                self.notify_signal.emit(level, f"{title}: {msg}")
 
-        mode = (plot_by_mode if plot_by_mode is not None else (self.plot_by_var.get().lower() if self.plot_by_var else 'auto'))
+        mode = (plot_by_mode if plot_by_mode is not None else self.cmb_pltyp.currentText().lower())
+        
+        # Shortcut for Native Grids if in 'auto' or 'grid' mode AND large enough for QuadMesh optimization
+        if is_native and mode in ['auto', 'grid'] and len(self.emissions_df) > 10000:
+            target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
+            # For native datasets (NetCDF/Inline), we can proceed if the pollutant is available
+            if target_pol and target_pol in getattr(self.emissions_df, 'columns', []):
+                logging.debug(f"Native grid shortcut for {target_pol}")
+                
+                # Slicing is disabled to avoid duplicate column header issues
+                res_df = self.emissions_df.copy()
+                
+                # Apply fill_nan in shortcut
+                if fill_nan:
+                    res_df[target_pol] = res_df[target_pol].fillna(0)
+
+                # Ensure GRID_RC exists (Required for Hover tools and coordination)
+                if 'GRID_RC' not in res_df.columns and 'ROW' in res_df.columns and 'COL' in res_df.columns:
+                    try: 
+                        # Vectorized string conversion is faster
+                        res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
+                        # Cache it back to source to avoid re-calculation on next pollutant switch
+                        if 'GRID_RC' not in self.emissions_df.columns:
+                            self.emissions_df['GRID_RC'] = res_df['GRID_RC']
+                    except: pass
+                
+                # Downstream pipeline (Reprojection/Plotter) expects a GeoDataFrame
+                if not isinstance(res_df, gpd.GeoDataFrame):
+                    res_gdf = gpd.GeoDataFrame(res_df, geometry=None)
+                    # Preserve attributes which contain the grid info
+                    res_gdf.attrs = self.emissions_df.attrs.copy()
+                    
+                    # NEW: Robustly inject grid info from active grid if missing in dataset
+                    if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
+                         if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
+                              res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
+                    
+                    # Try to assign CRS from grid info if missing
+                    if getattr(res_gdf, 'crs', None) is None:
+                        try:
+                            info = res_gdf.attrs.get('_smk_grid_info')
+                            if info and info.get('proj_str'):
+                                res_gdf.set_crs(info['proj_str'], inplace=True)
+                        except: pass
+                    return res_gdf
+                return res_df
+
         base_gdf: Optional[gpd.GeoDataFrame] = None
         merge_on: Optional[str] = None
         geometry_tag = None
+        
         try:
             source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type') if isinstance(self.emissions_df, pd.DataFrame) else None
         except Exception:
             source_type = None
 
-        sel_display = scc_selection if scc_selection is not None else (self.scc_select_var.get() if self.scc_select_var else 'All SCC')
+        sel_display = scc_selection if scc_selection is not None else self.cmb_scc.currentText()
         sel_code = ''
         code_map = scc_code_map if scc_code_map is not None else self._scc_display_to_code
         if code_map:
@@ -1809,13 +2757,24 @@ class EmissionGUI:
                 sel_code = code_map.get(sel_display, '') or ''
             except Exception:
                 sel_code = ''
-        use_scc_filter = bool(self._has_scc_cols and sel_code)
+        
+        has_scc_cols = any(c.lower() in ['scc', 'scc code', 'scc_code'] for c in self.emissions_df.columns)
+        use_scc_filter = bool(has_scc_cols and sel_code)
 
         if mode == 'grid':
             if self.grid_gdf is None:
                 _do_notify('WARNING', 'Grid not loaded', 'Select a GRIDDESC and Grid Name first to build the grid geometry.')
                 raise ValueError("Handled")
-            self._ensure_ff10_grid_mapping(notify_success=False)
+            
+            # For NetCDF, we don't need to ensure FF10 mapping, but we might need to ensure GRID_RC exists
+            if not is_native:
+                self._ensure_ff10_grid_mapping(notify_success=False)
+            else:
+                if 'GRID_RC' not in self.emissions_df.columns and 'ROW' in self.emissions_df.columns:
+                    try:
+                        self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
+                    except: pass
+
             base_gdf = self.grid_gdf
             merge_on = 'GRID_RC'
             geometry_tag = 'grid'
@@ -1826,10 +2785,16 @@ class EmissionGUI:
             base_gdf = self.counties_gdf
             merge_on = 'FIPS'
             geometry_tag = 'county'
-        else:
+        else: # auto
             if self.grid_gdf is not None:
                 if 'GRID_RC' not in getattr(self.emissions_df, 'columns', []):
-                    self._ensure_ff10_grid_mapping(notify_success=False)
+                    if not is_native:
+                        self._ensure_ff10_grid_mapping(notify_success=False)
+                    else:
+                        if 'ROW' in self.emissions_df.columns:
+                             try: self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
+                             except: pass
+                             
                 if 'GRID_RC' in getattr(self.emissions_df, 'columns', []):
                     base_gdf = self.grid_gdf
                     merge_on = 'GRID_RC'
@@ -1837,8 +2802,9 @@ class EmissionGUI:
             if base_gdf is None and self.counties_gdf is not None:
                 base_gdf = self.counties_gdf
                 merge_on = 'FIPS'
-                if not merge_on or merge_on.lower() not in {c.lower() for c in self.emissions_df.columns}:
-                    merge_on = 'FIPS'
+                if not any(c.lower() == 'fips' for c in self.emissions_df.columns):
+                    if any(c.lower() == 'region_cd' for c in self.emissions_df.columns):
+                        merge_on = 'FIPS' 
                 geometry_tag = 'county'
             if base_gdf is None:
                 _do_notify('WARNING', 'No suitable geometry', 'Could not find a suitable shapefile (Counties or Grid) for the loaded emissions data.')
@@ -1846,10 +2812,10 @@ class EmissionGUI:
 
         if merge_on and isinstance(base_gdf, gpd.GeoDataFrame):
             if merge_on not in base_gdf.columns:
-                if merge_on.lower() == 'region_cd' and 'FIPS' in base_gdf.columns:
+                if merge_on == 'FIPS' and 'region_cd' in base_gdf.columns:
                     try:
                         base_gdf = base_gdf.copy()
-                        base_gdf['region_cd'] = base_gdf['FIPS']
+                        base_gdf['FIPS'] = base_gdf['region_cd']
                     except Exception:
                         pass
                 else:
@@ -1857,12 +2823,9 @@ class EmissionGUI:
                     raise ValueError("Handled")
 
         pol_tuple = tuple(self.pollutants or [])
-        if not pol_tuple:
-            try:
-                pol_tuple = tuple(detect_pollutants(self.emissions_df))
-            except Exception:
-                pol_tuple = ()
+        target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
 
+        # Cache key including NaN fill and spatial filter state
         cache_key = (
             geometry_tag or mode,
             merge_on or '',
@@ -1871,626 +2834,130 @@ class EmissionGUI:
             id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
             sel_code if use_scc_filter else '',
             pol_tuple,
-            pollutant or '',
-            getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
-            getattr(self, 'fill_nan_arg', None),
-            # Filter overlay state
-            getattr(self, 'filter_overlay_var', None) and self.filter_overlay_var.get(),
-            id(self.overlay_gdf) if getattr(self, 'overlay_gdf', None) is not None else 0
+            target_pol or '',
+            fill_nan,
+            self.cmb_filter_op.currentText() if hasattr(self, 'cmb_filter_op') else 'False',
+            id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0
         )
+        
         cached = self._merged_cache.get(cache_key)
         if cached is not None:
-            cached_merged, cached_prepared, cached_key = cached
-            try:
-                merged_view = cached_merged.copy()
-            except Exception:
-                merged_view = cached_merged
-            try:
-                if cached_prepared is not None:
-                    merged_view.attrs['__prepared_emis'] = cached_prepared
-            except Exception:
-                pass
-            try:
-                if cached_key:
-                    merged_view.attrs['__merge_key'] = cached_key
-            except Exception:
-                pass
-            return merged_view
+            return cached[0].copy()
 
-        emis_for_merge = self.emissions_df if isinstance(self.emissions_df, pd.DataFrame) else None
+        # Use full copy to avoid issues with duplicate columns in source data
+        if isinstance(self.emissions_df, pd.DataFrame):
+            emis_for_merge = self.emissions_df.copy()
+            # Copy attrs manually
+            if hasattr(self.emissions_df, 'attrs'):
+                emis_for_merge.attrs = self.emissions_df.attrs.copy()
+        else:
+            emis_for_merge = None
+
         if emis_for_merge is None:
-            _do_notify('ERROR', 'No Emissions Data', 'Emissions dataset is not loaded or invalid.')
             return None
 
-        # ON-DEMAND LAZY NETCDF FETCH:
-        # If the requested pollutant is in the NetCDF variables but not in the DataFrame yet
-        target_pol = pollutant if pollutant else (self.pollutant_var.get() if hasattr(self, 'pollutant_var') else None)
+        # ON-DEMAND LAZY NETCDF FETCH
         if target_pol and target_pol not in emis_for_merge.columns:
-                ds = emis_for_merge.attrs.get('_smk_xr_ds')
-                if ds is not None:
-                    _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
-                    try:
-                        from ncf_processing import read_ncf_emissions
-                        ncf_params = emis_for_merge.attrs.get('ncf_params', {})
-                        # Re-read just this pollutant using the cached xarray handle
-                        new_data = read_ncf_emissions(
-                            self.inputfile_path, 
-                            pollutants=[target_pol], 
-                            xr_ds=ds, 
-                            **ncf_params
-                        )
-                        if target_pol in new_data.columns:
-                            # Cache it in the main dataframe so we don't fetch it again
-                            emis_for_merge[target_pol] = new_data[target_pol].values
-                            # Also update units_map if missing
-                            if target_pol not in self.units_map:
-                                v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
-                                self.units_map[target_pol] = v_meta.get('units', '')
-                    except Exception as e:
-                        _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
-
-        raw_df_for_scc = None
-        if use_scc_filter and isinstance(self.raw_df, pd.DataFrame):
-            cmap = {c.lower(): c for c in self.raw_df.columns}
-            scc_col = cmap.get('scc')
-            desc_col = cmap.get('scc description') or cmap.get('scc_description')
-            if scc_col and scc_col in self.raw_df.columns:
+            ds = emis_for_merge.attrs.get('_smk_xr_ds')
+            if ds is not None:
+                _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
                 try:
-                    mask = self.raw_df[scc_col].astype(str) == sel_code
-                except Exception:
-                    mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            elif desc_col and desc_col in self.raw_df.columns:
-                try:
-                    mask = self.raw_df[desc_col].astype(str) == sel_code
-                except Exception:
-                    mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            else:
-                mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            raw_df_for_scc = self.raw_df.loc[mask].copy()
-            if raw_df_for_scc.empty:
-                _do_notify('WARNING', 'SCC filter matched 0 rows', f'No rows matched SCC: {sel_display}. Showing all SCC.')
-                raw_df_for_scc = None
+                    from ncf_processing import read_ncf_emissions
+                    ncf_params = emis_for_merge.attrs.get('ncf_params', {})
+                    new_data = read_ncf_emissions(self.input_files_list[0], pollutants=[target_pol], xr_ds=ds, **ncf_params)
+                    if target_pol in new_data.columns:
+                        emis_for_merge[target_pol] = new_data[target_pol].values
+                        self.emissions_df[target_pol] = new_data[target_pol].values # Sync back
+                        if target_pol not in self.units_map:
+                            v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
+                            self.units_map[target_pol] = v_meta.get('units', '')
+                except Exception as e:
+                    _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
 
+        # SCC Filtering & Re-aggregation
         if merge_on not in emis_for_merge.columns or use_scc_filter:
-            try:
-                raw_df = raw_df_for_scc if use_scc_filter else self.raw_df  # type: ignore[attr-defined]
-            except Exception:
-                raw_df = None
-            if isinstance(raw_df, pd.DataFrame) and merge_on in raw_df.columns:
-                pols = list(self.pollutants or detect_pollutants(raw_df))
+            raw_to_use = self.raw_df
+            if use_scc_filter and self.raw_df is not None:
+                scc_col = next((c for c in raw_to_use.columns if c.lower() in ['scc', 'scc code', 'scc_code']), None)
+                if scc_col:
+                    raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
+            
+            if isinstance(raw_to_use, pd.DataFrame) and merge_on in raw_to_use.columns:
+                pols = list(self.pollutants or detect_pollutants(raw_to_use))
                 if pols:
                     try:
-                        subset = raw_df[[merge_on] + pols]
-                        try:
-                            grouped = subset.groupby(merge_on, dropna=False, sort=False)
-                        except TypeError:
-                            grouped = subset.groupby(merge_on, sort=False)
-                        agg = grouped.sum(numeric_only=True).reset_index()
-                        try:
-                            agg.attrs = dict(getattr(emis_for_merge, 'attrs', {}))
-                        except Exception:
-                            pass
+                        subset = raw_to_use[[merge_on] + pols]
+                        agg = subset.groupby(merge_on, sort=False).sum(numeric_only=True).reset_index()
+                        agg.attrs = dict(getattr(emis_for_merge, 'attrs', {}))
                         emis_for_merge = agg
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.warning(f"Re-aggregation failed: {e}")
 
         if merge_on not in emis_for_merge.columns:
-            if merge_on == 'GRID_RC':
-                # Enhanced Warning Diagnostics
-                msg_lines = ["Plot by Grid requires 'GRID_RC' column (implied X/Y logic)."]
-                
-                # Check for presence of row/col columns
-                cols_low = [c.lower() for c in emis_for_merge.columns]
-                has_row = any(x in cols_low for x in ['row', 'r', 'y', 'ycell', 'y_cell'])
-                has_col = any(x in cols_low for x in ['col', 'c', 'x', 'xcell', 'x_cell'])
-                
-                if has_row and has_col:
-                    msg_lines.append("Found potential Row/Col columns, but GRID_RC was not generated.")
-                    msg_lines.append("Check that your GRIDDESC file is loaded and the correct Grid Name is selected.")
-                else:
-                    msg_lines.append("Input data appears to be missing 'row'/'col' or 'x'/'y' identifier columns.")
-                
-                if self.grid_gdf is None or self.grid_gdf.empty:
-                    msg_lines.append("CRITICAL: No Grid Definition loaded. You must load a GRIDDESC file.")
-
-                _do_notify('WARNING', 'No GRID_RC in data', "\n".join(msg_lines))
-            else:
-                if source_type in ('ff10_point', 'ff10_nonpoint'):
-                    _do_notify('WARNING', 'No region_cd in data', 'FF10 data requires region_cd for county plots.')
-                else:
-                    _do_notify('WARNING', 'No FIPS in data', 'Plot by County requires emissions with FIPS codes.')
-            
-            # Signal to caller that warning is handled to avoid generic "Missing Data" msg
+            _do_notify('WARNING', 'Missing Join Column', f"Data lacks '{merge_on}' required for {geometry_tag} plot.")
             raise ValueError("Handled")
 
         try:
-            merged, prepared_emis = merge_emissions_with_geometry(
-                emis_for_merge,
-                base_gdf,
-                merge_on,
-                sort=False,
-                copy_geometry=False,
+            from data_processing import merge_emissions_with_geometry
+            merged, prepared = merge_emissions_with_geometry(
+                emis_for_merge, base_gdf, merge_on, sort=False, copy_geometry=False
             )
-            # Propagate attributes from emissions and geometry
+            # Propagate attributes from emissions and geometry (CRITICAL for QuadMesh/Hover)
             if hasattr(merged, 'attrs'):
                 for src in [emis_for_merge, base_gdf]:
                     if hasattr(src, 'attrs'):
                         merged.attrs.update(src.attrs)
-        except Exception as exc:
-            _do_notify('ERROR', 'Geometry Merge Failed', str(exc), exc=exc)
-            return None
 
-        try:
-            matched_vals = prepared_emis[merge_on].dropna()
-            merged['__has_emissions'] = merged[merge_on].isin(matched_vals)
-        except Exception:
-            try:
-                merged['__has_emissions'] = merged[merge_on].notna()
-            except Exception:
-                merged['__has_emissions'] = False
-        
-        # Apply fill_nan if configured (for map regions with no data)
-        try:
-            fill_arg = getattr(self, 'fill_nan_arg', None)
-            fill_zero = getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get()
-
-            do_fill = False
-            fill_val = 0.0
-
-            if fill_zero:
-                do_fill = True
-                fill_val = 0.0
-            elif fill_arg is not None:
-                if isinstance(fill_arg, bool) and not fill_arg:
-                    do_fill = False
-                elif isinstance(fill_arg, str) and str(fill_arg).lower() == 'false':
-                    do_fill = False
-                else:
-                    try:
-                        fill_val = float(fill_arg)
-                        do_fill = True
-                    except Exception:
-                        pass
-                
-            if do_fill:
-                # Identify pollutant columns to fill
-                pols = getattr(self, 'pollutants', [])
+            matched = prepared[merge_on].dropna().unique()
+            merged['__has_emissions'] = merged[merge_on].isin(matched)
+            
+            # fill_nan logic
+            if fill_nan:
+                pols = list(self.pollutants or [])
+                if target_pol and target_pol not in pols:
+                    pols.append(target_pol)
+                    
                 if pols:
                     cols_to_fill = [c for c in pols if c in merged.columns]
                     if cols_to_fill:
-                            merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_val)
-        except Exception as e:
-            logging.warning(f"Error filling NaNs in merged geometry: {e}")
+                        # Only fill regions where we actually have a geometry but no match
+                        # merged['__has_emissions'] tells us if it was a match
+                        merged[cols_to_fill] = merged[cols_to_fill].fillna(0.0)
 
-        # Filter by Filter Shapefile if enabled (new logic with backward compatibility)
-        try:
-            filter_mode = None
-            filter_gdf_to_use = getattr(self, 'filter_gdf', None)
-            
-            # Check new filter_shapefile_opt first
-            if getattr(self, 'filter_overlay_var', None):
-                val = self.filter_overlay_var.get()
-                if isinstance(val, str):
-                    s = val.strip().lower()
-                    if s not in ('false', 'none', 'off', 'null', ''):
-                        filter_mode = 'intersect' if s == 'true' else s
-                elif isinstance(val, bool) and val:
-                    filter_mode = 'intersect'
-            
-            # Backward compatibility: if filter_gdf not set but filtering requested, use overlay_gdf
-            if filter_mode and filter_gdf_to_use is None:
-                ov_gdf = getattr(self, 'overlay_gdf', None)
-                if ov_gdf is not None:
-                    _do_notify('WARNING', 'Deprecated', 'Using overlay for filtering. Please use filter_shapefile instead.', popup=False)
-                    # Convert overlay list to combined GeoDataFrame for filtering
-                    if isinstance(ov_gdf, list):
-                        if ov_gdf:
-                            target_crs = ov_gdf[0].crs
-                            combined_parts = [ov_gdf[0]]
-                            for other in ov_gdf[1:]:
-                                if target_crs and other.crs and other.crs != target_crs:
-                                    other = other.to_crs(target_crs)
-                                combined_parts.append(other)
-                            filter_gdf_to_use = pd.concat(combined_parts, ignore_index=True)
-                    else:
-                        filter_gdf_to_use = ov_gdf
-            
-            # Apply filtering
-            if filter_mode and filter_gdf_to_use is not None:
-                _do_notify('INFO', 'Filtering', f'Filtering data by shapefile ({filter_mode})...', popup=False)
+            # Spatial Filtering
+            filter_mode = self.cmb_filter_op.currentText()
+            if filter_mode != 'False' and self.filter_gdf is not None:
+                _do_notify('INFO', 'Filtering', f'Filtering data by shapefile ({filter_mode})...')
+                from data_processing import apply_spatial_filter
                 try:
-                    merged = apply_spatial_filter(merged, filter_gdf_to_use, filter_mode)
+                    merged = apply_spatial_filter(merged, self.filter_gdf, filter_mode)
                 except Exception as e:
                     _do_notify('WARNING', 'Filter Failed', f"Could not filter by shapefile ({filter_mode}): {e}")
+
+            self._merged_cache[cache_key] = (merged.copy(), prepared, merge_on)
+            
+            # Ensure the merged GDF has a CRS (fallback to WGS84 for remapping)
+            if getattr(merged, 'crs', None) is None:
+                 if getattr(base_gdf, 'crs', None) is not None:
+                      merged.crs = base_gdf.crs
+                 else:
+                      merged.crs = "EPSG:4326"
+            
+            return merged
         except Exception as e:
-            _do_notify('WARNING', 'Filter Logic Error', str(e))
+            _do_notify('ERROR', 'Merge Failed', f"{e}")
+            return None
 
+    def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed):
+        """Worker thread to prepare data and reproject, mirroring gui_qt.py exactly."""
         try:
-            cache_df = merged.copy()
-        except Exception:
-            cache_df = merged
-        self._merged_cache[cache_key] = (cache_df, prepared_emis, merge_on)
-        return merged
-
-    def _setup_hover(self, merged: gpd.GeoDataFrame, pollutant: str, ax=None, lonlat_transformer: Optional[pyproj.Transformer] = None) -> None:
-        """Enhance status bar to show pollutant at cursor and WGS84 lon/lat by overriding format_coord.
-        Pass the GeoDataFrame in the same CRS as the axes (reprojected if needed), and optionally a transformer
-        that converts axes coordinates to WGS84 lon/lat for display.
-        """
-        try:
-            from shapely.geometry import Point  # type: ignore
-        except Exception:
-            return
-        gdf = merged
-        try:
-            sindex = gdf.sindex
-        except Exception:
-            sindex = None
-
-        def _fmt(x: float, y: float) -> str:
-            # Build lon/lat if possible; otherwise fall back to axes coords
-            base = None
-            try:
-                if lonlat_transformer is not None:
-                    lon, lat = lonlat_transformer.transform(x, y)
-                    if abs(lon) < 1e6 and abs(lat) < 1e6:
-                        base = f"lon={lon:.4f}°, lat={lat:.4f}°"
-                elif getattr(gdf, 'crs', None) is not None:
-                    try:
-                        # If geometries are already geographic
-                        is_geog = gdf.crs.is_geographic if hasattr(gdf.crs, 'is_geographic') else False
-                        if is_geog:
-                            base = f"lon={x:.4f}°, lat={y:.4f}°"
-                    except Exception:
-                        pass
-            except Exception:
-                base = None
-            if base is None:
-                base = f"x={x:.4f}, y={y:.4f}"
-            try:
-                pt = Point(x, y)
-                cand_idx = []
-                
-                # OPTIMIZATION: High-speed grid math for large datasets
-                # This bypasses expensive SIndex intersection for 100k+ polygons
-                info = getattr(gdf, 'attrs', {}).get('_smk_grid_info')
-                if info and 'ROW' in gdf.columns:
-                    try:
-                        # 1. Coordinate to Native Grid space (e.g. LCC)
-                        native_crs_str = info.get('proj_str')
-                        lookup_x, lookup_y = x, y
-                        
-                        if native_crs_str:
-                            try:
-                                import pyproj
-                                native_crs = pyproj.CRS.from_user_input(native_crs_str)
-                                # The Axes CRS is recorded by the plotter
-                                axes_crs = getattr(target_ax, '_smk_ax_crs', None) or getattr(gdf, 'crs', None)
-                                
-                                if axes_crs is not None and not native_crs.equals(axes_crs):
-                                    if not hasattr(target_ax, '_hover_lookup_transformer'):
-                                        target_ax._hover_lookup_transformer = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
-                                    lookup_x, lookup_y = target_ax._hover_lookup_transformer.transform(x, y)
-                            except Exception: pass
-                        
-                        # 2. Native space to Row/Col (1-based)
-                        col_look = int(np.floor((lookup_x - info['xorig']) / info['xcell'])) + 1
-                        row_look = int(np.floor((lookup_y - info['yorig']) / info['ycell'])) + 1
-                        
-                        # 3. Fast lookup in GDF
-                        # Identify candidate index based on Row/Col
-                        matches = gdf.index[(gdf['ROW'] == row_look) & (gdf['COL'] == col_look)].tolist()
-                        if matches:
-                            cand_idx = matches
-                    except Exception: cand_idx = []
-                
-                # FALLBACK: Use Spatial Index (Intersection) if math failed or no match
-                if not cand_idx:
-                    if sindex is not None:
-                        cand_idx = list(sindex.intersection((x, y, x, y)))
-                    else:
-                        cand_idx = range(len(gdf))
-
-                best_parts = None
-                best_val = -1.0
-                
-                for idx in cand_idx:
-                    row = gdf.iloc[idx]
-                    geom = row.geometry
-                    if geom is not None and geom.contains(pt):
-                        parts = [base]
-                        # Identify region
-                        fips = row.get('FIPS')
-                        region_cd = row.get('region_cd') or row.get('REGION_CD')
-                        gridrc = row.get('GRID_RC')
-                        if isinstance(fips, (str, int)):
-                            parts.append(f"FIPS={str(fips).zfill(6) if str(fips).isdigit() else str(fips)}")
-                        elif isinstance(region_cd, (str, int, float)):
-                            region_str = str(region_cd)
-                            parts.append(f"region_cd={region_str.zfill(6) if region_str.isdigit() else region_str}")
-                        elif isinstance(gridrc, (str, int)):
-                            parts.append(f"GRID_RC={gridrc}")
-                        
-                        # Pull value
-                        val = row.get(pollutant)
-                        # Check for current values on axes (useful for NetCDF animation)
-                        current_vals = getattr(target_ax, '_smk_current_vals', None)
-                        if current_vals is not None:
-                            try:
-                                # Use the positional index if within bounds
-                                if idx < len(current_vals):
-                                    val = current_vals[idx]
-                            except Exception:
-                                pass
-                        try:
-                            f_val = float(val) if not pd.isna(val) else 0.0
-                        except Exception:
-                            f_val = 0.0
-                            
-                        if not pd.isna(val):
-                            try:
-                                parts.append(f"{pollutant}={f_val:.4g}")
-                            except Exception:
-                                parts.append(f"{pollutant}={val}")
-                        
-                        # If this is the best (highest non-zero) value we've seen, remember it
-                        if f_val > best_val or best_parts is None:
-                            best_val = f_val
-                            best_parts = parts
-                
-                if best_parts:
-                    return ", ".join(best_parts)
-            except Exception:
-                pass
-            return base
-
-        try:
-            target_ax = ax if ax is not None else self.ax
-            if target_ax is not None:
-                target_ax.format_coord = _fmt
-        except Exception:
-            pass
-
-    # ---- Rectangle zoom (left-drag zoom in, right-drag zoom out) ----
-    def _install_box_zoom(self):
-        import matplotlib.patches as mpatches
-
-        # Clean previous connections/rectangle
-        self._remove_box_zoom()
-
-        ax = self.ax
-        fig = self.fig
-        if ax is None or fig is None:
-            return
-
-        rect = mpatches.Rectangle((0, 0), 0, 0, fill=False, ec='red', lw=1.2, zorder=9999)
-        ax.add_patch(rect)
-        rect.set_visible(False)
-        self._zoom_rect = rect
-        self._zoom_press = None
-
-        def on_press(event):
-            if event.inaxes != ax:
-                return
-            if event.button not in (1, 3):  # 1=left (zoom in), 3=right (zoom out)
-                return
-            # Don't interfere with built-in toolbar modes (zoom/pan)
-            try:
-                if getattr(self, 'toolbar', None) is not None and getattr(self.toolbar, 'mode', '') == 'pan/zoom':
-                    return
-            except Exception:
-                pass
-            self._zoom_press = (event.xdata, event.ydata, event.button)
-            # Set rectangle edge color based on zoom direction
-            rect.set_edgecolor('red' if event.button == 1 else 'blue')
-            rect.set_linestyle('-')
-            rect.set_linewidth(1.2)
-            rect.set_visible(True)
-            rect.set_xy((event.xdata, event.ydata))
-            rect.set_width(0)
-            rect.set_height(0)
-            fig.canvas.draw_idle()
-
-        def on_motion(event):
-            if self._zoom_press is None or event.inaxes != ax or event.xdata is None or event.ydata is None:
-                return
-            try:
-                if getattr(self, 'toolbar', None) is not None and getattr(self.toolbar, 'mode', '') == 'pan/zoom':
-                    return
-            except Exception:
-                pass
-            x0, y0, btn = self._zoom_press
-            x1, y1 = event.xdata, event.ydata
-            xmin, xmax = sorted([x0, x1])
-            ymin, ymax = sorted([y0, y1])
-            rect.set_xy((xmin, ymin))
-            rect.set_width(max(0.0, xmax - xmin))
-            rect.set_height(max(0.0, ymax - ymin))
-            fig.canvas.draw_idle()
-
-        def on_release(event):
-            if self._zoom_press is None:
-                return
-            try:
-                if getattr(self, 'toolbar', None) is not None and getattr(self.toolbar, 'mode', '') == 'pan/zoom':
-                    # Hide rectangle and abort when toolbar is in a mode
-                    rect.set_visible(False)
-                    fig.canvas.draw_idle()
-                    self._zoom_press = None
-                    return
-            except Exception:
-                pass
-            # Derive end coordinates even if mouse was released outside the axes
-            x0, y0, btn = self._zoom_press
-            if event.inaxes == ax and event.xdata is not None and event.ydata is not None:
-                x1, y1 = event.xdata, event.ydata
-            else:
-                # Fallback to rectangle's current extents
-                try:
-                    x1 = rect.get_x() + rect.get_width()
-                    y1 = rect.get_y() + rect.get_height()
-                except Exception:
-                    x1, y1 = x0, y0
-            xmin, xmax = sorted([x0, x1])
-            ymin, ymax = sorted([y0, y1])
-            # Hide the rubber band
-            rect.set_visible(False)
-            fig.canvas.draw_idle()
-            self._zoom_press = None
-
-            # Ignore tiny drags
-            if abs(xmax - xmin) < 1e-12 or abs(ymax - ymin) < 1e-12:
-                return
-
-            if btn == 1:
-                # Zoom in: fit to box
-                # Push current view to toolbar history before changing
-                try:
-                    if getattr(self, 'toolbar', None) is not None:
-                        self.toolbar.push_current()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                ax.set_xlim(xmin, xmax)
-                ax.set_ylim(ymin, ymax)
-            else:
-                # Zoom out: use the box as a reference to compute a scale factor
-                cur_xmin, cur_xmax = ax.get_xlim()
-                cur_ymin, cur_ymax = ax.get_ylim()
-                cur_w = max(1e-12, cur_xmax - cur_xmin)
-                cur_h = max(1e-12, cur_ymax - cur_ymin)
-                box_w = max(1e-12, xmax - xmin)
-                box_h = max(1e-12, ymax - ymin)
-                # Scale factor: how much of current view the box represents
-                sx = min(10.0, max(1e-6, box_w / cur_w))
-                sy = min(10.0, max(1e-6, box_h / cur_h))
-                s = min(sx, sy)
-                # New size grows inversely with s (smaller box -> larger zoom-out)
-                new_w = cur_w / s
-                new_h = cur_h / s
-                cx = 0.5 * (xmin + xmax)
-                cy = 0.5 * (ymin + ymax)
-                # Clamp zoom-out to the original/base view when known
-                try:
-                    if hasattr(self, '_base_view') and self._base_view:
-                        (bx0, bx1), (by0, by1) = self._base_view
-                        base_w = max(1e-12, bx1 - bx0)
-                        base_h = max(1e-12, by1 - by0)
-                        if new_w >= base_w or new_h >= base_h:
-                            ax.set_xlim(bx0, bx1)
-                            ax.set_ylim(by0, by1)
-                            fig.canvas.draw_idle()
-                            return
-                        # Keep view within base bounds
-                        x0_new = min(max(bx0, cx - new_w / 2.0), bx1 - new_w)
-                        y0_new = min(max(by0, cy - new_h / 2.0), by1 - new_h)
-                        ax.set_xlim(x0_new, x0_new + new_w)
-                        ax.set_ylim(y0_new, y0_new + new_h)
-                        fig.canvas.draw_idle()
-                        return
-                except Exception:
-                    pass
-                # Push current view to toolbar history before changing
-                try:
-                    if getattr(self, 'toolbar', None) is not None:
-                        self.toolbar.push_current()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                ax.set_xlim(cx - new_w / 2.0, cx + new_w / 2.0)
-                ax.set_ylim(cy - new_h / 2.0, cy + new_h / 2.0)
-            fig.canvas.draw_idle()
-
-        cid1 = self.canvas.mpl_connect('button_press_event', on_press)
-        cid2 = self.canvas.mpl_connect('motion_notify_event', on_motion)
-        cid3 = self.canvas.mpl_connect('button_release_event', on_release)
-        self._zoom_cids = [cid1, cid2, cid3]
-
-    def _remove_box_zoom(self):
-        # Disconnect events and remove rectangle if present
-        if getattr(self, 'canvas', None) is not None:
-            try:
-                for cid in self._zoom_cids:
-                    self.canvas.mpl_disconnect(cid)
-            except Exception:
-                pass
-        self._zoom_cids = []
-        if self._zoom_rect is not None:
-            try:
-                self._zoom_rect.remove()
-            except Exception:
-                pass
-            self._zoom_rect = None
-
-    def _lazy_load_inputfile(self, *, show_preview: bool = False) -> bool:
-        """Load the remembered input file on demand when data is not yet in memory."""
-        if isinstance(self.emissions_df, pd.DataFrame):
-            return True
-        path = (self.inputfile_path or '').strip()
-        if not path:
-            return False
-        try:
-            self.load_inputfile(show_preview=show_preview)
-        except Exception as exc:
-            self._notify('ERROR', 'Auto Load Failed', str(exc), exc=exc)
-            return False
-        return isinstance(self.emissions_df, pd.DataFrame)
-
-    def _enable_plot_btn(self):
-        if getattr(self, 'plot_btn', None):
-            try:
-                self.plot_btn.state(['!disabled'])
-            except Exception:
-                pass
-
-    def plot(self):
-        if self.emissions_df is None:
-            if self.inputfile_path:
-                self.load_inputfile(show_preview=False)
-                return
-            self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.')
-            return
-        pollutant = self.pollutant_var.get()
-        if not pollutant and getattr(self, 'pollutants', None):
-            try:
-                first_pol = next(iter(self.pollutants))
-            except Exception:
-                first_pol = ''
-            if first_pol:
-                self.pollutant_var.set(first_pol)
-                pollutant = first_pol
-        if not pollutant:
-            self._notify('WARNING', 'Select Pollutant', 'No pollutant selected.')
-            return
-        
-        # Capture UI state
-        plot_by_mode = self.plot_by_var.get().lower() if self.plot_by_var else 'auto'
-        scc_selection = self.scc_select_var.get() if self.scc_select_var else 'All SCC'
-        scc_code_map = self._scc_display_to_code.copy() if self._scc_display_to_code else {}
-        
-        # Determine plotting CRS (LCC only when GRIDDESC + grid name provided; else WGS84)
-        try:
-            plot_crs_info = self._plot_crs()
-        except Exception:
-            plot_crs_info = (None, None, None)
-
-        self._set_status("Preparing plot data...", level="INFO")
-        
-        if getattr(self, 'plot_btn', None):
-            try:
-                self.plot_btn.state(['disabled'])
-            except Exception:
-                pass
-
-        threading.Thread(
-            target=self._plot_worker, 
-            args=(pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info), 
-            daemon=True
-        ).start()
-
-    def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info):
-        try:
-            # Thread-safe notify wrapper
+            logging.info(f"Plotting worker started for: {pollutant}")
+            
             def safe_notify(level, title, msg, exc=None, **kwargs):
-                self.root.after(0, lambda: self._notify(level, title, msg, exc=exc, **kwargs))
+                try:
+                    self.notify_signal.emit(level, f"{title}: {msg}")
+                except RuntimeError:
+                    pass
 
             try:
                 merged = self._merged(
@@ -2498,2260 +2965,1211 @@ class EmissionGUI:
                     scc_selection=scc_selection, 
                     scc_code_map=scc_code_map,
                     notify=safe_notify,
-                    pollutant=pollutant
+                    pollutant=pollutant,
+                    fill_nan=meta_fixed.get('fill_nan', False)
                 )
             except ValueError as ve:
                 if str(ve) == "Handled":
-                    # Diagnostic notification already sent
-                    self.root.after(0, self._enable_plot_btn)
-                    return
+                     QTimer.singleShot(0, self._stop_progress)
+                     return
                 raise ve
-            
+
             if merged is None:
-                self.root.after(0, lambda: self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.'))
-                self.root.after(0, self._enable_plot_btn)
+                try:
+                    self.notify_signal.emit('WARNING', 'Missing Data. Load smkreport and shapefile first.')
+                except RuntimeError:
+                    pass
+                QTimer.singleShot(0, self._stop_progress)
                 return
 
-            # Reproject
+            # REPROJECTION LOGIC
             plot_crs, tf_fwd, tf_inv = plot_crs_info
+            
             try:
-                merged_plot = merged.to_crs(plot_crs) if plot_crs is not None and getattr(merged, 'crs', None) is not None else merged
-                # Ensure attributes needed for time series and QuadMesh are preserved
+                # Ensure merged has a CRS for to_crs() to work (defaulting to 4326 if missing)
+                if getattr(merged, 'crs', None) is None:
+                     try: merged.set_crs("EPSG:4326", inplace=True)
+                     except: pass
+
+                is_native_plot = getattr(merged, 'attrs', {}).get('_smk_is_native', False)
+                # Ensure we only skip reprojection if the optimization will actually be used (Size > 10000)
+                should_shortcut = is_native_plot and len(merged) > 10000
+                
+                if plot_crs is not None:
+                     # Performance: Skip expensive to_crs if using optimized QuadMesh for native/NetCDF grids
+                     if should_shortcut:
+                          logging.info("Native grid shortcut: Skipping per-cell vector reprojection.")
+                          merged_plot = merged
+                     else:
+                          logging.info(f"Reprojecting plot data to: {plot_crs}")
+                          merged_plot = merged.to_crs(plot_crs)
+                else:
+                     merged_plot = merged
+                     
+                # Ensure attributes (grid info) are preserved after reprojection
                 if getattr(merged, 'attrs', None) and getattr(merged_plot, 'attrs', None) is not None:
-                    for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path', '_smk_grid_info', '_smk_is_native']:
+                    for k in ['stack_groups_path', 'proxy_ncf_path', 'original_ncf_path', '_smk_grid_info', '_smk_is_native', 'ncf_params', '_smk_xr_ds', 'per_file_summaries']:
                         if k in merged.attrs:
                                 merged_plot.attrs[k] = merged.attrs[k]
-            except Exception:
-                merged_plot = merged
-            
-            self.root.after(0, lambda: self._finalize_plot(merged, merged_plot, pollutant, plot_crs_info))
-            
-        except Exception as e:
-            self.root.after(0, lambda: self._notify('ERROR', 'Plot Prep Error', str(e), exc=e))
-            self.root.after(0, self._enable_plot_btn)
-
-    def _finalize_plot(self, merged, merged_plot, pollutant, plot_crs_info):
-        import time
-        _t_start = time.time()
-        _t_last = [_t_start]  # Use list to avoid nonlocal issues
-        def _log_time(msg):
-            elapsed = time.time() - _t_last[0]
-            total = time.time() - _t_start
-            logging.info(f"[PLOT TIMING] {msg}: {elapsed:.2f}s (total: {total:.2f}s)")
-            _t_last[0] = time.time()
-        
-        self._enable_plot_btn()
-        self._set_status("Rendering plot...", level="INFO")
-        _log_time("Plot initialization")
-        # Persistence disabled
-
-        # Lazy import for embedding
-        from matplotlib.figure import Figure
-        try:
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-        except Exception as e:
-            self._notify('ERROR', 'Backend Error', f'Failed to load TkAgg backend: {e}', exc=e)
-            return
-
-        # Determine if we can reuse an existing window for THIS pollutant.
-        plot_state = self._plot_windows.get(pollutant)
-        reuse_window = False
-        
-        if plot_state and plot_state.get('win'):
-            try:
-                if plot_state['win'].winfo_exists():
-                    reuse_window = True
-                else:
-                    self._plot_windows.pop(pollutant, None)
-                    plot_state = None
-            except Exception:
-                self._plot_windows.pop(pollutant, None)
-                plot_state = None
-
-        win = None
-        local_fig = None
-        local_ax = None
-        canvas = None
-        toolbar = None
-
-        plot_container = None
-        if reuse_window:
-            # Reuse existing window assets
-            try:
-                local_ax = plot_state['ax']
-                local_fig = plot_state['fig']
-                canvas = plot_state['canvas']
-                win = plot_state['win']
-                toolbar = plot_state.get('toolbar')
-                plot_container = plot_state.get('plot_container')
-
-                # Clear the main axis
-                local_ax.clear()
-                
-                # Clean up UI (Export, Time Series controls)
-                if plot_container:
-                    for child in plot_container.winfo_children():
-                        # Keep Canvas and Toolbar
-                        if child not in (canvas.get_tk_widget(), toolbar):
-                                try: child.destroy()
-                                except: pass
-
-                # Cleanup old stats callbacks specific to this window
-                old_cbids = plot_state.get('stats_cbids', [])
-                for cid in old_cbids:
-                    try: local_ax.callbacks.disconnect(cid)
-                    except: pass
-                plot_state['stats_cbids'] = []
-                
-                # Remove any other axes (colorbars) but keep main ax
-                for ax in local_fig.axes:
-                    if ax != local_ax:
-                        local_fig.delaxes(ax)
-                
-                # Bring to front
-                win.deiconify()
-                win.lift()
-                logging.info(f"Reusing existing plot window for {pollutant}.")
             except Exception as e:
-                logging.warning("Failed to reuse window: %s", e)
-                reuse_window = False
-                self._plot_windows.pop(pollutant, None)
-                plot_state = None
+                logging.warning(f"Reprojection failed: {e}")
+                merged_plot = merged
 
-        if not reuse_window:
-            # Create a new pop-out window for this plot
-            win = tk.Toplevel(self.root)
-            win.title(f"Map: {pollutant}")
+            # metadata for plotting 
+            logging.info(f"DEBUG: Final plot CRS: {getattr(merged_plot, 'crs', 'None')}")
+            meta = meta_fixed.copy()
+            meta['tf_fwd'] = tf_fwd
+            meta['tf_inv'] = tf_inv
             
-            # Setup close handler to remove from dict
-            def _on_destroy(event, p=pollutant, w=win):
-                if event.widget == w:
-                    try: self._plot_windows.pop(p, None)
-                    except: pass
-            win.bind("<Destroy>", _on_destroy)
-
-            plot_container = ttk.Frame(win)
-            plot_container.pack(side='top', fill='both', expand=True)
-            # Scale figure size modestly with UI scale
-            try:
-                base_w, base_h = 9.0, 5.0
-                fig_w = max(6.0, min(16.0, base_w * getattr(self, '_ui_scale', 1.0)))
-                fig_h = max(3.5, min(10.0, base_h * getattr(self, '_ui_scale', 1.0)))
-            except Exception:
-                fig_w, fig_h = 9.0, 5.0
-            local_fig = Figure(figsize=(fig_w, fig_h), dpi=100)
-            local_ax = local_fig.add_subplot(111)
-            canvas = FigureCanvasTkAgg(local_fig, master=plot_container)
-            canvas.draw()
-            _log_time("Initial canvas draw")
-            canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
-            # Toolbar (remove Zoom tool)
-            try:
+            # Calculate Zoom Bounds if requested
+            if meta.get('zoom_to_data') and pollutant in merged_plot.columns:
                 try:
-                    import PIL.ImageTk  # type: ignore  # noqa: F401
-                except Exception:
-                    pass
-                BaseNav = NavigationToolbar2Tk
-                class _NoZoomToolbar(BaseNav):
-                    toolitems = tuple(t for t in getattr(BaseNav, 'toolitems', []) if t and t[0] != 'Zoom')
-                toolbar = _NoZoomToolbar(canvas, plot_container, pack_toolbar=False)
-            except Exception:
-                from matplotlib.backends._backend_tk import NavigationToolbar2Tk as _Nav
-                class _TextToolbar(_Nav):
-                    def _Button(self, text, image_file, toggle=False, command=None):
-                        if text == 'Zoom': return tk.Button(master=self, text='')
-                        if toggle:
-                            var = tk.IntVar(master=self, value=0)
-                            btn = tk.Checkbutton(master=self, text=text, indicatoron=0, variable=var, command=command)
-                            def _select():
-                                try: var.set(1)
-                                except Exception: pass
-                            def _deselect():
-                                try: var.set(0)
-                                except Exception: pass
-                            btn.select = _select  # type: ignore[attr-defined]
-                            btn.deselect = _deselect  # type: ignore[attr-defined]
-                        else:
-                            btn = tk.Button(master=self, text=text, command=command)
-                        btn.pack(side=tk.LEFT)
-                        return btn
-                toolbar = _TextToolbar(canvas, plot_container, pack_toolbar=False)
-            toolbar.update()
-            toolbar.pack(side='top', fill='x')
-
-        cbar_ax = None
-
-        # Export controls (extent checkbox + button)
-        try:
-            export_frame = ttk.Frame(plot_container)
-            export_frame.pack(side='top', fill='x', pady=(2, 0))
-            extent_only_var = tk.BooleanVar(value=True)
-            ttk.Checkbutton(export_frame, text='Current extent only', variable=extent_only_var).pack(side='left', padx=(4, 8))
-            
-            def _export_layer():
-                try:
-                    # Choose file path and format by extension
-                    path = filedialog.asksaveasfilename(defaultextension='.gpkg',
-                                                        filetypes=[('GeoPackage', '*.gpkg'), ('ESRI Shapefile', '*.shp'), ('All', '*.*')])
-                except Exception as e:
-                    self._notify('ERROR', 'Export Error', f'Could not open save dialog: {e}', exc=e)
-                    return
-                if not path:
-                    return
-                try:
-                    # Use attached data if available (fixes stale closure on reuse)
-                    try:
-                        gdf_src = getattr(local_ax, '_current_data', merged_plot)
-                    except:
-                        gdf_src = merged_plot
-                except Exception:
-                    gdf_src = merged
-                
-                gdf_to_write = gdf_src
-                # Subset to current extent if requested
-                if extent_only_var.get():
-                    try:
-                        from shapely.geometry import box as _box
-                        xmin, xmax = local_ax.get_xlim(); ymin, ymax = local_ax.get_ylim()
-                        bbox_geom = _box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
-                        try:
-                            sidx = gdf_src.sindex
-                        except Exception:
-                            sidx = None
-                        if sidx is not None:
-                            try:
-                                cand = list(sidx.intersection(bbox_geom.bounds))
-                                gdf_to_write = gdf_src.iloc[cand]
-                            except Exception:
-                                gdf_to_write = gdf_src
-                        try:
-                            gdf_to_write = gdf_to_write[gdf_to_write.geometry.intersects(bbox_geom)]
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                # Keep only key id and selected pollutant to keep schema small
-                try:
-                    cols = ['geometry']
-                    for key in ('FIPS', 'region_cd', 'GRID_RC'):
-                        if key in gdf_to_write.columns:
-                            cols.append(key)
-                    pol = pollutant
-                    if pol in gdf_to_write.columns:
-                        cols.append(pol)
-                    gdf_out = gdf_to_write[cols].copy()
-                except Exception:
-                    gdf_out = gdf_to_write
-                # Normalize dtypes for file drivers (avoid pandas nullable Int64)
-                try:
-                    for c in gdf_out.columns:
-                        if c != 'geometry' and str(gdf_out[c].dtype).lower().startswith('int'):  # pandas nullable int
-                            gdf_out[c] = gdf_out[c].astype('float64')
-                except Exception:
-                    pass
-                # Determine driver from extension
-                p_lower = path.lower()
-                driver = 'GPKG' if p_lower.endswith('.gpkg') else 'ESRI Shapefile'
-                # Layer name for gpkg
-                layer = None
-                if driver == 'GPKG':
-                    try:
-                        import re as _re
-                        nm = pol if 'pol' in locals() else 'emissions'
-                        layer = _re.sub(r'[^A-Za-z0-9_]+', '_', str(nm))[:63] or 'layer'
-                    except Exception:
-                        layer = 'layer'
-                try:
-                    if driver == 'GPKG':
-                        gdf_out.to_file(path, layer=layer, driver=driver)
+                    # Filter for non-zero emissions to zoom into actual data
+                    non_zero = merged_plot[merged_plot[pollutant] > 0]
+                    if not non_zero.empty:
+                        meta['zoom_gdf'] = non_zero
                     else:
-                        # Ensure .shp extension
-                        if not p_lower.endswith('.shp'):
-                            path = path + '.shp'
-                        gdf_out.to_file(path, driver=driver)
-                    self._notify('INFO', 'Export Complete', f'Exported {len(gdf_out)} features to {path}')
-                except Exception as e:
-                    self._notify('ERROR', 'Export Error', f'Failed to export: {e}', exc=e)
-            ttk.Button(export_frame, text='Export Layer…', command=_export_layer).pack(side='left')
-        except Exception:
-            pass
-
-        # Keep references on the instance to prevent GC of handlers
-        # Save state to dictionary if this was a new window
-        if not reuse_window:
-            plot_state = {
-                'win': win,
-                'fig': local_fig,
-                'ax': local_ax,
-                'canvas': canvas,
-                'toolbar': toolbar if 'toolbar' in locals() else None,
-                'plot_container': plot_container,
-                'stats_cbids': []
-            }
-            self._plot_windows[pollutant] = plot_state
-
-        plot_crs, tf_fwd, tf_inv = plot_crs_info if plot_crs_info else (None, None, None)
-        data = merged[pollutant]
-        positive = data[data > 0].dropna()
-        vmin = float(positive.min()) if not positive.empty else 0.0
-        vmax_val = data.max(skipna=True)
-        vmax = float(vmax_val) if pd.notna(vmax_val) else 0.0
-
-        # Colormap selection
-        cmap_name = self.cmap_var.get() if hasattr(self, 'cmap_var') and self.cmap_var else 'jet'
-
-        # Auto-select boundary colors for contrast
-        # Heuristic: dark-start maps (Jet, Viridis) => Use medium gray for context and bright Cyan for overlay highlight
-        #            light-start maps (Greys, Reds) => Use darker gray for context and Black/Red for overlay
-        _cmap_lower = cmap_name.lower()
-        _dark_cmaps = {'viridis', 'plasma', 'inferno', 'magma', 'cividis', 'jet', 'turbo', 'nipy_spectral', 'gnuplot', 'gnuplot2'}
-        
-        if _cmap_lower in _dark_cmaps:
-            county_color = 'black'    # User requested persistent black
-            overlay_color = 'cyan'    # High contrast highlight (Neon)
-            county_lw = 0.6           # Increased visibility
-            overlay_lw = 0.8
-        else:
-            county_color = 'black'    # User requested persistent black
-            overlay_color = 'black'   # Max contrast on light maps
-            county_lw = 0.6           # Increased visibility
-            overlay_lw = 0.8
-
-        try:
-            cmap_registry = getattr(matplotlib, 'colormaps', None)
-            if cmap_registry is not None:
-                cmap = cmap_registry.get_cmap(cmap_name)
+                        meta['zoom_gdf'] = merged_plot
+                except Exception:
+                    meta['zoom_gdf'] = merged_plot
             else:
-                cmap = mplcm.get_cmap(cmap_name)
-        except Exception:
-            # Final fallback
+                meta['zoom_gdf'] = merged_plot
+
             try:
-                cmap = mplcm.get_cmap('jet')
-            except Exception:
-                cmap = plt.get_cmap('jet')
-        
-        # Decide discrete vs continuous based on custom bins
-        bins = self._parse_bins()
-        if len(bins) >= 2:
-            # Discrete mapping using boundaries
-            # Handle user request for transparency below first bin:
-            # - Use clip=False so values < bins[0] map to -1 (Under)
-            # - Use extend='neither' to preserve original bin-to-color mapping (extend='max' shifts colors)
-            # - Explicitly set under/over colors
-            
-            cmap = copy.copy(cmap)
-            cmap.set_under('none')            # Transparent for values < bins[0]
-            try:
-                # Ensure values > bins[-1] stay opaque (last color) like clip=True
-                cmap.set_over(cmap(cmap.N - 1)) 
-            except Exception:
+                self.plot_ready_signal.emit(merged_plot, pollutant, meta)
+            except RuntimeError:
                 pass
             
-            norm = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
-        else:
-            # Continuous; honor linear/log selection
-            if self.scale_var.get() == 'log' and vmax > 0 and vmin > 0:
-                norm = LogNorm(vmin=vmin, vmax=vmax)
-            else:
-                norm = None
-
-        # Plotting
-        # Capture axes before plotting so we can detect the newly created colorbar axis
-        pre_axes = set(local_fig.axes)
-        
-        # Optimization: Disable edges for large datasets to speed up rendering
-        p_lw = 0.05
-        p_ec = 'black'
-        if len(merged_plot) > 20000:
-            p_lw = 0.0
-            p_ec = 'none'
-            if getattr(self, '_notify', None):
-                # Update status without popup
-                try: self.status_var.set("Rendering optimized (edges disabled due to density)...")
-                except: pass
-        
-        # Ensure uniform collection size for animation (plot all geometries, even if NaN)
-        if pollutant in merged_plot.columns:
+        except Exception as e:
             try:
-                merged_plot[pollutant] = merged_plot[pollutant].fillna(0.0)
+                self.notify_signal.emit("ERROR", f"Plot Preparation Error: {e}")
+            except RuntimeError:
+                pass
+            logging.exception("Plot worker failed")
+        finally:
+            QTimer.singleShot(0, self._stop_progress)
+
+    @Slot(object, str, dict)
+    def _render_plot_on_main(self, gdf, column, meta):
+        """Main thread slot to update the matplotlib figure."""
+        try:
+            # 1. Clear and setup figure
+            self.figure.clear()
+            
+            # --- Dynamic Controls Update (Mirroring gui_qt.py) ---
+            # Clear existing items
+            while self.pc_layout.count():
+                item = self.pc_layout.takeAt(0)
+                widget = item.widget()
+                if widget: widget.deleteLater()
+            
+            # Detect NCF Source
+            is_ncf = False
+            try:
+                attrs = getattr(gdf, 'attrs', {})
+                src_type = attrs.get('source_type')
+                # FORCE boolean evaluation to avoid NoneType crash in setVisible
+                flag = (src_type in ('gridded_netcdf', 'inline_point_lazy')) or \
+                       (attrs.get('format') == 'netcdf') or \
+                       ('proxy_ncf_path' in attrs) or \
+                       (attrs.get('is_netcdf') is True) or \
+                       bool(attrs.get('source_path') and is_netcdf_file(attrs.get('source_path')))
+                is_ncf = bool(flag)
+            except: pass
+            
+            self.plot_controls_frame.setVisible(is_ncf)
+            
+            if is_ncf:
+                 # Populate Layout
+                 self.pc_layout.addWidget(QLabel("Time:"))
+                 self.lbl_anim_status = QLabel("-")
+                 self.pc_layout.addWidget(self.lbl_anim_status)
+                 
+                 btn_prev = QPushButton("< Prev")
+                 btn_prev.clicked.connect(lambda: self._step_time(-1))
+                 self.pc_layout.addWidget(btn_prev)
+                 
+                 btn_next = QPushButton("Next >")
+                 btn_next.clicked.connect(lambda: self._step_time(1))
+                 self.pc_layout.addWidget(btn_next)
+                 
+                 # Aggregation
+                 self.pc_layout.addSpacing(10)
+                 self.pc_layout.addWidget(QLabel("| View:"))
+                 for lbl, mode in [('Total', 'total'), ('Avg', 'avg'), ('Max', 'max'), ('Min', 'min')]:
+                     b = QPushButton(lbl)
+                     b.clicked.connect(partial(self._show_agg, mode))
+                     self.pc_layout.addWidget(b)
+                     
+                 # TS Extraction
+                 self.pc_layout.addSpacing(10)
+                 self.pc_layout.addWidget(QLabel("| TS in View:"))
+                 for lbl, mode in [('Mean', 'mean'), ('Sum', 'sum')]:
+                     b = QPushButton(lbl)
+                     b.clicked.connect(partial(self._on_ts_view_click, mode))
+                     self.pc_layout.addWidget(b)
+                     
+                 self.pc_layout.addStretch()
+            # -----------------------------------------------------
+
+            ax = self.figure.add_subplot(111)
+            pre_axes = set(self.figure.axes)
+            
+            # 2. Extract meta/settings
+            cmap = meta.get('cmap', 'viridis')
+            use_log = meta.get('use_log', True)
+            bins_txt = meta.get('bins_txt', "")
+            bins = meta.get('bins', [])
+            zoom_to_data = meta.get('zoom_to_data', False)
+            zoom_gdf = meta.get('zoom_gdf', gdf)
+            show_graticule = meta.get('show_graticule', True)
+            unit = self.units_map.get(column, "")
+            
+            # 3. Get transformers (needed for hover & graticule)
+            # Preference: Use transformers from meta (calculated during projection setup)
+            # Fallback: Recalculate if they are missing or CRS changed
+            tf_fwd = meta.get('tf_fwd')
+            tf_inv = meta.get('tf_inv')
+            if tf_fwd is None or tf_inv is None:
+                tf_fwd, tf_inv = self._get_transformers(gdf.crs)
+
+            # 4. Initialize Axis & Aspect Ratio
+            # Use 'box' adjustment to maintain stability during zoom/resize
+            ax.set_aspect('equal', adjustable='box')
+            
+            # 5. Render main plot
+            self._merged_gdf = gdf
+            # Store current values for dynamic title stats
+            ax._smk_current_vals = gdf[column].values
+            ax._smk_time_lbl = None
+            
+            # Style & Optimization (Mirroring gui_qt.py)
+            p_lw = 0.05
+            p_ec = 'black'
+            if len(gdf) > 20000:
+                p_lw = 0.0
+                p_ec = 'none'
+
+            unit = self.units_map.get(column, "")
+            # Fallback for units
+            if not unit:
+                vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
+                if isinstance(vmeta, dict) and column in vmeta:
+                     unit = vmeta[column].get('units', '')
+
+            collection = create_map_plot(
+                gdf=gdf,
+                column=column,
+                title="", 
+                ax=ax,
+                cmap_name=cmap,
+                bins=bins,
+                log_scale=use_log,
+                overlay_counties=self.counties_gdf,
+                overlay_shape=self.overlay_gdf,
+                unit_label=unit, # Pass units directly for better detection
+                crs_proj=getattr(gdf, 'crs', None),
+                tf_fwd=tf_fwd if show_graticule else None,
+                tf_inv=tf_inv if show_graticule else None,
+                zoom_to_data=False, # Limits already set above
+                linewidth=p_lw,
+                edgecolor=p_ec
+            )
+            
+            # --- Zoom Calculation (Robust for Gridded Shortcut) ---
+            if zoom_to_data or self._base_view is None:
+                try:
+                    # Check if we can use standard total_bounds
+                    if hasattr(zoom_gdf, 'total_bounds') and not np.isnan(zoom_gdf.total_bounds).any():
+                        minx, miny, maxx, maxy = zoom_gdf.total_bounds
+                    elif hasattr(zoom_gdf, 'attrs') and '_smk_grid_info' in zoom_gdf.attrs:
+                        # Shortcut path: geometry is None, use grid info
+                        info = zoom_gdf.attrs['_smk_grid_info']
+                        minx, miny = info['xorig'], info['yorig']
+                        maxx = minx + info['ncols'] * info['xcell']
+                        maxy = miny + info['nrows'] * info['ycell']
+                        
+                        # Handle potential coordinate transformation if axes are in different CRS (e.g. 4326)
+                        native_crs = info.get('proj_str')
+                        target_crs = getattr(ax, '_smk_ax_crs', None) or getattr(gdf, 'crs', None)
+                        if native_crs and target_crs and str(native_crs) != str(target_crs):
+                            from pyproj import Transformer
+                            trans = Transformer.from_crs(native_crs, target_crs, always_xy=True)
+                            pts_x, pts_y = trans.transform([minx, maxx, minx, maxx], [miny, miny, maxy, maxy])
+                            minx, maxx = min(pts_x), max(pts_x)
+                            miny, maxy = min(pts_y), max(pts_y)
+                    else:
+                        minx, miny, maxx, maxy = ax.get_xlim()[0], ax.get_ylim()[0], ax.get_xlim()[1], ax.get_ylim()[1]
+
+                    padx = (maxx - minx) * 0.05
+                    pady = (maxy - miny) * 0.05
+                    if abs(padx) < 1e-7: padx = 0.5
+                    if abs(pady) < 1e-7: pady = 0.5
+                    ax.set_xlim(min(minx, maxx) - abs(padx), max(minx, maxx) + abs(padx))
+                    ax.set_ylim(min(miny, maxy) - abs(pady), max(miny, maxy) + abs(pady))
+                except Exception as ze:
+                    logging.warning(f"Zoom calculation failed: {ze}")
+            
+            # Initial Draw to register axes
+            self.canvas.draw_idle()
+
+            # 6. Install Interactions (Hover & Box-Zoom)
+            self._setup_hover(gdf, column, ax, tf_inv=tf_inv)
+            self._install_box_zoom(ax)
+            
+            # Step-wise draw to register axes and allow tick generation
+            self.canvas.draw()
+            
+            # 7. Format Colorbar (Mirroring gui_qt.py)
+            # Identify the colorbar axis. Prefer the direct colorbar object if attached to collection.
+            cbar_ax = None
+            if collection is not None and hasattr(collection, 'colorbar') and collection.colorbar is not None:
+                cbar_ax = collection.colorbar.ax
+            
+            if cbar_ax is None:
+                # Fallback to axis search
+                all_axes = self.figure.axes
+                new_candidate = [a for a in all_axes if a not in pre_axes and a is not ax]
+                if new_candidate:
+                    cbar_ax = new_candidate[0]
+                
+                if cbar_ax is None:
+                    for cand in all_axes:
+                        if cand is ax: continue
+                        if str(cand.get_label()) == '<colorbar>':
+                            cbar_ax = cand
+                            break
+                
+                if cbar_ax is None:
+                    for cand in all_axes:
+                        if cand is ax: continue
+                        try:
+                            bbox = cand.get_position()
+                            if min(bbox.width, bbox.height) < 0.3 * max(bbox.width, bbox.height):
+                                cbar_ax = cand
+                                break
+                        except: pass
+
+            norm = getattr(collection, 'norm', None) if collection is not None else None
+
+            if cbar_ax is not None and collection is not None:
+                # 7a. Robust orientation detection
+                try:
+                    bbox = cbar_ax.get_position()
+                    orient_vertical = (bbox.height >= bbox.width)
+                except Exception:
+                    orient_vertical = True
+
+                # 7b. Label colorbar with units if available (Use local unit variable)
+                try:
+                    if unit:
+                         if orient_vertical: cbar_ax.set_ylabel(unit, fontweight='bold', fontsize=9)
+                         else: cbar_ax.set_xlabel(unit, fontweight='bold', fontsize=9)
+                except Exception: pass
+                    
+                # 7c. Robust Colorbar Formatting (Fix for small values and custom bins)
+                try:
+                    from matplotlib.ticker import FixedLocator, FuncFormatter, ScalarFormatter, LogFormatter, FixedFormatter, AutoLocator
+                    from matplotlib.colors import LogNorm
+                    is_log = isinstance(norm, LogNorm) if norm is not None else False
+                    bins_ticks = (bins if bins is not None else [])
+
+                    if bins_ticks:
+                        ticks = [t for t in bins_ticks if (t > 0) ] if is_log else list(bins_ticks)
+                        if ticks:
+                            # Trigger scientific if values are extreme
+                            txt_bins = self.txt_bins.text().lower() if hasattr(self, 'txt_bins') else ""
+                            use_sci = 'e' in txt_bins or any(abs(t) >= 1e6 or (0 < abs(t) < 1e-4) for t in ticks)
+
+                            if not use_sci:
+                                # Positional format for human readability if not too small
+                                try:
+                                    labels = [np.format_float_positional(t, trim='-') for t in ticks]
+                                    fmt = FixedFormatter(labels)
+                                except Exception:
+                                    fmt = FuncFormatter(lambda x, p: f"{x:g}")
+                            else:
+                                # Scientific format for extreme values
+                                fmt = FuncFormatter(lambda x, p: f"{x:.4g}")
+                            
+                            if orient_vertical:
+                                cbar_ax.yaxis.set_major_locator(FixedLocator(ticks))
+                                cbar_ax.yaxis.set_major_formatter(fmt)
+                                cbar_ax.xaxis.set_ticks([])
+                            else:
+                                cbar_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                                cbar_ax.xaxis.set_major_formatter(fmt)
+                                cbar_ax.yaxis.set_ticks([])
+                    else:
+                        # Default Formatter for standard linear/log scales
+                        if is_log:
+                            fmt = LogFormatter()
+                            if orient_vertical: 
+                                cbar_ax.yaxis.set_major_formatter(fmt)
+                            else: 
+                                cbar_ax.xaxis.set_major_formatter(fmt)
+                        else:
+                            fmt = ScalarFormatter(useOffset=False)
+                            fmt.set_scientific(True)
+                            fmt.set_powerlimits((-4, 4))
+                            
+                            if orient_vertical: 
+                                # Force a few ticks if it's empty
+                                cbar_ax.yaxis.set_major_locator(AutoLocator())
+                                cbar_ax.yaxis.set_major_formatter(fmt)
+                            else: 
+                                cbar_ax.xaxis.set_major_locator(AutoLocator())
+                                cbar_ax.xaxis.set_major_formatter(fmt)
+                            
+                    # 7d. Style Optimization (Ticks and Fonts)
+                    try:
+                        # Refresh after setting formatters
+                        self.canvas.draw()
+                        labels_to_style = cbar_ax.get_yticklabels() if orient_vertical else cbar_ax.get_xticklabels()
+                        if labels_to_style:
+                            for lbl in labels_to_style:
+                                lbl.set_fontsize(8)
+                    except Exception: pass
+                except Exception as e:
+                    logging.debug(f"Colorbar formatting failed: {e}")
+            
+            # 8. Initial Title Stats
+            self._update_plot_title(ax, immediate=True)
+            self.canvas.draw_idle()
+
+            # 9. Sync Interaction Logic with gui_qt.py
+            try:
+                # A. Base View for Home and Clamping
+                base_xlim = ax.get_xlim()
+                base_ylim = ax.get_ylim()
+                self._base_view = (base_xlim, base_ylim)
+                
+                # B. Home Button Override (Direct Logic)
+                def _home_override(*args, **kwargs):
+                    try:
+                        ax.set_xlim(base_xlim)
+                        ax.set_ylim(base_ylim)
+                        self.canvas.draw_idle()
+                        self._update_plot_title(ax, immediate=True)
+                    except: pass
+                
+                # Override the instance method
+                self.toolbar.home = _home_override
+                
+                # C. Reset Navigation Stack
+                if hasattr(self.toolbar, '_nav_stack'):
+                    self.toolbar._nav_stack.clear()
+                
+                # IMPORTANT: In Qt, we must refresh the button states
+                if hasattr(self.toolbar, 'set_history_buttons'):
+                    self.toolbar.set_history_buttons()
+                elif hasattr(self.toolbar, 'update'):
+                    self.toolbar.update()
+
+                # D. Axis Callbacks for Live Stats (Robust Update)
+                if hasattr(ax, '_smk_stats_cids'):
+                    for cid in ax._smk_stats_cids:
+                        ax.callbacks.disconnect(cid)
+                
+                c1 = ax.callbacks.connect('xlim_changed', lambda a: self._update_plot_title(a))
+                c2 = ax.callbacks.connect('ylim_changed', lambda a: self._update_plot_title(a))
+                ax._smk_stats_cids = [c1, c2]
+
+            except Exception as he:
+                logging.debug(f"Interaction sync failed: {he}")
+ 
+            self.notify_signal.emit("INFO", f"Plotted {column}")
+            self._update_stats_panel(gdf, column)
+            self.canvas.draw_idle()
+            
+        except Exception as e:
+            self.notify_signal.emit("ERROR", f"Render failed: {e}")
+            traceback.print_exc()
+        finally:
+            self._stop_progress()
+
+    def reset_home_view(self):
+        """Reset the plot view to the full extent of the loaded data (Full Domain)."""
+        try:
+            if self._merged_gdf is not None and not self._merged_gdf.empty:
+                ax = self.figure.gca()
+                bounds = self._merged_gdf.total_bounds
+                x_pad = (bounds[2] - bounds[0]) * 0.05
+                y_pad = (bounds[3] - bounds[1]) * 0.05
+                if x_pad == 0: x_pad = 0.5
+                if y_pad == 0: y_pad = 0.5
+                ax.set_xlim(bounds[0] - x_pad, bounds[2] + x_pad)
+                ax.set_ylim(bounds[1] - y_pad, bounds[3] + y_pad)
+                self.canvas.draw_idle()
+                self._update_plot_title(ax, immediate=True)
+            elif self.toolbar:
+                self.toolbar.home()
+        except Exception as e:
+            logging.warning(f"Reset view failed: {e}")
+
+    def _on_canvas_motion(self, event):
+        """Update status bar on hover."""
+        if not event.inaxes: return
+        try:
+             # Use the format_coord string which we already enhanced in _setup_hover
+             res = event.inaxes.format_coord(event.xdata, event.ydata)
+             self.status_label.setText(res)
+        except: pass
+
+    def _handle_cell_click(self, x, y):
+        """Handle click for Time Series extraction."""
+        if self._merged_gdf is None or not 'ROW' in self._merged_gdf.columns:
+            return
+
+        try:
+             # Identify cell
+             info = self._merged_gdf.attrs.get('_smk_grid_info')
+             if not info: return # Can't identify without grid info
+             
+             col_look = int(np.floor((x - info['xorig']) / info['xcell'])) + 1
+             row_look = int(np.floor((y - info['yorig']) / info['ycell'])) + 1
+             
+             logging.info(f"Click at ({x}, {y}) -> Cell ({row_look}, {col_look})")
+             
+             # Check if ncf
+             is_ncf = self.plot_controls_frame.isVisible()
+             if not is_ncf: return
+             
+             from ncf_processing import get_ncf_timeseries
+             self.notify_signal.emit("INFO", f"Extracting Time Series for Cell ({row_look}, {col_look})...")
+             
+             # Layer/Op
+             l_idx = 0; l_op = 'select'
+             lay_txt = self.cmb_ncf_layer.currentText()
+             if "Sum" in lay_txt: l_op = 'sum'
+             elif "Avg" in lay_txt: l_op = 'mean'
+             elif "Layer" in lay_txt:
+                 try: l_idx = int(lay_txt.split()[-1]) - 1
+                 except: pass
+             
+             QTimer.singleShot(0, lambda: self._exec_ts_plot(row_look, col_look, l_idx, l_op))
+             
+        except Exception as e:
+             logging.error(f"Click handler error: {e}")
+
+    def _exec_ts_plot(self, r, c, l_idx, l_op):
+         try:
+             # Run extraction (blocking is okay for short TS, or move to thread if slow)
+             from ncf_processing import get_ncf_timeseries
+             res = get_ncf_timeseries(
+                self.input_files_list[0],
+                self.cmb_pollutant.currentText(),
+                [r-1], [c-1],
+                layer_idx=l_idx, layer_op=l_op, op='mean'
+             )
+             
+             if res:
+                 self._show_ts_window(res, f"Cell ({r}, {c})")
+                 self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c})")
+             else:
+                 self.notify_signal.emit("WARNING", "No data found for cell.")
+         except Exception as e:
+             self.notify_signal.emit("ERROR", f"TS Extraction failed: {e}")
+
+    def _show_ts_window(self, data, title):
+        try:
+             win = TimeSeriesPlotWindow(data, title, self.cmb_pollutant.currentText(), self.units_map.get(self.cmb_pollutant.currentText(), ""), self)
+             win.show()
+        except Exception as e:
+            logging.error(f"TS Window error: {e}")
+
+
+    def _parse_bins(self) -> List[float]:
+        """Parse custom bins from the GUI field (comma or space separated)."""
+        raw = self.txt_bins.text().strip()
+        if not raw:
+            return []
+        try:
+            # Handle both commas and spaces
+            parts = [p for p in raw.replace(',', ' ').split() if p]
+            # Use sorted set to ensure strictly monotonic increasing values
+            vals = sorted(list(set(float(p) for p in parts)))
+            return vals
+        except Exception:
+            self.notify_signal.emit('WARNING', f"Bins Parse Error: Could not parse '{raw}'; expected numbers.")
+            return []
+
+    def _setup_hover(self, merged: gpd.GeoDataFrame, pollutant: str, ax=None, tf_inv: Optional[pyproj.Transformer] = None) -> None:
+        """Enhance status bar to show pollutant at cursor and WGS84 lon/lat (Optimized for speed and accuracy)."""
+        from shapely.geometry import Point
+        
+        gdf = merged
+        sindex = getattr(gdf, 'sindex', None)
+        target_ax = ax if ax is not None else getattr(self, 'ax', None)
+        if target_ax is None: return
+
+        # 1. Pre-calculate lookup data (avoid repeated Series/DataFrame lookups on every mouse move)
+        # Using numpy arrays directly is significantly faster than Pandas row lookups (iloc)
+        gdf_cols = gdf.columns.tolist()
+        
+        # Robust column finding (handle suffixes like _x/_y from merges)
+        r_col = next((c for c in gdf_cols if c.upper().startswith('ROW')), None)
+        c_col = next((c for c in gdf_cols if c.upper().startswith('COL')), None)
+        
+        r_arr = gdf[r_col].values if r_col else None
+        c_arr = gdf[c_col].values if c_col else None
+        f_arr = gdf['FIPS'].values if 'FIPS' in gdf_cols else None
+        re_arr = gdf['region_cd'].values if 'region_cd' in gdf_cols else (gdf['REGION_CD'].values if 'REGION_CD' in gdf_cols else None)
+        g_arr = gdf['GRID_RC'].values if 'GRID_RC' in gdf_cols else None
+        p_arr = gdf[pollutant].values if pollutant in gdf_cols else None
+        geom_arr = gdf.geometry.values if hasattr(gdf, 'geometry') else []
+
+        # 2. Pre-build Grid lookup transformer to avoid CRS/Projection overhead
+        info = getattr(gdf, 'attrs', {}).get('_smk_grid_info')
+        lookup_tf = None
+        if info:
+            try:
+                native_crs_str = info.get('proj_str')
+                if native_crs_str:
+                    native_crs = pyproj.CRS.from_user_input(native_crs_str)
+                    # Use the actual CRS from the axes if available
+                    axes_crs = getattr(target_ax, '_smk_ax_crs', None) or getattr(gdf, 'crs', None)
+                    if axes_crs is not None:
+                         # Always create transformer if they might be different; pyproj optimizes identity.
+                         lookup_tf = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
             except Exception: pass
 
-        # Ensure 'bad' values (NaNs) are plotted in the same collection using set_bad
-        # This prevents GeoPandas from creating a separate collection for missing values,
-        # which is required for the animation updates (set_array) to work correctly on the full grid.
-        try:
-            if not (len(bins) >= 2): # already copied if discrete
-                cmap = copy.copy(cmap)
-            cmap.set_bad('#f0f0f0', alpha=1.0)
-        except Exception: pass
-
-        # Attach data for export (closure workaround)
-        local_ax._current_data = merged_plot
-        
-        # Use shared plotting function
-        self._data_collection = create_map_plot(
-            gdf=merged_plot,
-            column=pollutant,
-            title="", # GUI handles title via window logic
-            ax=local_ax,
-            cmap_name=cmap, # Pass object
-            bins=bins, 
-            unit_label=None, # GUI handles labeling manually below
-            overlay_counties=None, # GUI handles layers separately
-            overlay_shape=None,
-            crs_proj=plot_crs, # needed for overlays if we added them, but helpful for context
-            tf_fwd=None, # GUI handles graticule manually
-            tf_inv=None,
-            zoom_to_data=False, # GUI handles zoom manually
-            # Style & Overrides
-            linewidth=p_lw,
-            edgecolor=p_ec,
-            norm=norm,
-            zorder=1
-        )
-        _log_time("GeoPandas plot() completed")
-
-        # Identify newly created colorbar axis (any new axis besides main)
-        post_axes = set(local_fig.axes)
-        new_axes = [a for a in (post_axes - pre_axes) if a is not local_ax]
-        if new_axes:
-            cbar_ax = new_axes[0]
-            # Label colorbar with units if available
+        def _fmt(x: float, y: float) -> str:
+            # Lon/Lat mapping for status bar display
+            base = None
             try:
-                unit = self.units_map.get(pollutant)
-                if unit:
-                    cbar_ax.set_ylabel(unit)
-            except Exception:
-                pass
-            # Apply custom bins as colorbar ticks (if any)
+                if tf_inv is not None:
+                    lon_val, lat_val = tf_inv.transform(x, y)
+                    if abs(lon_val) < 1000 and abs(lat_val) < 1000: # Sanity check for degrees
+                        base = f"lon={lon_val:.4f}\u00b0, lat={lat_val:.4f}\u00b0"
+                elif getattr(gdf, 'crs', None) is not None:
+                    try:
+                        is_geog = gdf.crs.is_geographic if hasattr(gdf.crs, 'is_geographic') else False
+                        if is_geog:
+                            base = f"lon={x:.4f}\u00b0, lat={y:.4f}\u00b0"
+                    except Exception: pass
+            except Exception: pass
+                
+            if base is None:
+                base = f"x={x:.4f}, y={y:.4f}"
+
             try:
-                from matplotlib.ticker import FixedLocator
-                bins_ticks = bins or []
-                if bins_ticks:
-                    # Show all provided bin edges as ticks; do not clamp to data range.
-                    # For log colorbars (not used with BoundaryNorm here), we'd restrict to >0.
-                    is_log = isinstance(norm, LogNorm)
-                    ticks = [t for t in bins_ticks if (t > 0) ] if is_log else list(bins_ticks)
-                    if ticks:
-                        # Determine orientation by axis box shape
-                        try:
-                            bbox = cbar_ax.get_position()
-                            orient_vertical = (bbox.height >= bbox.width)
-                        except Exception:
-                            orient_vertical = True
-                        # Determine formatter that shows requested precision
-                        def _fmt_precise(x, pos=None):
-                            if x == 0: return "0"
-                            # If very small, use up to 4 decimal places, else standard
-                            if 0 < abs(x) < 0.1:
-                                return f"{x:.4g}"
-                            return f"{x:.4g}"
+                # Optimized multi-stage lookup
+                cand_idx = []
+                
+                # Fast Strategy 1: Native Grid Math (O(1) search candidate range)
+                if info is not None and r_arr is not None:
+                    try:
+                        lx, ly = x, y
+                        if lookup_tf:
+                            lx, ly = lookup_tf.transform(lx, ly)
                         
-                        from matplotlib.ticker import FuncFormatter
-
-                        if orient_vertical:
-                            try:
-                                cbar_ax.yaxis.set_major_locator(FixedLocator(ticks))
-                                cbar_ax.yaxis.set_major_formatter(FuncFormatter(_fmt_precise))
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                cbar_ax.xaxis.set_major_locator(FixedLocator(ticks))
-                                cbar_ax.xaxis.set_major_formatter(FuncFormatter(_fmt_precise))
-                            except Exception:
-                                pass
-                        try:
-                            local_fig.canvas.draw_idle()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-        # If plotting by grid and counties layer is available, overlay county boundaries for context
-        try:
-            mode = (self.plot_by_var.get().lower() if getattr(self, 'plot_by_var', None) else 'auto')
-        except Exception:
-            mode = 'auto'
-        if self.counties_gdf is not None:
-            try:
-                overlay = self.counties_gdf
-                try:
-                    overlay = overlay.to_crs(plot_crs) if plot_crs is not None and getattr(overlay, 'crs', None) is not None else overlay
-                except Exception:
-                    pass
-                # Use a separate axis or just plain plot, but importantly do NOT make it a collection that looks like data
-                # We save it to a variable that is NOT _data_collection
-                overlay.plot(ax=local_ax, facecolor='none', edgecolor=county_color, linewidth=county_lw, alpha=0.6, zorder=20)
-            except Exception:
-                pass
-        if self.overlay_gdf is not None:
-            # Handle both single GeoDataFrame and list of GeoDataFrames
-            overlay_list = self.overlay_gdf if isinstance(self.overlay_gdf, list) else [self.overlay_gdf]
-            colors = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
-            
-            for idx, ov_part in enumerate(overlay_list):
-                try:
-                    if plot_crs is not None and getattr(ov_part, 'crs', None) is not None:
-                        ov_part = ov_part.to_crs(plot_crs)
-                    
-                    # Use unique color for each overlay
-                    color = colors[idx % len(colors)]
-                    ov_part.boundary.plot(ax=local_ax, facecolor='none', edgecolor=color, linewidth=overlay_lw, alpha=0.9, zorder=25, linestyle='--')
-                except Exception as e:
-                    logging.warning("Failed to plot overlay part %d: %s", idx, e)
-        # Optional zoom to data extent (non-NA values)
-        if self.zoom_var.get():
-            candidates = None
-            values_num = None
-            if pollutant in merged_plot.columns:
-                try:
-                    values_num = pd.to_numeric(merged_plot[pollutant], errors='coerce')
-                except Exception:
-                    values_num = None
-            if values_num is not None:
-                try:
-                    # Modified to include zero values in zoom extent
-                    valid_mask = values_num.notna()
-                    if '__has_emissions' in merged_plot.columns:
-                        try:
-                            has_mask = merged_plot['__has_emissions'].fillna(False)
-                            valid_mask = valid_mask | has_mask
-                        except Exception:
-                            pass
-                    if getattr(valid_mask, 'any', lambda: False)():
-                        try:
-                            candidates = merged_plot[valid_mask.fillna(False)]
-                        except Exception:
-                            candidates = merged_plot[valid_mask]
-                except Exception:
-                    candidates = None
-            if (candidates is None or candidates.empty) and '__has_emissions' in merged_plot.columns:
-                try:
-                    has_mask = merged_plot['__has_emissions'].fillna(False)
-                    subset = merged_plot[has_mask]
-                    if not subset.empty:
-                        candidates = subset
-                except Exception:
-                    pass
-            try:
-                bounds_df = candidates
-                if bounds_df is None or bounds_df.empty:
-                    bounds_df = merged_plot
-                if bounds_df is None:
-                    bounds_df = pd.DataFrame()
-            except Exception:
-                bounds_df = merged_plot if merged_plot is not None else pd.DataFrame()
-            try:
-                bounds_df = bounds_df[bounds_df.geometry.notna()]
-            except Exception:
-                pass
-            try:
-                bounds_df = bounds_df[~bounds_df.geometry.is_empty]
-            except Exception:
-                pass
-            if bounds_df is not None and not getattr(bounds_df, 'empty', True):
-                try:
-                    minx, miny, maxx, maxy = bounds_df.total_bounds
-                    dx = (maxx - minx) * 0.02 if maxx > minx else 0.1
-                    dy = (maxy - miny) * 0.02 if maxy > miny else 0.1
-                    local_ax.set_xlim(minx - dx, maxx + dx)
-                    local_ax.set_ylim(miny - dy, maxy + dy)
-                except Exception:
-                    pass
-        # Draw graticule lines on projected map
-        logging.info(f"DEBUG GUI Graticule Check: CRS={plot_crs}, FWD={tf_fwd}, INV={tf_inv}")
-        try:
-            if plot_crs is not None and tf_fwd is not None and tf_inv is not None:
-                # Slightly behind the polygons (zorder=0 in draw function)
-                self._draw_graticule(local_ax, tf_fwd, tf_inv, lon_step=None, lat_step=None)
-                # Equal aspect to preserve shapes visually
-                try:
-                    local_ax.set_aspect('equal', adjustable='box')
-                except Exception:
-                    pass
-            else:
-                logging.warning("DEBUG GUI Graticule SKIPPED: Missing transformers or CRS")
-        except Exception:
-            pass
-        # Record base view for this window and wire Home
-        try:
-            base_view = (local_ax.get_xlim(), local_ax.get_ylim())
-            self._base_views[pollutant] = base_view # Store base view per pollutant
-            try:
-                base_view_holder = {}
-                base_view_holder['limits'] = base_view  # keep stats baseline aligned with Home view
-            except Exception:
-                pass
-            # Save on instance for helper-based zoom to clamp against
-            try:
-                self._base_view = base_view
-            except Exception:
-                pass
-            def _home(*_a, **_k):
-                try:
-                    xlim, ylim = base_view
-                    local_ax.set_xlim(*xlim)
-                    local_ax.set_ylim(*ylim)
-                    canvas.draw_idle()
-                except Exception:
-                    pass
-            try:
-                # Bind to this window's toolbar, not any class-level toolbar
-                toolbar.home = _home  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # Title with source name if available
-        try:
-            attrs = getattr(self.emissions_df, 'attrs', {})
-            src = attrs.get('source_name') if self.emissions_df is not None else None
-            var_meta = attrs.get('variable_metadata', {}).get(pollutant, {})
-        except Exception:
-            src = None
-            var_meta = {}
-
-        # Build title and optional SCC subtitle
-        long_name = var_meta.get('long_name')
-        units = str(var_meta.get('units', '') or '').strip()
-        
-        if long_name:
-            main_title = long_name
-            if units:
-                main_title += f" ({units})"
-                # Also update units map for colorbar if not set
-                if pollutant not in self.units_map:
-                    self.units_map[pollutant] = units
-        else:
-            main_title = f"{pollutant} emissions from {src}" if src else f"{pollutant} emission"
-        
-        try:
-            sel_disp = self.scc_select_var.get() if getattr(self, 'scc_select_var', None) else 'All SCC'
-        except Exception:
-            sel_disp = 'All SCC'
-
-        # Append NetCDF Layer/Time info
-        ncf_parts = []
-        try:
-            # Check if source is NetCDF
-            src_type = attrs.get('source_type')
-            is_ncf_source = (src_type == 'gridded_netcdf') or \
-                            is_netcdf_file(self.inputfile_path) or \
-                            ('proxy_ncf_path' in attrs)
-            
-            if is_ncf_source:
-                if hasattr(self, 'ncf_layer_var') and self.ncf_layer_var.get():
-                    ncf_parts.append(self.ncf_layer_var.get())
-                if hasattr(self, 'ncf_tstep_var') and self.ncf_tstep_var.get():
-                    ts_val = self.ncf_tstep_var.get()
-                    if 'Sum' in ts_val:
-                        ncf_parts.append(ts_val)
-                    else:
-                        ncf_parts.append(f"Time: {ts_val}")
-        except Exception:
-            pass
-
-        title_lines = [main_title]
-        if ncf_parts:
-            title_lines.append(", ".join(ncf_parts))
-        if sel_disp and sel_disp != 'All SCC':
-            title_lines.append(f"SCC: {sel_disp}")
-        
-        # Apply Title to Axes (Fix for missing title)
-        try:
-            if title_lines:
-                local_ax.set_title("\n".join(title_lines), fontsize=12)
-        except Exception:
-            pass
-
-        # Add Time Series buttons if NCF
-        is_ncf_source = False
-        ts_click_handler = None
-        try:
-            src_type = attrs.get('source_type')
-            is_ncf_source = (src_type == 'gridded_netcdf') or \
-                            is_netcdf_file(self.inputfile_path) or \
-                            ('proxy_ncf_path' in attrs)
-        except Exception:
-            pass
-        
-        # Text artist (Stats) anchored to bottom-left inside axes
-        # Defined early so it can be updated by Time Nav
-        stats_text = local_ax.text(
-            0.01, 0.01,
-            "",
-            transform=local_ax.transAxes,
-            ha='left', va='bottom', fontsize=9, color='#333333', zorder=30,
-            bbox=dict(facecolor='white', edgecolor='#aaaaaa', alpha=0.7, pad=2)
-        )
-
-        if is_ncf_source:
-            ts_frame = ttk.Frame(plot_container)
-            ts_frame.pack(side='top', fill='x', pady=(2, 0))
-
-            # --- Time Stepping Controls ---
-            nav_frame = ttk.Frame(plot_container) 
-            nav_frame.pack(side='top', fill='x', pady=(2, 0))
-             
-            self._t_data_cache = None
-            self._t_idx = 0
-            self._is_showing_agg = True
-            # stats_box - removed, using stats_text
-             
-            lbl_time = ttk.Label(nav_frame, text="Time: Initial")
-            lbl_time.pack(side='left', padx=5)
-
-            def _ensure_time_data():
-                if self._t_data_cache is not None: return True
-                try:
-                    from ncf_processing import get_ncf_animation_data
-                except ImportError: return False
-                 
-                # Prepare indices for ALL cells in plot
-                r_col = 'ROW'; c_col = 'COL'
-                if 'ROW' not in merged_plot.columns and 'ROW_x' in merged_plot.columns: r_col = 'ROW_x'
-                if 'COL' not in merged_plot.columns and 'COL_x' in merged_plot.columns: c_col = 'COL_x'
-                 
-                # 0-based indices
-                try:
-                    # Robust extraction: fillna(0) ensures no NaNs cause crash during casting
-                    rows = merged_plot[r_col].fillna(0).astype(int) - 1
-                    cols = merged_plot[c_col].fillna(0).astype(int) - 1
-                except Exception as e:
-                    logging.error(f"Failed to extract grid indices: {e}") 
-                    return False
-                 
-                # Layer op
-                l_idx = 0; l_op = 'select'
-                try: 
-                    lay_setting = self.ncf_layer_var.get()
-                    if "Sum" in lay_setting: l_op = 'sum'
-                    elif "Avg" in lay_setting: l_op = 'mean'
-                    elif "Layer" in lay_setting:
-                        try: l_idx = int(lay_setting.split()[-1]) - 1; l_op = 'select'
-                        except: pass
-                except: pass
-
-                self._set_status("Loading full time series...", level="INFO")
-                 
-                # Determine variables before logging
-                effective_path = self.inputfile_path
-                stack_groups_path = None
-                try:
-                    if hasattr(self.emissions_df, 'attrs'):
-                        if 'proxy_ncf_path' in self.emissions_df.attrs:
-                                effective_path = self.emissions_df.attrs['proxy_ncf_path']
-                        elif 'original_ncf_path' in self.emissions_df.attrs:
-                                effective_path = self.emissions_df.attrs['original_ncf_path']
-                          
-                        if 'stack_groups_path' in self.emissions_df.attrs:
-                                stack_groups_path = self.emissions_df.attrs['stack_groups_path']
-                except Exception: pass
-
-                logging.info(f"Loading Animation Data: Path={effective_path}, StackGroups={stack_groups_path}")
-                if 'proxy_ncf_path' in getattr(self.emissions_df, 'attrs', {}):
-                        logging.info("Using cached gridded file for animation: %s", effective_path)
-
-                # Capture Current View Scale (Initial Scale)
-                vmin_init, vmax_init = 0, 1
-                init_coll = None
-                try:
-                    if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
-                        init_coll = self._data_collection
-                    else:
-                        for c in local_ax.collections:
-                            if c.get_array() is not None:
-                                init_coll = c
-                                break
-                    if init_coll is None and local_ax.collections: init_coll = local_ax.collections[0]
-                    if init_coll:
-                        vmin_init, vmax_init = init_coll.get_clim()
-                except: pass
-
-                try:
-                    res = get_ncf_animation_data(
-                        effective_path, 
-                        pollutant, 
-                        rows.tolist(), 
-                        cols.tolist(), 
-                        layer_idx=l_idx, 
-                        layer_op=l_op,
-                        stack_groups_path=stack_groups_path
-                    )
-                    if not res:
-                        logging.error("get_ncf_animation_data returned None. Check logs for details.")
-                        # Don't show popup error, just log it to avoid spamming if user clicks around
-                        # But wait, this is _ensure_time_data, called once on creation.
-                        # If it fails, animation won't work.
-                        self._notify('WARNING', 'Animation Data', 'No time series data could be loaded for this layer.')
-                        return False
-                     
-                    # Add Aggregates
-                    # vals: (T, N)
-                    vals = res['values']
-                    times = res['times']
-                     
-                    # Total All Time (Sum across T)
-                    tot = np.sum(vals, axis=0, keepdims=True)
-                    # Average All Time (Mean across T)
-                    avg = np.mean(vals, axis=0, keepdims=True)
-                     
-                    # Max/Min All Time
-                    mx_agg = np.nanmax(vals, axis=0, keepdims=True)
-                    mn_agg = np.nanmin(vals, axis=0, keepdims=True)
-                     
-                    # Store aggregates separately, do NOT stack into main playback loop
-                    res['tot_val'] = tot.flatten()
-                    res['avg_val'] = avg.flatten()
-                    res['mx_val'] = mx_agg.flatten()
-                    res['mn_val'] = mn_agg.flatten()
-                     
-                    res['values'] = vals
-                    res['times'] = times
-                     
-                    # Calculate scale limits
-                    # Use Global Min/Max across entire time dimension for consistency
-                    # NOTE: 'vals' here is the original time-step data only, excluding Total/Avg aggregates.
-                     
-                    # Determine log scale: Prefer UI setting, then Norm type
-                    is_log = False
-                    try: 
-                        if hasattr(self, 'scale_var') and self.scale_var.get() == 'log':
-                            is_log = True
-                        elif init_coll and isinstance(init_coll.norm, LogNorm):
-                            is_log = True
-                    except: pass
-                     
-                    if is_log:
-                        pos_vals = vals[vals > 0]
-                        res['vmin'] = pos_vals.min() if pos_vals.size > 0 else 0.001
-                        res['vmax'] = vals.max() if vals.size > 0 else 1.0
-                    else:
-                        res['vmin'] = np.nanmin(vals)
-                        res['vmax'] = np.nanmax(vals)
-
-                    self._t_data_cache = res
-
-                    # Sync _t_idx with the current UI selection (only on first load)
+                        c_look = int(np.floor((lx - info['xorig']) / info['xcell'])) + 1
+                        r_look = int(np.floor((ly - info['yorig']) / info['ycell'])) + 1
+                        
+                        # Find indices in GDF that match this row/col
+                        mask = (r_arr == r_look) & (c_arr == c_look)
+                        cand_idx = np.where(mask)[0]
+                    except Exception: 
+                        cand_idx = []
+                
+                # Strategy 2: Spatial Index Fallback (for non-gridded or if math missed)
+                if (len(cand_idx) == 0) and sindex is not None:
                     try:
-                        # Attempt to align _t_idx with ncf_tstep_var
-                        current_sel = self.ncf_tstep_var.get()
-                        # Since aggregates are now separate, if user selected agg, we should maybe
-                        # initialize plot to that agg? Or just defaut to time step 0?
-                        # Let's default to time step 0 if an aggregate was selected, unless we add
-                        # logic to immediately show the aggregate.
-                        # The user asked to remove them from loop range.
-                         
-                        # If it's a specific time step, match it
-                        found = False
-                        for i, t in enumerate(times):
-                            if str(t).strip() == str(current_sel).strip():
-                                self._t_idx = i
-                                self._is_showing_agg = False
-                                found = True
-                                break
-                            if str(current_sel) in str(t):
-                                self._t_idx = i
-                                self._is_showing_agg = False
-                                found = True
-                                break
-                         
-                        if not found:
-                            self._t_idx = 0
-                            self._is_showing_agg = True
-                             
-                    except Exception:
-                        pass
+                        cand_idx = list(sindex.intersection((x, y, x, y)))
+                    except Exception: 
+                        cand_idx = []
 
-                    return True
-                except Exception as e:
-                    self._notify('ERROR', 'Time Data', str(e))
-                    return False
+                if len(cand_idx) == 0:
+                    return base
 
-            def _update_view(new_vals, time_lbl):
-                coll = None
-                try:
-                    if hasattr(self, '_data_collection') and self._data_collection in local_ax.collections:
-                        coll = self._data_collection
-                    else:
-                        if self._t_data_cache and 'values' in self._t_data_cache:
-                            expected_size = self._t_data_cache['values'][0].size
-                            for c in local_ax.collections:
-                                arr = c.get_array()
-                                if arr is not None and arr.size == expected_size:
-                                    coll = c
-                                    break
-                    if coll is None and local_ax.collections:
-                        c0 = local_ax.collections[0]
-                        if c0.get_array() is not None: coll = c0
-                except: pass
-
-                try:
-                    if coll:
-                        coll.set_array(new_vals)
-                        local_ax._smk_current_vals = new_vals
-                        coll.set_clim(self._t_data_cache['vmin'], self._t_data_cache['vmax'])
-                        if hasattr(coll, 'colorbar') and coll.colorbar:
-                            coll.colorbar.update_normal(coll)
-
-                        # Calculate Stats (View Dependent)
+                pt = Point(x, y)
+                best_parts = None
+                best_val = -1.0
+                
+                for idx in cand_idx:
+                    geom = geom_arr[idx]
+                    # Robust containment check required for 100% accuracy near edges
+                    if geom is not None and geom.contains(pt):
+                        parts = [base]
+                        
+                        # Region/FIPS lookup
+                        fips = f_arr[idx] if f_arr is not None else None
+                        region_cd = re_arr[idx] if re_arr is not None else None
+                        gridrc = g_arr[idx] if g_arr is not None else None
+                        
+                        if fips is not None and str(fips) != 'nan':
+                            f_str = str(fips).split('.')[0]
+                            parts.append(f"FIPS={f_str.zfill(6) if f_str.isdigit() else f_str}")
+                        elif region_cd is not None and str(region_cd) != 'nan':
+                            r_str = str(region_cd).split('.')[0]
+                            parts.append(f"region_cd={r_str.zfill(6) if r_str.isdigit() else r_str}")
+                        elif gridrc is not None:
+                            parts.append(f"GRID_RC={gridrc}")
+                        
+                        # Value lookup (Sync with current animation view if available)
+                        ax_vals = getattr(target_ax, '_smk_current_vals', None)
+                        val = ax_vals[idx] if (ax_vals is not None and idx < len(ax_vals)) else (p_arr[idx] if p_arr is not None else None)
+                        
                         try:
-                            x0, x1 = local_ax.get_xlim()
-                            y0, y1 = local_ax.get_ylim()
-                            from shapely.geometry import box
-                            view_box = box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-                             
-                            visible_idxs = list(merged_plot.sindex.intersection(view_box.bounds))
-                             
-                            if visible_idxs:
-                                view_vals = new_vals[visible_idxs]
-                                filtered = view_vals[~np.isnan(view_vals)]
-                            else:
-                                filtered = np.array([])
-
-                            u_str = f" ({units})" if units else ""
-                            new_title = f"{pollutant}{u_str}\nTime: {time_lbl}"
-                            local_ax.set_title(new_title)
-
-                            if filtered.size > 0:
-                                mn = np.min(filtered); mx = np.max(filtered)
-                                u = np.mean(filtered); s = np.sum(filtered)
-                                def _fs(v): return f"{v:.4g}"
-                                stats_txt = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
-                                if units: stats_txt += f" {units}"
-                                try: stats_text.set_text(stats_txt)
-                                except: pass
-                            else:
-                                try: stats_text.set_text("No Data in View")
-                                except: pass
-                        except Exception as ex:
-                            print(f"Stats update error: {ex}")
-                         
-                        n_steps = len(self._t_data_cache['times'])
-                        # Update label logic: if custom label (Agg), show it. If index-based, show index.
-                        if "Sum" in time_lbl or "Mean" in time_lbl:
-                            lbl_time.config(text=f"Time: {time_lbl}")
-                        else:
-                            lbl_time.config(text=f"Time: {time_lbl} ({self._t_idx+1}/{n_steps})")
-                         
-                        canvas.draw_idle()
-                except Exception as e:
-                    print(f"Update failed: {e}")
-
-            def _step_time(delta):
-                if not _ensure_time_data(): return
-                n_steps = len(self._t_data_cache['times'])
-                old_idx = self._t_idx
-                if getattr(self, '_is_showing_agg', False):
-                    self._t_idx = 0 if delta > 0 else n_steps - 1
-                    self._is_showing_agg = False
-                else:
-                    self._t_idx = (self._t_idx + delta) % n_steps
-                new_vals = self._t_data_cache['values'][self._t_idx]
-                time_lbl = self._t_data_cache['times'][self._t_idx]
-                logging.info(f"Animation Step: {old_idx} -> {self._t_idx}, ValRange=[{new_vals.min():.2f}, {new_vals.max():.2f}]")
-                _update_view(new_vals, time_lbl)
-            
-            def _show_agg(mode):
-                if not _ensure_time_data(): return
-                self._is_showing_agg = True
-                if mode == 'total':
-                    new_vals = self._t_data_cache['tot_val']
-                    lbl = "Total (Sum)"
-                elif mode == 'avg':
-                    new_vals = self._t_data_cache['avg_val']
-                    lbl = "Average (Mean)"
-                elif mode == 'max':
-                    new_vals = self._t_data_cache['mx_val']
-                    lbl = "Max All Time (Grid-wise)"
-                elif mode == 'min':
-                    new_vals = self._t_data_cache['mn_val']
-                    lbl = "Min All Time (Grid-wise)"
-                _update_view(new_vals, lbl)
-
-            ttk.Button(nav_frame, text="< Prev", command=lambda: _step_time(-1)).pack(side='left', padx=2)
-            ttk.Button(nav_frame, text="Next >", command=lambda: _step_time(1)).pack(side='left', padx=2)
-            ttk.Button(nav_frame, text="Total", command=lambda: _show_agg('total')).pack(side='left', padx=5)
-            ttk.Button(nav_frame, text="Avg", command=lambda: _show_agg('avg')).pack(side='left', padx=2)
-            ttk.Button(nav_frame, text="Max", command=lambda: _show_agg('max')).pack(side='left', padx=2)
-            ttk.Button(nav_frame, text="Min", command=lambda: _show_agg('min')).pack(side='left', padx=2)
-             
-            def _on_ts(mode):
-                try:
-                    from ncf_processing import get_ncf_timeseries
-                except ImportError:
-                    self._notify('ERROR', 'Time Series', 'Could not import NetCDF processing module.')
-                    return
-                 
-                # 1. Get current bounds
-                xmin, xmax = local_ax.get_xlim()
-                ymin, ymax = local_ax.get_ylim()
-                 
-                # 2. Filter gdf
-                try:
-                    # merged_plot is in plot CRS, limits are in plot CRS
-                    # Filter by intersection
-                    from shapely.geometry import box
-                    bbox = box(min(xmin, xmax), min(ymin, ymax), max(xmin, xmax), max(ymin, ymax))
-                     
-                    sidx = merged_plot.sindex
-                    cand_idxs = list(sidx.intersection(bbox.bounds))
-                    subset = merged_plot.iloc[cand_idxs]
-                    subset = subset[subset.intersects(bbox)]
-                     
-                    if subset.empty:
-                        self._notify('WARNING', 'Time Series', 'No grid cells in current view.')
-                        return
-                     
-                    # 3. Get indices
-                    # We need ROW and COL columns. 
-                    # They are 1-based in DF.
-                    # Handle overlap suffix from merge (_x from geom, _y from emis)
-                    r_col = 'ROW'
-                    c_col = 'COL'
-                    if 'ROW' not in subset.columns:
-                        if 'ROW_x' in subset.columns: r_col = 'ROW_x'
-                        else: r_col = None
-                    if 'COL' not in subset.columns:
-                        if 'COL_x' in subset.columns: c_col = 'COL_x'
-                        else: c_col = None
-                          
-                    if not r_col or not c_col:
-                        if 'GRID_RC' in subset.columns:
-                            # Fallback: parse GRID_RC
-                            try:
-                                # assuming R_C
-                                subset['_TS_ROW'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[0]))
-                                subset['_TS_COL'] = subset['GRID_RC'].apply(lambda x: int(x.split('_')[1]))
-                                r_col = '_TS_ROW'
-                                c_col = '_TS_COL'
-                            except:
-                                self._notify('ERROR', 'Time Series', 'Grid ROW/COL could not be derived.')
-                                return
-                        else:
-                            self._notify('ERROR', 'Time Series', 'Grid ROW/COL information missing from plot data.')
-                            return
-                     
-                    rows_0 = subset[r_col].astype(int) - 1
-                    cols_0 = subset[c_col].astype(int) - 1
-                     
-                    # Check bounds validity
-                    if (rows_0 < 0).any() or (cols_0 < 0).any():
-                        self._notify('ERROR', 'Time Series', 'Invalid grid indices found.')
-                        return
-                     
-                except Exception as e:
-                    self._notify('ERROR', 'Time Series Prep', f"Failed to filter grid: {e}")
-                    return
-
-                # 4. Get Layer info
-                try:
-                    lay_setting = self.ncf_layer_var.get()
-                    l_idx = 0
-                    l_op = 'select'
-                    if 'Sum All' in lay_setting:
-                        l_idx = None
-                        l_op = 'sum'
-                    elif 'Average' in lay_setting:
-                        l_idx = None
-                        l_op = 'mean'
-                    elif 'Layer' in lay_setting:
-                        try: l_idx = int(lay_setting.split()[-1]) - 1
-                        except: l_idx = 0
-                        l_op = 'select'
-                except: # fallback
-                    l_idx = 0
-                    l_op = 'select'
-                 
-                # 5. Call backend
-                self._set_status("Extracting time series...", level="INFO")
-
-                # Prepare arguments for Inline support
-                stack_groups_path = None
-                effective_path = self.inputfile_path
-                try:
-                    stack_groups_path = merged_plot.attrs.get('stack_groups_path')
-                    if 'proxy_ncf_path' in merged_plot.attrs:
-                        effective_path = merged_plot.attrs['proxy_ncf_path']
-                    if 'original_ncf_path' in merged_plot.attrs:
-                        effective_path = merged_plot.attrs['original_ncf_path']
-                except Exception:
-                    pass
-
-                try:
-                    result = get_ncf_timeseries(
-                        effective_path,
-                        pollutant,
-                        rows_0.tolist(),
-                        cols_0.tolist(),
-                        layer_idx=l_idx,
-                        layer_op=l_op,
-                        op=mode,
-                        stack_groups_path=stack_groups_path
-                    )
-                except Exception as e:
-                    self._notify('ERROR', 'Extract Error', str(e))
-                    return
-                     
-                if not result:
-                    self._notify('WARNING', 'Time Series', 'Extraction returned no data.')
-                    return
-                 
-                # 6. Plot
-                ts_view = tk.Toplevel(self.root)
-                ts_title = f"{pollutant} Time Series ({mode.title()}) - {len(subset)} Cells"
-                ts_view.title(ts_title)
-                 
-                import matplotlib.pyplot as plt
-                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-                 
-                fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
-                times = result['times']
-                vals = result['values']
-                units = result['units']
-                 
-                # Parse time labels? YYYYDDD_HHMMSS
-                # Maybe simplify X axis labels
-                if isinstance(vals, dict):
-                        # Multi-line plot (Inline Sources)
-                        for label, series in vals.items():
-                            lw = 2.5 if label == 'Total' else 1.0
-                            alpha = 1.0 if label == 'Total' else 0.6
-                            ms = 4 if label == 'Total' else 2
-                            ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
-                      
-                        # Only show legend if reasonable number of items
-                        if len(vals) < 25:
-                            ax_ts.legend(fontsize='small', loc='upper right')
-                        else:
-                            # If too many, maybe just Total in legend?
-                            ax_ts.legend(['Total'], loc='upper right')
-                else:
-                        ax_ts.plot(vals, marker='o', markersize=4)
-                      
-                u_str = str(units or '').strip()
-                y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
-                ax_ts.set_ylabel(y_lbl)
-                ax_ts.set_xlabel("Time Step")
-                ax_ts.grid(True, linestyle='--', alpha=0.7)
-                 
-                if len(times) > 10:
-                        # Sparse ticks
-                        step = len(times) // 10
-                        ax_ts.set_xticks(range(0, len(times), step))
-                        ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
-                else:
-                        ax_ts.set_xticks(range(len(times)))
-                        ax_ts.set_xticklabels(times, rotation=30, ha='right')
-                 
-                fig_ts.tight_layout()
-                 
-                cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
-                cv.draw()
-                cv.get_tk_widget().pack(side='top', fill='both', expand=True)
-                 
-                tb = NavigationToolbar2Tk(cv, ts_view)
-                tb.update()
-                tb.pack(side='top', fill='x')
-                 
-                self._set_status("Time series extracted.", level="INFO")
-             
-            ttk.Button(ts_frame, text="Time_Series_Total", command=lambda: _on_ts('sum')).pack(side='left', padx=4)
-            ttk.Button(ts_frame, text="Time_Series_Averaged", command=lambda: _on_ts('mean')).pack(side='left', padx=4)
-
-            def _display_ts_window(result, title_msg):
-                ts_view = tk.Toplevel(self.root)
-                ts_view.title(title_msg)
-                import matplotlib.pyplot as plt
-                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-                 
-                fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
-                times = result['times']
-                vals = result['values']
-                units = result['units']
-                 
-                if isinstance(vals, dict):
-                        # Multi-line plot (Inline Sources)
-                        for label, series in vals.items():
-                            lw = 2.5 if label == 'Total' else 1.0
-                            alpha = 1.0 if label == 'Total' else 0.6
-                            ms = 4 if label == 'Total' else 2
-                            ax_ts.plot(series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
-                      
-                        if len(vals) < 25:
-                            ax_ts.legend(fontsize='small', loc='upper right')
-                        else:
-                            ax_ts.legend(['Total'], loc='upper right')
-                else:
-                        ax_ts.plot(vals, marker='o', markersize=4)
-
-                u_str = str(units or '').strip()
-                y_lbl = f"{pollutant} ({u_str})" if u_str else pollutant
-                ax_ts.set_ylabel(y_lbl)
-                ax_ts.set_xlabel("Time Step")
-                ax_ts.grid(True, linestyle='--', alpha=0.7)
-                 
-                if len(times) > 10:
-                        step = max(1, len(times) // 10)
-                        ax_ts.set_xticks(range(0, len(times), step))
-                        ax_ts.set_xticklabels([times[i] for i in range(0, len(times), step)], rotation=30, ha='right')
-                else:
-                        ax_ts.set_xticks(range(len(times)))
-                        ax_ts.set_xticklabels(times, rotation=30, ha='right')
-                 
-                fig_ts.tight_layout()
-                 
-                cv = FigureCanvasTkAgg(fig_ts, master=ts_view)
-                cv.draw()
-                cv.get_tk_widget().pack(side='top', fill='both', expand=True)
-                 
-                tb = NavigationToolbar2Tk(cv, ts_view)
-                tb.update()
-                tb.pack(side='top', fill='x')
-
-            def _on_click(event):
-                # Click-to-plot logic
-                if event.inaxes != local_ax: return
-                if getattr(toolbar, 'mode', '') != '': return
-                if event.button != 1: return
-                 
-                try:
-                    from shapely.geometry import Point
-                    x, y = event.xdata, event.ydata
-                    pt = Point(x, y)
-                     
-                    target = None
-                    # OPTIMIZATION: High-speed grid math check
-                    info = getattr(merged_plot, 'attrs', {}).get('_smk_grid_info')
-                    if info and 'ROW' in merged_plot.columns:
-                        try:
-                            lx, ly = x, y
-                            # Transform click to native space if needed
-                            native_crs_str = info.get('proj_str')
-                            if native_crs_str:
-                                import pyproj
-                                native_crs = pyproj.CRS.from_user_input(native_crs_str)
-                                axes_crs = getattr(local_ax, '_smk_ax_crs', None) or getattr(merged_plot, 'crs', None)
-                                if axes_crs is not None and not native_crs.equals(axes_crs):
-                                    if not hasattr(local_ax, '_click_lookup_transformer'):
-                                        local_ax._click_lookup_transformer = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
-                                    lx, ly = local_ax._click_lookup_transformer.transform(x, y)
+                            f_val = float(val) if not pd.isna(val) else 0.0
+                            parts.append(f"{pollutant}={f_val:.4g}")
+                        except Exception:
+                            if val is not None: parts.append(f"{pollutant}={val}")
+                            f_val = 0.0
                             
-                            c_look = int(np.floor((lx - info['xorig']) / info['xcell'])) + 1
-                            r_look = int(np.floor((ly - info['yorig']) / info['ycell'])) + 1
-                            
-                            # Lookup
-                            matches = merged_plot[(merged_plot['ROW'] == r_look) & (merged_plot['COL'] == c_look)]
-                            if not matches.empty:
-                                target = matches.iloc[0]
-                        except Exception: target = None
-                    
-                    if target is None:
-                        # FALLBACK: Spatial lookup
-                        if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                            cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                            for idx in cands:
-                                row = merged_plot.iloc[idx]
-                                if row.geometry.contains(pt):
-                                    target = row
-                                    break
-                        else:
-                            matches = merged_plot[merged_plot.intersects(pt)]
-                            if not matches.empty:
-                                target = matches.iloc[0]
-                         
-                    if target is None: return
+                        if f_val > best_val or best_parts is None:
+                            best_val = f_val
+                            best_parts = parts
+                            if best_val > 0: break # Match found
 
-                    # Extract R/C
-                    r = None; c = None
-                    if 'ROW' in target: r = target['ROW']
-                    elif 'ROW_x' in target: r = target['ROW_x']
-                     
-                    if 'COL' in target: c = target['COL']
-                    elif 'COL_x' in target: c = target['COL_x']
-                     
-                    if (r is None or c is None) and 'GRID_RC' in target:
-                        try:
-                                parts = str(target['GRID_RC']).split('_')
-                                r = int(parts[0])
-                                c = int(parts[1])
-                        except: pass
-                          
-                    if r is None or c is None: return
-
-                    l_idx = 0; l_op = 'select'
-                    try: 
-                        if hasattr(self, 'ncf_layer_var'):
-                            l_sel = self.ncf_layer_var.get()
-                            if "Sum" in l_sel: l_op = 'sum'
-                            elif "Avg" in l_sel: l_op = 'mean'
-                            else:
-                                parts = l_sel.split()
-                                if len(parts) > 1 and parts[-1].isdigit():
-                                    l_idx = int(parts[-1]) - 1
-                    except: pass
-                     
-                    from ncf_processing import get_ncf_timeseries
-                    self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
-                     
-                    attrs = getattr(merged_plot, 'attrs', {})
-                    effective_path = self.inputfile_path
-                    if 'proxy_ncf_path' in attrs:
-                        effective_path = attrs['proxy_ncf_path']
-                    if 'original_ncf_path' in attrs:
-                        effective_path = attrs['original_ncf_path']
-
-                    stack_groups_path = None
-                    if 'stack_groups_path' in attrs:
-                        stack_groups_path = attrs['stack_groups_path']
-                          
-                    res = get_ncf_timeseries(
-                        effective_path,
-                        pollutant,
-                        [int(r)-1],
-                        [int(c)-1],
-                        layer_idx=l_idx,
-                        layer_op=l_op,
-                        op='mean',
-                        stack_groups_path=stack_groups_path
-                    )
-                     
-                    if res:
-                        _display_ts_window(res, f"{pollutant} Time Series Cell ({r}, {c})")
-                        self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
-                     
-                except Exception as e:
-                    logging.error(f"Click handler failed: {e}")
-             
-            ts_click_handler = _on_click
-
-        local_ax.set_title("\n".join(title_lines))
-        # Install hover/status text formatter with emission values and WGS84 lon/lat
-        try:
-            # Initialize current values for hover lookup (NetCDF animation support)
-            local_ax._smk_current_vals = merged_plot[pollutant].values
-            self._setup_hover(merged_plot, pollutant, ax=local_ax, lonlat_transformer=tf_inv)
-        except Exception:
-            pass
-        # Install rectangle zoom handlers (left-drag zoom in, right-drag zoom out) for this window
-        try:
-            import matplotlib.patches as mpatches
-            rect = mpatches.Rectangle((0, 0), 0, 0, fill=False, ec='red', lw=1.2, zorder=9999)
-            local_ax.add_patch(rect)
-            rect.set_visible(False)
-            zoom_press = {'state': None}
-            def on_press(event):
-                if event.inaxes != local_ax:
-                    return
-                if event.button not in (1, 3):
-                    return
-                try:
-                    if getattr(toolbar, 'mode', '') == 'pan/zoom':
-                        return
-                except Exception:
-                    pass
-                zoom_press['state'] = (event.xdata, event.ydata, event.button)
-                rect.set_edgecolor('red' if event.button == 1 else 'blue')
-                rect.set_linestyle('-')
-                rect.set_linewidth(1.2)
-                rect.set_visible(True)
-                rect.set_xy((event.xdata, event.ydata))
-                rect.set_width(0)
-                rect.set_height(0)
-                local_fig.canvas.draw_idle()
-            def on_motion(event):
-                st = zoom_press['state']
-                if st is None or event.inaxes != local_ax or event.xdata is None or event.ydata is None:
-                    return
-                try:
-                    if getattr(toolbar, 'mode', ''):
-                        return
-                except Exception:
-                    pass
-                x0, y0, btn = st
-                x1, y1 = event.xdata, event.ydata
-                xmin, xmax = sorted([x0, x1])
-                ymin, ymax = sorted([y0, y1])
-                rect.set_xy((xmin, ymin))
-                rect.set_width(max(0.0, xmax - xmin))
-                rect.set_height(max(0.0, ymax - ymin))
-                local_fig.canvas.draw_idle()
-            def on_release(event):
-                st = zoom_press['state']
-                if st is None:
-                    return
-                try:
-                    if getattr(toolbar, 'mode', '') == 'pan/zoom':
-                        rect.set_visible(False)
-                        local_fig.canvas.draw_idle()
-                        zoom_press['state'] = None
-                        return
-                except Exception:
-                    pass
-                x0, y0, btn = st
-                # Accept release even if outside the axes; use rectangle extents
-                if event.inaxes == local_ax and event.xdata is not None and event.ydata is not None:
-                    x1, y1 = event.xdata, event.ydata
-                else:
-                    try:
-                        x1 = rect.get_x() + rect.get_width()
-                        y1 = rect.get_y() + rect.get_height()
-                    except Exception:
-                        x1, y1 = x0, y0
-                xmin, xmax = sorted([x0, x1])
-                ymin, ymax = sorted([y0, y1])
-                rect.set_visible(False)
-                local_fig.canvas.draw_idle()
-                zoom_press['state'] = None
-                if abs(xmax - xmin) < 1e-12 or abs(ymax - ymin) < 1e-12:
-                    if ts_click_handler:
-                        ts_click_handler(event)
-                    return
-                try:
-                    toolbar.push_current()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                if btn == 1:
-                    local_ax.set_xlim(xmin, xmax)
-                    local_ax.set_ylim(ymin, ymax)
-                else:
-                    cur_xmin, cur_xmax = local_ax.get_xlim()
-                    cur_ymin, cur_ymax = local_ax.get_ylim()
-                    cur_w = max(1e-12, cur_xmax - cur_xmin)
-                    cur_h = max(1e-12, cur_ymax - cur_ymin)
-                    box_w = max(1e-12, xmax - xmin)
-                    box_h = max(1e-12, ymax - ymin)
-                    sx = min(10.0, max(1e-6, box_w / cur_w))
-                    sy = min(10.0, max(1e-6, box_h / cur_h))
-                    s = min(sx, sy)
-                    new_w = cur_w / s
-                    new_h = cur_h / s
-                    cx = 0.5 * (xmin + xmax)
-                    cy = 0.5 * (ymin + ymax)
-                    # Clamp against base view if available
-                    try:
-                        (bx0, bx1), (by0, by1) = base_view
-                        base_w = max(1e-12, bx1 - bx0)
-                        base_h = max(1e-12, by1 - by0)
-                        if new_w >= base_w or new_h >= base_h:
-                            local_ax.set_xlim(bx0, bx1)
-                            local_ax.set_ylim(by0, by1)
-                        else:
-                            x0_new = min(max(bx0, cx - new_w / 2.0), bx1 - new_w)
-                            y0_new = min(max(by0, cy - new_h / 2.0), by1 - new_h)
-                            local_ax.set_xlim(x0_new, x0_new + new_w)
-                            local_ax.set_ylim(y0_new, y0_new + new_h)
-                    except Exception:
-                        local_ax.set_xlim(cx - new_w / 2.0, cx + new_w / 2.0)
-                        local_ax.set_ylim(cy - new_h / 2.0, cy + new_h / 2.0)
-                local_fig.canvas.draw_idle()
-        except Exception:
-            pass
-        # Connect the handlers to the canvas so zoom works
-        try:
-            cid_press = canvas.mpl_connect('button_press_event', on_press)
-            cid_move = canvas.mpl_connect('motion_notify_event', on_motion)
-            cid_release = canvas.mpl_connect('button_release_event', on_release)
-            # Store cids on the window for cleanup
-            try:
-                setattr(win, '_zoom_cids', [cid_press, cid_move, cid_release])
-            except Exception:
-                pass
-            # Ensure we disconnect on close to avoid leaks
-            def _on_plot_close():
-                # Disconnect zoom event handlers and destroy window
-                try:
-                    for cid in getattr(win, '_zoom_cids', []) or []:
-                        try:
-                            canvas.mpl_disconnect(cid)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
-                    artists = getattr(local_ax, '_smk_graticule_artists', None)
-                    if isinstance(artists, dict):
-                        for key in ('lines', 'texts'):
-                            for art in artists.get(key, []) or []:
-                                try:
-                                    art.remove()
-                                except Exception:
-                                    pass
-                    local_ax._smk_graticule_artists = {'lines': [], 'texts': []}  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                try:
-                    for cid in getattr(local_ax, '_smk_graticule_cids', []) or []:
-                        try:
-                            local_ax.callbacks.disconnect(cid)
-                        except Exception:
-                            pass
-                    local_ax._smk_graticule_cids = []  # type: ignore[attr-defined]
-                    local_ax._smk_graticule_callback = None  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                try:
-                    win.destroy()
-                except Exception:
-                    pass
-            try:
-                win.protocol("WM_DELETE_WINDOW", _on_plot_close)
-            except Exception:
-                pass
-            # Use the plotted GeoDataFrame (in projected CRS when applicable)
-            gdf_for_stats = merged_plot
-            prepared_for_stats = merged.attrs.get('__prepared_emis') if hasattr(merged, 'attrs') else None
-            merge_key_name = merged.attrs.get('__merge_key') if hasattr(merged, 'attrs') else None
-            # Determine if fill was applied
-            fill_active = False
-            try:
-                if getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get():
-                    fill_active = True
-                else:
-                    arg = getattr(self, 'fill_nan_arg', None)
-                    if arg is not None and str(arg).lower() != 'false':
-                        fill_active = True
-            except Exception:
-                pass
-
-            if (
-                not fill_active
-                and isinstance(prepared_for_stats, pd.DataFrame)
-                and isinstance(merge_key_name, str)
-                and merge_key_name in prepared_for_stats.columns
-            ):
-                stats_source = prepared_for_stats
-            else:
-                stats_source = merged
-                prepared_for_stats = None
-                merge_key_name = None
-            pol = pollutant
-            unit = None
-            try:
-                unit = self.units_map.get(pol)
-            except Exception:
-                unit = None
-            # stats_text created earlier
-
-            def _calc_stats(raw_values):
-                if raw_values is None:
-                    return None
-                series = raw_values if isinstance(raw_values, pd.Series) else pd.Series(raw_values)
-                numeric = pd.to_numeric(series, errors='coerce').dropna()
-                if numeric.empty:
-                    return None
-                arr = numeric.to_numpy(dtype=float, copy=False)
-                return (
-                    float(arr.min()),
-                    float(arr.mean()),
-                    float(arr.max()),
-                    float(arr.sum()),
-                )
-
-            def _format_stats(stats_tuple):
-                def _fmt(value):
-                    return f"{value:.4g}" if np.isfinite(value) else "--"
-
-                if stats_tuple is None:
-                    base = "Min: --  Mean: --  Max: --  Sum: --"
-                else:
-                    vmin, vmean, vmax, vsum = stats_tuple
-                    base = (
-                        f"Min: {_fmt(vmin)}  Mean: {_fmt(vmean)}  "
-                        f"Max: {_fmt(vmax)}  Sum: {_fmt(vsum)}"
-                    )
-                if unit:
-                    return f"{base} {unit}"
+                if best_parts:
+                    return " | ".join(best_parts)
+                return base
+            except Exception as e:
                 return base
 
-            try:
-                global_series = stats_source[pol]
-            except Exception:
-                global_series = None
-            global_stats = _calc_stats(global_series)
-            base_view_holder: Dict[str, Optional[Tuple[Tuple[float, float], Tuple[float, float]]]] = {'limits': None}
+        # 4. Apply to axis
+        target_ax.format_coord = _fmt
 
-            def _view_matches_base(xlim, ylim, tol=1e-6):
-                base = base_view_holder.get('limits')
-                if base is None:
-                    return True
-                (bx0, bx1), (by0, by1) = base
-                return (
-                    abs(xlim[0] - bx0) <= tol * max(1.0, abs(bx0)) and
-                    abs(xlim[1] - bx1) <= tol * max(1.0, abs(bx1)) and
-                    abs(ylim[0] - by0) <= tol * max(1.0, abs(by0)) and
-                    abs(ylim[1] - by1) <= tol * max(1.0, abs(by1))
-                )
-
-            def _update_stats_for_view():
-                if global_stats is None:
-                    stats_text.set_text(_format_stats(None))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                xlim = local_ax.get_xlim()
-                ylim = local_ax.get_ylim()
-                if base_view_holder['limits'] is None:
-                    base_view_holder['limits'] = (xlim, ylim)
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                if _view_matches_base(xlim, ylim):
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                try:
-                    from shapely.geometry import box as _box
-                except Exception:
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                if not (xlim[0] < xlim[1] and ylim[0] < ylim[1]):
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                bbox_geom = _box(min(xlim), min(ylim), max(xlim), max(ylim))
-                try:
-                    sidx = gdf_for_stats.sindex
-                except Exception:
-                    sidx = None
-                if sidx is not None:
-                    try:
-                        idx = list(sidx.intersection(bbox_geom.bounds))
-                        sub = gdf_for_stats.iloc[idx]
-                    except Exception:
-                        sub = gdf_for_stats
-                else:
-                    sub = gdf_for_stats
-                try:
-                    sub = sub[sub.geometry.intersects(bbox_geom)]
-                except Exception:
-                    pass
-                subset_values = None
-                if (
-                    prepared_for_stats is not None
-                    and merge_key_name
-                    and hasattr(sub, 'columns')
-                    and merge_key_name in sub.columns
-                    and merge_key_name in prepared_for_stats.columns
-                ):
-                    try:
-                        keys = sub[merge_key_name]
-                        keys = keys[keys.notna()]
-                        if not keys.empty:
-                            subset_values = prepared_for_stats.loc[
-                                prepared_for_stats[merge_key_name].isin(keys.unique()),
-                                pol,
-                            ]
-                    except Exception:
-                        subset_values = None
-                if subset_values is None:
-                    if sub is not None and hasattr(sub, 'index'):
-                        try:
-                            subset_values = merged.loc[sub.index, pol]
-                        except Exception:
-                            try:
-                                subset_values = sub.get(pol) if hasattr(sub, 'get') else None
-                            except Exception:
-                                subset_values = None
-                    elif sub is not None and hasattr(sub, 'get'):
-                        subset_values = sub.get(pol)
-                subset_stats = _calc_stats(subset_values)
-                if subset_stats is None:
-                    subset_stats = global_stats
-                stats_text.set_text(_format_stats(subset_stats))
-                try:
-                    local_fig.canvas.draw_idle()
-                except Exception:
-                    pass
-            # Connect to axis limit changes
-            # Connect to axis limit changes
-            plot_state['stats_cbids'] = []
-            try:
-                plot_state['stats_cbids'].append(local_ax.callbacks.connect('xlim_changed', lambda ax: _update_stats_for_view()))
-            except Exception:
-                pass
-            try:
-                plot_state['stats_cbids'].append(local_ax.callbacks.connect('ylim_changed', lambda ax: _update_stats_for_view()))
-            except Exception:
-                pass
-            # Run once initially
-            _update_stats_for_view()
-        except Exception:
-            pass
-        # Finalize window title
-        try:
-            if src:
-                win.title(f"Map: {pollutant} • {src}")
-            else:
-                win.title(f"Map: {pollutant}")
-        except Exception:
-            pass
+    def _install_box_zoom(self, ax: plt.Axes):
+        """Install interactive box zoom handles with proper connection management."""
+        # 1. Cleanup old connections to prevent accumulation/interference
+        if hasattr(self, '_zoom_cids'):
+            for cid in self._zoom_cids:
+                self.canvas.mpl_disconnect(cid)
+        self._zoom_cids = []
         
-        self._set_status("Plot complete.", level="INFO")
+        self._zoom_press = None
+        self._zoom_rect = mpatches.Rectangle((0, 0), 0, 0, fill=False, ec='red', lw=1.2, zorder=9999)
+        ax.add_patch(self._zoom_rect)
+        self._zoom_rect.set_visible(False)
+        
+        def on_press(event):
+            if not event.inaxes or event.inaxes != ax: return
+            if self.toolbar and self.toolbar.mode: return
+            if event.button not in (1, 3): return 
+            self._zoom_press = (event.xdata, event.ydata, event.button)
+
+        def on_motion(event):
+            if self._zoom_press is None or event.inaxes != ax: return
+            x0, y0, btn = self._zoom_press
+            x1, y1 = event.xdata, event.ydata
+            xmin, xmax = sorted([x0, x1])
+            ymin, ymax = sorted([y0, y1])
+            self._zoom_rect.set_xy((xmin, ymin))
+            self._zoom_rect.set_width(xmax - xmin)
+            self._zoom_rect.set_height(ymax - ymin)
+            self._zoom_rect.set_visible(True)
+            self.canvas.draw_idle()
+
+        def on_release(event):
+            if self._zoom_press is None: return
+            # IMPORTANT: Verify this event belongs to THIS axes to prevent stealing events from active plot
+            if event.inaxes != ax and event.inaxes is not None: return
+            
+            x0, y0, btn = self._zoom_press
+            x1, y1 = event.xdata, event.ydata
+            if x1 is None: x1, y1 = x0, y0 
+            
+            self._zoom_press = None
+            self._zoom_rect.set_visible(False)
+            
+            dist = np.hypot(x1 - x0, y1 - y0)
+            if dist < (ax.get_xlim()[1] - ax.get_xlim()[0]) * 0.01:
+                 if btn == 1:
+                      self._handle_cell_click(x0, y0)
+                 self.canvas.draw_idle()
+                 return
+
+            xmin, xmax = sorted([x0, x1])
+            ymin, ymax = sorted([y0, y1])
+            if abs(xmax - xmin) < 1e-6 or abs(ymax - ymin) < 1e-6:
+                self.canvas.draw_idle()
+                return
+
+            if btn == 1: # Zoom In
+                try:
+                    self.toolbar.push_current()
+                    ax.set_xlim(xmin, xmax)
+                    ax.set_ylim(ymin, ymax)
+                except: pass
+            else: # Zoom Out (Clamped logic from gui_qt.py)
+                try:
+                    cur_w = ax.get_xlim()[1] - ax.get_xlim()[0]
+                    cur_h = ax.get_ylim()[1] - ax.get_ylim()[0]
+                    box_w = xmax - xmin
+                    box_h = ymax - ymin
+                    
+                    s = min(box_w / cur_w, box_h / cur_h)
+                    if s < 1e-6: s = 0.1 
+                    
+                    new_w = cur_w / s
+                    new_h = cur_h / s
+                    cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
+                    
+                    if hasattr(self, '_base_view') and self._base_view:
+                        (bx0, bx1), (by0, by1) = self._base_view
+                        bw, bh = bx1 - bx0, by1 - by0
+                        if new_w >= bw or new_h >= bh:
+                            self.toolbar.push_current()
+                            ax.set_xlim(bx0, bx1); ax.set_ylim(by0, by1)
+                            self.canvas.draw_idle()
+                            return
+                    
+                    self.toolbar.push_current()
+                    ax.set_xlim(cx - new_w/2, cx + new_w/2)
+                    ax.set_ylim(cy - new_h/2, cy + new_h/2)
+                except: pass
+            
+            self.canvas.draw_idle()
+            if self.toolbar:
+                if hasattr(self.toolbar, 'set_history_buttons'):
+                    self.toolbar.set_history_buttons()
+                elif hasattr(self.toolbar, 'update'):
+                    self.toolbar.update()
+
+        # Connect and store CIDs for future cleanup
+        self._zoom_cids.append(self.canvas.mpl_connect('button_press_event', on_press))
+        self._zoom_cids.append(self.canvas.mpl_connect('motion_notify_event', on_motion))
+        self._zoom_cids.append(self.canvas.mpl_connect('button_release_event', on_release))
+        self._zoom_cids.append(self.canvas.mpl_connect('motion_notify_event', self._on_canvas_motion))
+
+    def _update_stats_panel(self, gdf, col):
+        """Update the side-panel stats after plotting."""
+        try:
+            vals = pd.to_numeric(gdf[col], errors='coerce').dropna()
+            if not vals.empty:
+                self.lbl_stats_sum.setText(f"{vals.sum():.4g}")
+                self.lbl_stats_max.setText(f"{vals.max():.4g}")
+                self.lbl_stats_mean.setText(f"{vals.mean():.4g}")
+                self.lbl_stats_count.setText(str(len(vals)))
+            else:
+                for w in [self.lbl_stats_sum, self.lbl_stats_max, self.lbl_stats_mean, self.lbl_stats_count]:
+                    w.setText("-")
+        except:
+            for w in [self.lbl_stats_sum, self.lbl_stats_max, self.lbl_stats_mean, self.lbl_stats_count]:
+                w.setText("Error")
+
+    def show_metadata(self):
+        """Show raw metadata popup."""
+        if self.emissions_df is not None:
+             MetadataWindow(self.emissions_df, self).exec()
+
+    def show_detailed_stats(self):
+        """Show detailed pollutant statistics popup."""
+        pol = self.cmb_pollutant.currentText()
+        if not pol:
+            QMessageBox.warning(self, "No Pollutant", "Please select a pollutant first.")
+            return
+        if self.emissions_df is not None:
+             DetailedStatsWindow(self.emissions_df, pol, self).exec()
+
+    def _filter_scc_list(self, text):
+        """Filter the SCC ComboBox list based on search text."""
+        if not hasattr(self, '_scc_full_list') or not self._scc_full_list:
+            items = [self.cmb_scc.itemText(i) for i in range(self.cmb_scc.count())]
+            self._scc_full_list = items
+        
+        self.cmb_scc.blockSignals(True)
+        self.cmb_scc.clear()
+        query = text.lower()
+        filtered = [it for it in self._scc_full_list if query in it.lower()]
+        if not filtered:
+             filtered = ["All SCC"]
+        self.cmb_scc.addItems(filtered)
+        self.cmb_scc.blockSignals(False)
+
+    def _filter_pollutant_list(self, text):
+        """Filter the Pollutant ComboBox based on search text."""
+        if not hasattr(self, '_full_pollutant_list'):
+            self._full_pollutant_list = [self.cmb_pollutant.itemText(i) for i in range(self.cmb_pollutant.count())]
+        
+        current = self.cmb_pollutant.currentText()
+        self.cmb_pollutant.blockSignals(True)
+        self.cmb_pollutant.clear()
+        
+        query = text.lower()
+        matches = [p for p in self._full_pollutant_list if query in p.lower()]
+        if not matches:
+            matches = self._full_pollutant_list
+            
+        self.cmb_pollutant.addItems(matches)
+        
+        idx = self.cmb_pollutant.findText(current)
+        if idx >= 0:
+            self.cmb_pollutant.setCurrentIndex(idx)
+        
+        self.cmb_pollutant.blockSignals(False)
+
+    def save_plot(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Plot", "", "PNG Image (*.png);;PDF (*.pdf)")
+        if path:
+            self.figure.savefig(path, dpi=300)
+            self.status_label.setText(f"Saved to {path}")
+
+    def pop_out_plot(self):
+        """Open current plot in a separate window."""
+        if self._merged_gdf is None:
+            self.notify_signal.emit("WARNING", "No data to pop out.")
+            return
+            
+        p = self.cmb_pollutant.currentText()
+        m = {
+            'cmap': self.cmb_cmap.currentText() + ('_r' if self.chk_rev_cmap.isChecked() else ''),
+            'use_log': self.chk_log.isChecked(),
+            'unit': self.units_map.get(p, ''),
+            'vmin': self.txt_rmin.text() if self.txt_rmin.text() else None,
+            'vmax': self.txt_rmax.text() if self.txt_rmax.text() else None
+        }
+        
+        # Parse bins
+        bt = self.txt_bins.text()
+        m['bins'] = []
+        if bt:
+            try: m['bins'] = [float(x.strip()) for x in bt.split(',')]
+            except: pass
+            
+        win = PlotWindow(self._merged_gdf, p, m, parent=self)
+        if not hasattr(self, '_pop_wins'): self._pop_wins = []
+        self._pop_wins.append(win)
+        win.show()
+
+    def export_data(self):
+        """Export current data to file."""
+        df = self.raw_df if self.raw_df is not None else self.emissions_df
+        if df is None:
+             QMessageBox.warning(self, "No Data", "No data to export.")
+             return
+
+        path, _ = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV Files (*.csv);;GeoPackage (*.gpkg)")
+        if path:
+            try:
+                self.status_label.setText(f"Exporting to {path}...")
+                if path.endswith('.gpkg'):
+                    # Need geometry
+                    if hasattr(df, 'geometry'):
+                        gpd.GeoDataFrame(df).to_file(path, driver="GPKG")
+                    elif self.counties_gdf is not None:
+                         # Try to join? Complex. Just warn.
+                         QMessageBox.warning(self, "Geometry Missing", "Data has no geometry for GPKG. Saving as CSV instead.")
+                         path = path.replace('.gpkg', '.csv')
+                         df.to_csv(path, index=False)
+                    else:
+                        QMessageBox.warning(self, "Error", "Cannot export GPKG without geometry.")
+                        return
+                else:
+                    df.to_csv(path, index=False)
+                self.status_label.setText(f"Exported to {path}")
+                self.notify_signal.emit("INFO", f"Data exported to {path}")
+            except Exception as e:
+                self.notify_signal.emit("ERROR", f"Export failed: {e}")
+
+    def _get_transformers(self, crs):
+        """Get transformers for graticule."""
+        try:
+            if not crs: return None, None
+            # Project to LatLon (4326)
+            tf_inv = pyproj.Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            tf_fwd = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            return tf_fwd, tf_inv
+        except:
+            return None, None
 
     def preview_data(self):
+        """Show a table preview of the current data."""
         if self.emissions_df is None:
-            if self.inputfile_path:
-                self.load_inputfile(show_preview=True)
+            QMessageBox.warning(self, "No Data", "Please load data first.")
+            return
+            
+        # Choice: Raw or Plotted
+        # The original code had 'if self._merged_gdf is not None:' here.
+        # The instruction provided an 'elif plot_kwargs.get('legend'):' which is syntactically incorrect
+        # in this context and refers to a variable not available in this method.
+        # Assuming the intent was to modify the condition for showing the choice dialog,
+        # but without 'plot_kwargs' or a clear replacement, the original logic is kept
+        # for _merged_gdf, as it's the most sensible interpretation given the context.
+        # If the intent was to remove the choice dialog entirely or change its condition
+        # based on an external 'plot_kwargs', more context would be needed.
+        if self._merged_gdf is not None:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Preview Data")
+            msg.setText("Which data would you like to preview?")
+            btn_plot = msg.addButton("Plotted (Filtered/Joined)", QMessageBox.ActionRole)
+            btn_raw = msg.addButton("Raw (Full File)", QMessageBox.ActionRole)
+            msg.addButton(QMessageBox.Cancel)
+            msg.exec()
+            
+            if msg.clickedButton() == btn_plot:
+                df, title = self._merged_gdf, "Plotted Data Preview"
+            elif msg.clickedButton() == btn_raw:
+                df, title = self.emissions_df, "Raw Data Preview"
+            else:
                 return
-            self._notify('INFO', 'No Data', 'Load a SMOKE report / FF10 input file first to preview.')
-            return
-        # Select the raw parsed dataset (pre-filter, pre-aggregation) if available
-        df_for_info = self._get_raw_for_summary()
-        
-        # Update the legacy text box with columns for quick glance (from raw dataset if present)
-        try:
-            # Only display original input columns, hiding derived columns such as FIPS/GRID_RC
-            try:
-                orig_cols = self.emissions_df.attrs.get('original_columns')  # type: ignore[attr-defined]
-            except Exception:
-                orig_cols = None
-            cols_iter = [c for c in (orig_cols or list(df_for_info.columns)) if c in df_for_info.columns]
-            buf = io.StringIO()
-            buf.write("Report Columns (original only; units shown when available)\n")
-            cols_with_units = []
-            for c in cols_iter:
-                unit = self.units_map.get(c)
-                if unit:
-                    cols_with_units.append(f"{c} ({unit})")
-                else:
-                    cols_with_units.append(str(c))
-            buf.write(", ".join(cols_with_units))
-            self.preview.delete('1.0', tk.END)
-            self.preview.insert(tk.END, buf.getvalue())
-            meta_text = self._last_attrs_summary or self._format_attrs_for_display(self.emissions_df)
-            if meta_text:
-                self.preview.insert(tk.END, "\n\nAttributes\n")
-                self.preview.insert(tk.END, meta_text)
-            self._append_loader_messages_to_preview()
-            self._preview_has_data = True
-        except Exception:
-            pass
-        # Open a popup window with a tabular view
-        try:
-            # Pass the raw df; the popup will filter to original columns as well
-            self._open_preview_window(raw=df_for_info)
-        except Exception as e:
-            self._notify('ERROR', 'Preview Error', f'Failed to open preview table: {e}', exc=e)
-
-    def _open_preview_window(self, raw: Optional[pd.DataFrame] = None):
-        if not USING_TK:
-            return
-        df = raw if isinstance(raw, pd.DataFrame) else self.emissions_df
-        if df is None:
-            return
-        # Restrict to only original input columns if available
-        try:
-            orig_cols = self.emissions_df.attrs.get('original_columns') if self.emissions_df is not None else None  # type: ignore[attr-defined]
-            if isinstance(orig_cols, (list, tuple)) and orig_cols:
-                keep_cols = [c for c in orig_cols if c in df.columns]
-                if keep_cols:
-                    df = df[keep_cols]
-        except Exception:
-            pass
-        # Close existing preview if open
-        if self._preview_win is not None:
-            try:
-                self._preview_win.destroy()
-            except Exception:
-                pass
-            self._preview_win = None
-        win = tk.Toplevel(self.root)
-        win.title("Data Preview (first 200 rows)")
-        try:
-            # Base size ~1000x480 scaled
-            base_w, base_h = 1000, 480
-            w = int(max(800, min(1800, base_w * getattr(self, '_ui_scale', 1.0))))
-            h = int(max(420, min(1200, base_h * getattr(self, '_ui_scale', 1.0))))
-            win.geometry(f"{w}x{h}")
-            try:
-                self.root.minsize(800, 500)
-            except Exception:
-                pass
-        except Exception:
-            win.geometry("1000x480")
-        self._preview_win = win
-        def _on_close():
-            try:
-                win.destroy()
-            finally:
-                self._preview_win = None
-        win.protocol("WM_DELETE_WINDOW", _on_close)
-
-        # Top info label
-        info = ttk.Label(win, text=f"Rows: {len(df):,}    Columns: {len(df.columns):,}")
-        info.pack(side='top', anchor='w', padx=8, pady=4)
-
-        # Summary controls frame
-        sumfrm = ttk.Frame(win)
-        sumfrm.pack(side='top', fill='x', padx=8, pady=(0, 6))
-        ttk.Label(sumfrm, text='Summarize by:').pack(side='left')
-        self.summary_group_var = tk.StringVar(value='county')
-        # Options: county (FIPS), state (STATEFP from FIPS), scc (SCC), grid (GRID_RC)
-        group_choices = ['county', 'state', 'scc', 'grid']
-        self.summary_group_combo = ttk.Combobox(sumfrm, textvariable=self.summary_group_var, values=group_choices, width=12, state='readonly')
-        self.summary_group_combo.pack(side='left', padx=(6, 12))
-        ttk.Button(sumfrm, text='Preview Summary', command=lambda: self._on_preview_summary()).pack(side='left', padx=(0, 6))
-        ttk.Button(sumfrm, text='Export CSV', command=lambda: self._on_export_summary()).pack(side='left')
-
-        # Frame for tree + scrollbars
-        frm = ttk.Frame(win)
-        frm.pack(side='top', fill='both', expand=True)
-        frm.rowconfigure(0, weight=1)
-        frm.columnconfigure(0, weight=1)
-
-        # Treeview setup
-        columns = [str(c) for c in df.columns]
-        tree = ttk.Treeview(frm, columns=columns, show='headings')
-        vsb = ttk.Scrollbar(frm, orient='vertical', command=tree.yview)
-        hsb = ttk.Scrollbar(frm, orient='horizontal', command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        tree.grid(row=0, column=0, sticky='nsew')
-        vsb.grid(row=0, column=1, sticky='ns')
-        hsb.grid(row=1, column=0, sticky='ew')
-
-        # Get column headers with units (fix: avoid duplicate names)
-        units_map = getattr(df, 'attrs', {}).get('units_map', {})
-        columns_with_units = []
-        for c in columns:
-            unit = units_map.get(c, None)
-            # Only append units for pollutant columns, and only if not already present
-            if unit and c not in ('STATEFP', 'STATE_NAME', 'FIPS', 'GRID_RC', 'SCC', 'SCC_DESCRIPTION') and unit not in c:
-                columns_with_units.append(f"{c} ({unit})")
-            else:
-                columns_with_units.append(c)
-        
-        # Determine reasonable column widths from a sample
-        sample = df.head(200)
-        def _fmt_cell(v):
-            if pd.isna(v):
-                return ""
-            if isinstance(v, float):
-                try:
-                    return f"{v:.6g}"
-                except Exception:
-                    return str(v)
-            return str(v)
-        # Precompute width per column
-        max_len = {}
-        for c, c_unit in zip(columns, columns_with_units):
-            header_len = len(c_unit)
-            cell_max = header_len
-            try:
-                for v in sample[c].head(50):
-                    cell_max = max(cell_max, len(_fmt_cell(v)))
-            except Exception:
-                pass
-            max_len[c] = min(60, max(8, cell_max))  # char units
-        # Configure headings and widths
-        for c, c_unit in zip(columns, columns_with_units):
-            tree.heading(c, text=c_unit)
-            width_px = int(max_len[c] * 8 + 20)
-            anchor = 'e' if pd.api.types.is_numeric_dtype(df[c]) else 'w'
-            tree.column(c, width=width_px, anchor=anchor, stretch=True, minwidth=60)
-
-        # Insert rows
-        for i, (_, row) in enumerate(sample.iterrows()):
-            values = [_fmt_cell(row[c]) for c in columns]
-            tree.insert('', 'end', iid=str(i), values=values)
-
-    def _get_raw_for_summary(self) -> Optional[pd.DataFrame]:
-        try:
-            if isinstance(self.raw_df, pd.DataFrame):
-                return self.raw_df
-            return self.emissions_df
-        except Exception:
-            return self.emissions_df
-
-    def _ensure_ff10_grid_mapping(self, *, notify_success: bool = True) -> None:
-        """Populate GRID_RC for FF10 point datasets once grid geometry is available."""
-        if not (self._ff10_ready and isinstance(self.emissions_df, pd.DataFrame)):
-            return
-        if self.grid_gdf is None or not isinstance(self.grid_gdf, gpd.GeoDataFrame):
-            return
-        if self._ff10_grid_ready:
-            return
-        try:
-            mapped = map_latlon2grd(self.emissions_df, self.grid_gdf)
-        except ValueError as exc:
-            self._notify('WARNING', 'FF10 Grid Mapping', str(exc))
-            return
-        except Exception as exc:
-            self._notify('ERROR', 'FF10 Grid Mapping Failed', str(exc), exc=exc)
-            return
-
-        if not isinstance(mapped, pd.DataFrame) or 'GRID_RC' not in mapped.columns:
-            self._notify('WARNING', 'FF10 Grid Mapping', 'Failed to assign GRID_RC values to FF10 points.')
-            return
-
-        self.emissions_df = mapped
-        if isinstance(self.raw_df, pd.DataFrame):
-            try:
-                self.raw_df = map_latlon2grd(self.raw_df, self.grid_gdf)
-            except Exception:
-                # best-effort for raw preview; failures are non-critical here
-                pass
-        self._ff10_grid_ready = True
-        self._invalidate_merge_cache()
-        if notify_success:
-            self._notify('INFO', 'FF10 Grid Mapping', 'Mapped FF10 point records to grid cells.', popup=False)
-
-    def _build_summary(self, mode: str) -> pd.DataFrame:
-        raw = self._get_raw_for_summary()
-        if raw is None or not isinstance(raw, pd.DataFrame):
-            raise ValueError('No data available to summarize.')
-        # Determine pollutant columns from the raw dataframe
-        try:
-            pols = detect_pollutants(raw)
-        except Exception:
-            pols = [c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])]
-        if not pols:
-            raise ValueError('No pollutant numeric columns to summarize.')
-        lower_map = {c.lower(): c for c in raw.columns}
-        mode_l = (mode or '').strip().lower()
-        group_cols: List[str] = []
-        # Prepare optional name enrichment columns
-        add_cols: Dict[str, pd.Series] = {}
-        # County
-        source_type = None
-        try:
-            if isinstance(self.emissions_df, pd.DataFrame):
-                source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type')
-        except Exception:
-            source_type = None
-        if mode_l == 'county':
-            if 'fips' in lower_map:
-                key = lower_map['fips']
-            elif 'region_cd' in lower_map:
-                key = lower_map['region_cd']
-            else:
-                raise ValueError("Cannot summarize by county: Missing FIPS/region_cd column.")
-            group_cols = [key]
-            # Derive STATEFP and names when possible
-            try:
-                fips_series = raw[key].astype(str).str.zfill(6)
-                add_cols['COUNTRY_ID'] = fips_series.str[0]
-                add_cols['STATEFP'] = fips_series.str[1:3]
-                add_cols['STATE_NAME'] = add_cols['STATEFP'].map(US_STATE_FIPS_TO_NAME)
-            except Exception:
-                pass
-            # If COUNTY or COUNTY_NAME column exists in input, carry a representative name per FIPS
-            try:
-                county_name_col = lower_map.get('county name') or lower_map.get('county')
-                if county_name_col and county_name_col in raw.columns:
-                    # Take the most frequent name per FIPS to avoid duplicates
-                    tmp_cn = raw[[key, county_name_col]].copy()
-                    # Simple approach: first non-null per FIPS
-                    name_map = tmp_cn.dropna(subset=[county_name_col]).drop_duplicates(subset=[key]).set_index(key)[county_name_col]
-                    add_cols['COUNTY_NAME'] = raw[key].map(name_map)
-            except Exception:
-                pass
-        # State (from first two digits of FIPS)
-        elif mode_l == 'state':
-            fips_col = None
-            if 'fips' in lower_map:
-                fips_col = lower_map['fips']
-            elif 'region_cd' in lower_map:
-                fips_col = lower_map['region_cd']
-            if not fips_col or fips_col not in raw.columns:
-                raise ValueError("Cannot summarize by state: FIPS/region_cd not available to derive STATEFP.")
-            tmp = raw.copy()
-            # FIPS is typically 6 digits (C+SS+CCC). We want SS (chars 1-3).
-            # If it happens to be 5 digits (SSCCC), zfill(6) -> 0SSCCC, so 1-3 is still SS.
-            tmp['STATEFP'] = tmp[fips_col].astype(str).str.strip().str.zfill(6).str[1:3]
-            group_cols = ['STATEFP']
-            raw = tmp
-            # Add state name
-            try:
-                raw['STATE_NAME'] = raw['STATEFP'].map(US_STATE_FIPS_TO_NAME)
-                add_cols['STATE_NAME'] = raw['STATE_NAME']
-            except Exception:
-                pass
-        # SCC (optionally with description)
-        elif mode_l == 'scc':
-            scc_col = lower_map.get('scc')
-            if not scc_col:
-                raise ValueError("Cannot summarize by SCC: 'SCC' column not found.")
-            desc_col = lower_map.get('scc description')
-            # Ensure SCC and optional description are treated as strings
-            try:
-                raw[scc_col] = raw[scc_col].astype(str)
-            except Exception:
-                pass
-            if desc_col and desc_col in raw.columns:
-                try:
-                    raw[desc_col] = raw[desc_col].astype(str)
-                except Exception:
-                    pass
-            group_cols = [scc_col] + ([desc_col] if desc_col and desc_col in raw.columns else [])
-        # Grid: summarize by pair (X Cell, Y Cell), not by GRID_RC
-        elif mode_l == 'grid':
-            self._ensure_ff10_grid_mapping(notify_success=False)
-            xcell_col = lower_map.get('x cell')
-            ycell_col = lower_map.get('y cell')
-            if xcell_col in raw.columns and ycell_col in raw.columns:
-                # Use existing X/Y Cell columns; ensure standardized names for output
-                tmp = raw.copy()
-                try:
-                    tmp['X Cell'] = pd.to_numeric(tmp[xcell_col], errors='coerce').astype('Int64')
-                    tmp['Y Cell'] = pd.to_numeric(tmp[ycell_col], errors='coerce').astype('Int64')
-                except Exception:
-                    tmp['X Cell'] = tmp[xcell_col]
-                fips_series = raw[fips_col].astype(str).str.zfill(6)
-                add_cols['COUNTRY_ID'] = fips_series.str[0]
-                add_cols['STATEFP'] = fips_series.str[1:3]
-                group_cols = ['X Cell', 'Y Cell']
-            elif 'GRID_RC' in raw.columns:
-                # Parse GRID_RC into X/Y Cell integers
-                tmp = raw.copy()
-                try:
-                    parts = tmp['GRID_RC'].astype(str).str.split('_', n=1, expand=True)
-                    tmp['ROW'] = pd.to_numeric(parts[0], errors='coerce').astype('Int64')
-                    tmp['COL'] = pd.to_numeric(parts[1], errors='coerce').astype('Int64')
-                except Exception:
-                    # Fallback to strings if parsing failed
-                    tmp['ROW'] = parts[0] if 'parts' in locals() else ''
-                    tmp['COL'] = parts[1] if 'parts' in locals() else ''
-                # Standardize to X/Y Cell output labels
-                tmp['X Cell'] = tmp['COL']
-                tmp['Y Cell'] = tmp['ROW']
-                raw = tmp
-                group_cols = ['X Cell', 'Y Cell']
-            elif lower_map.get('row') in raw.columns and lower_map.get('col') in raw.columns:
-                # Use ROW/COL but present as X/Y Cell
-                rcol = lower_map.get('row')
-                ccol = lower_map.get('col')
-                tmp = raw.copy()
-                try:
-                    tmp['X Cell'] = pd.to_numeric(tmp[ccol], errors='coerce').astype('Int64')
-                    tmp['Y Cell'] = pd.to_numeric(tmp[rcol], errors='coerce').astype('Int64')
-                except Exception:
-                    tmp['X Cell'] = tmp[ccol]
-                    tmp['Y Cell'] = tmp[rcol]
-                raw = tmp
-                group_cols = ['X Cell', 'Y Cell']
-            else:
-                raise ValueError("Cannot summarize by grid: need X Cell/Y Cell, GRID_RC, or ROW/COL.")
         else:
-            raise ValueError(f"Unknown summarize mode: {mode}")
-        # Perform aggregation
-        cols = [c for c in group_cols if c in raw.columns]
-        if not cols:
-            raise ValueError('No valid grouping columns available.')
-        subset = raw[cols + pols]
-        try:
-            grouped = subset.groupby(cols, dropna=False, sort=False)
-        except TypeError:
-            grouped = subset.groupby(cols, sort=False)
-        out = grouped.sum(numeric_only=True).reset_index()
-        # Append enrichment columns if present
-        try:
-            for name, series in add_cols.items():
-                if name not in out.columns and series is not None:
-                    # reduce to one value per group by taking first matching value
-                    # build mapping from grouping key(s) to name
-                    if len(cols) == 1:
-                        m = raw[[cols[0]]].assign(__val=series).drop_duplicates(subset=[cols[0]]).set_index(cols[0])['__val']
-                        out[name] = out[cols[0]].map(m)
-                    else:
-                        # For multi-key groups (e.g., SCC+desc), skip enrichment here
-                        pass
-        except Exception:
-            pass
-        # County-mode specific cleanup and ordering
-        if mode_l == 'county':
-            # Normalize key column to 'FIPS'
-            key_col = cols[0] if cols else None
-            if key_col and key_col in out.columns and key_col != 'FIPS':
-                try:
-                    out = out.rename(columns={key_col: 'FIPS'})
-                except Exception:
-                    pass
-            # Ensure FIPS is 6 characters (e.g. '037001' instead of '37001')
-            if 'FIPS' in out.columns:
-                try:
-                    if 'COUNTRY_ID' in out.columns:
-                        fips_s = out['FIPS'].astype(str)
-                        cid_s = out['COUNTRY_ID'].astype(str)
-                        out['FIPS'] = np.where(fips_s.str.len() == 5, cid_s + fips_s, fips_s.str.zfill(6))
-                    else:
-                        out['FIPS'] = out['FIPS'].astype(str).str.zfill(6)
-                except Exception:
-                    pass
-            # Drop STATEFP if present
-            for drop_col in ['STATEFP']:
-                if drop_col in out.columns:
-                    try:
-                        out = out.drop(columns=[drop_col])
-                    except Exception:
-                        pass
-            # Drop X/Y Cell columns if present (various casings)
-            for c in list(out.columns):
-                cl = str(c).lower()
-                if cl in ('x cell', 'y cell'):
-                    try:
-                        out = out.drop(columns=[c])
-                    except Exception:
-                        pass
-            # Reorder columns: FIPS, STATE_NAME, COUNTY_NAME, then the rest
-            preferred = ['FIPS', 'STATE_NAME', 'COUNTY_NAME']
-            present_pref = [c for c in preferred if c in out.columns]
-            rest = [c for c in out.columns if c not in present_pref]
-            try:
-                out = out[present_pref + rest]
-            except Exception:
-                pass
-    # State-mode specific cleanup and ordering
-        elif mode_l == 'state':
-            # Drop X/Y Cell columns if somehow present
-            for c in list(out.columns):
-                cl = str(c).lower()
-                if cl in ('x cell', 'y cell'):
-                    try:
-                        out = out.drop(columns=[c])
-                    except Exception:
-                        pass
-            # Reorder columns: STATEFP, STATE_NAME, then the rest
-            preferred = ['STATEFP', 'STATE_NAME']
-            present_pref = [c for c in preferred if c in out.columns]
-            rest = [c for c in out.columns if c not in present_pref]
-            try:
-                out = out[present_pref + rest]
-            except Exception:
-                pass
-        # Grid-mode cleanup
-        elif mode_l == 'grid':
-            # Drop GRID_RC if present and keep standardized X/Y Cell columns at the front
-            if 'GRID_RC' in out.columns:
-                try:
-                    out = out.drop(columns=['GRID_RC'])
-                except Exception:
-                    pass
-            preferred = ['X Cell', 'Y Cell']
-            present_pref = [c for c in preferred if c in out.columns]
-            rest = [c for c in out.columns if c not in present_pref]
-            try:
-                out = out[present_pref + rest]
-            except Exception:
-                pass
-        return out
+            df, title = self.emissions_df, "Raw Data Preview"
+            
+        self.preview_win = TableWindow(df, title=title, parent=self)
+        self.preview_win.show()
+
+    def browse_filter_shpfile(self):
+        """Select filter shapefile."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select Shapefile", DEFAULT_SHPFILE_INITIALDIR, "Shapefiles (*.shp *.gpkg *.geojson)")
+        if path:
+            if hasattr(self, 'txt_filter_shp'):
+                 self.txt_filter_shp.setText(path)
+            self._load_filter_shpfile(path)
+
+    def _load_filter_shpfile(self, path):
+         try:
+             # Handle multiple paths
+             file_list = []
+             if isinstance(path, str):
+                 file_list = [p.strip() for p in path.split(';') if p.strip()]
+             elif isinstance(path, (list, tuple)):
+                 for item in path:
+                     if isinstance(item, str):
+                         file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                     else: file_list.append(str(item))
+             else: file_list = [str(path)]
+             
+             if not file_list: return
+             
+             parts = []
+             for f in file_list:
+                 self.status_label.setText(f"Loading filter shape: {os.path.basename(f)}")
+                 gdf = read_shpfile(f)
+                 if gdf is not None and not gdf.empty:
+                     if gdf.crs and gdf.crs.to_epsg() != 4326:
+                         gdf = gdf.to_crs(epsg=4326)
+                     parts.append(gdf)
+             
+             if not parts:
+                 self.filter_gdf = None
+                 return
+                 
+             if len(parts) == 1:
+                 self.filter_gdf = parts[0]
+             else:
+                 # Combine multiple filter shapes
+                 self.filter_gdf = pd.concat(parts, ignore_index=True)
+                 
+             self.notify_signal.emit("INFO", f"Loaded filter shape: {len(self.filter_gdf)} features from {len(parts)} files")
+             self.status_label.setText("Ready")
+         except Exception as e:
+             self.notify_signal.emit("ERROR", f"Failed to load filter shape: {e}")
+
+    def browse_overlay_shpfile(self):
+        """Select overlay shapefile."""
+        path, _ = QFileDialog.getOpenFileName(self, "Select Overlay", DEFAULT_SHPFILE_INITIALDIR, "Shapefiles (*.shp *.gpkg *.geojson)")
+        if path:
+            if hasattr(self, 'txt_overlay_shp'):
+                 self.txt_overlay_shp.setText(path)
+            self._load_overlay_shpfile(path)
+
+    def _load_overlay_shpfile(self, path):
+         try:
+             # Handle multiple paths
+             file_list = []
+             if isinstance(path, str):
+                 file_list = [p.strip() for p in path.split(';') if p.strip()]
+             elif isinstance(path, (list, tuple)):
+                 for item in path:
+                     if isinstance(item, str):
+                         file_list.extend([p.strip() for p in item.split(';') if p.strip()])
+                     else: file_list.append(str(item))
+             else: file_list = [str(path)]
+             
+             if not file_list: return
+             
+             parts = []
+             for f in file_list:
+                 self.status_label.setText(f"Loading overlay: {os.path.basename(f)}")
+                 gdf = read_shpfile(f)
+                 if gdf is not None and not gdf.empty:
+                     if gdf.crs and gdf.crs.to_epsg() != 4326:
+                         gdf = gdf.to_crs(epsg=4326)
+                     parts.append(gdf)
+             
+             if not parts:
+                 self.overlay_gdf = None
+                 return
+                 
+             # Store as list if multiple, plotter handles it
+             self.overlay_gdf = parts if len(parts) > 1 else parts[0]
+             self.notify_signal.emit("INFO", f"Loaded overlay: {len(parts)} files")
+             self.status_label.setText("Ready")
+         except Exception as e:
+             self.notify_signal.emit("ERROR", f"Failed to load overlay: {e}")
 
     def _on_preview_summary(self):
         try:
-            mode = self.summary_group_var.get() if hasattr(self, 'summary_group_var') else 'county'
-            df = self._build_summary(mode)
+            df = self._build_summary()
+            self.sum_win = TableWindow(df, title=f"Summary Preview ({self.cmb_summary_mode.currentText()})", parent=self)
+            self.sum_win.show()
         except Exception as e:
-            self._notify('ERROR', 'Summary Error', str(e), exc=e)
-            return
-        # Show summary top rows in a simple popup
-        try:
-            win = tk.Toplevel(self.root)
-            win.title(f"Summary preview by {mode}")
-            # dimensions
-            win.geometry("900x500")
-            lbl = ttk.Label(win, text=f"Rows: {len(df):,}    Columns: {len(df.columns):,}")
-            lbl.pack(side='top', anchor='w', padx=8, pady=4)
-            frm = ttk.Frame(win)
-            frm.pack(side='top', fill='both', expand=True)
-            frm.rowconfigure(0, weight=1)
-            frm.columnconfigure(0, weight=1)
-            columns = [str(c) for c in df.columns]
-            tree = ttk.Treeview(frm, columns=columns, show='headings')
-            vsb = ttk.Scrollbar(frm, orient='vertical', command=tree.yview)
-            hsb = ttk.Scrollbar(frm, orient='horizontal', command=tree.xview)
-            tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-            tree.grid(row=0, column=0, sticky='nsew')
-            vsb.grid(row=0, column=1, sticky='ns')
-            hsb.grid(row=1, column=0, sticky='ew')
-            # Build headings with units and compute widths to avoid squeezed headers
-            headings = []
-            for c in columns:
-                label = c
-                try:
-                    unit = self.units_map.get(c) if hasattr(self, 'units_map') and isinstance(self.units_map, dict) else None
-                    if unit and c not in ('STATEFP', 'STATE_NAME', 'FIPS', 'GRID_RC', 'SCC', 'SCC_DESCRIPTION') and unit not in c:
-                        label = f"({unit})"
-                        headings.append(f"{c} ({unit})")
-                    else:
-                        headings.append(c)
-                except Exception:
-                    pass
-
-            # Determine widths from header and a small data sample
-            sample = df.head(200)
-            def _fmt(v):
-                if pd.isna(v):
-                    return ''
-                if isinstance(v, float):
-                    try:
-                        return f"{v:.6g}"
-                    except Exception:
-                        return str(v)
-                return str(v)
-            max_len = {}
-            for c, label in zip(columns, headings):
-                # Wider base for long string columns like SCC description
-                base_min = 18 if c.lower() in ('scc description','scc_description') else 12
-                head_len = len(label)
-                cell_max = head_len
-                try:
-                    for v in sample[c].head(50):
-                        cell_max = max(cell_max, len(_fmt(v)))
-                except Exception:
-                    pass
-                max_len[c] = min(80, max(base_min, cell_max))
-            for c, label in zip(columns, headings):
-                tree.heading(c, text=label)
-                width_px = int(max_len[c] * 8 + 24)
-                tree.column(c, width=width_px, stretch=True)
-            # insert sample
-            def _fmt(v):
-                if pd.isna(v):
-                    return ''
-                if isinstance(v, float):
-                    try:
-                        return f"{v:.6g}"
-                    except Exception:
-                        return str(v)
-                return str(v)
-            for i, (_, row) in enumerate(sample.iterrows()):
-                values = [_fmt(row[c]) for c in columns]
-                tree.insert('', 'end', iid=str(i), values=values)
-        except Exception:
-            pass
+            self._handle_notification("ERROR", f"Summary failed: {e}")
 
     def _on_export_summary(self):
         try:
-            mode = self.summary_group_var.get() if hasattr(self, 'summary_group_var') else 'county'
-            df = self._build_summary(mode)
+            df = self._build_summary()
+            path, _ = QFileDialog.getSaveFileName(self, "Export Summary", "", "CSV Files (*.csv)")
+            if path:
+                df.to_csv(path, index=False)
+                self.status_label.setText(f"Summary saved to {path}")
         except Exception as e:
-            self._notify('ERROR', 'Summary Error', str(e), exc=e)
-            return
-        # Ask file path
+            self._handle_notification("ERROR", f"Export failed: {e}")
+
+    def _build_summary(self):
+        if self.emissions_df is None:
+            raise ValueError("No data loaded.")
+        
+        mode = self.cmb_summary_mode.currentText().lower()
+        raw = self.raw_df if self.raw_df is not None else self.emissions_df
+        
+        # Detect pollutants
+        pols = detect_pollutants(raw)
+        if not pols:
+            pols = [c for c in raw.columns if pd.api.types.is_numeric_dtype(raw[c])]
+            
+        group_cols = []
+        if mode == 'county':
+            fips_col = next((c for c in raw.columns if c.lower() in ['fips', 'region_cd']), None)
+            if not fips_col: raise ValueError("No FIPS column found.")
+            group_cols = [fips_col]
+        elif mode == 'state':
+            fips_col = next((c for c in raw.columns if c.lower() in ['fips', 'region_cd']), None)
+            if not fips_col: 
+                # Fallback to checking any column that might look like FIPS
+                fips_col = next((c for c in raw.columns if 'fips' in c.lower()), None)
+            
+            if not fips_col: raise ValueError("No FIPS column found for state summary.")
+            # Local copy to add state
+            raw = raw.copy()
+            raw['STATEFP'] = raw[fips_col].astype(str).str.zfill(6).str[1:3]
+            group_cols = ['STATEFP']
+        elif mode == 'scc':
+            scc_col = next((c for c in raw.columns if c.lower() in ['scc', 'scc code']), None)
+            if not scc_col: raise ValueError("No SCC column found.")
+            desc_cols = [c for c in raw.columns if c.lower() in ['scc description', 'scc_description']]
+            group_cols = [scc_col] + ([desc_cols[0]] if desc_cols else [])
+        elif mode == 'grid':
+            if 'ROW' in raw.columns and 'COL' in raw.columns:
+                group_cols = ['ROW', 'COL']
+            elif 'GRID_RC' in raw.columns:
+                group_cols = ['GRID_RC']
+            else:
+                raise ValueError("No grid indices found.")
+                
+        # Aggregate
+        summary = raw.groupby(group_cols, as_index=False)[pols].sum()
+        
+        # Enrich state names if needed
+        if 'STATEFP' in summary.columns:
+             summary.insert(1, 'STATE_NAME', summary['STATEFP'].map(US_STATE_FIPS_TO_NAME))
+             
+        return summary
+
+class TimeSeriesPlotWindow(QDialog):
+    def __init__(self, data, title, pollutant, unit, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Time Series - {title}")
+        self.resize(800, 500)
+        self.pollutant = pollutant
+        self.unit = unit
+        
+        layout = QVBoxLayout(self)
+        
+        self.figure = Figure(figsize=(8, 5), dpi=100)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        
+        self.plot_data(data)
+        
+    def plot_data(self, data):
+        ax = self.figure.add_subplot(111)
+        times = data.get('times', [])
+        vals = data.get('values', [])
+        
+        # Convert times to datetime if string
         try:
-            path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        except Exception as e:
-            self._notify('ERROR', 'Save Dialog Error', str(e), exc=e)
-            return
-        if not path:
-            return
+            if times and isinstance(times[0], str):
+                times = [pd.to_datetime(t) for t in times]
+        except: pass
+
+        if isinstance(vals, dict):
+            # Check length of first series to validate times
+            v_len = 0
+            if vals: v_len = len(list(vals.values())[0])
+            
+            if len(times) != v_len:
+                times = range(v_len)
+
+            # Multi-line plot
+            for label, series in vals.items():
+                lw = 2.5 if label == 'Total' else 1.0
+                alpha = 1.0 if label == 'Total' else 0.6
+                ms = 4 if label == 'Total' else 2
+                ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+            
+            if len(vals) < 25:
+                ax.legend(fontsize='small', loc='upper right')
+            else:
+                try: ax.legend(['Total'], loc='upper right')
+                except: pass
+        else:
+            # Single series (list or array)
+            if isinstance(vals, list) and len(vals) > 0 and isinstance(vals[0], (list, np.ndarray)):
+                 # If list of lists (single cell raw), take first
+                 vals = vals[0]
+            
+            # Fallback for times
+            if len(times) != len(vals):
+                times = range(len(vals))
+
+            ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
+
+        u_str = str(self.unit or '').strip()
+        y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+        ax.set_ylabel(y_lbl)
+        ax.set_xlabel("Time Step")
+        ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # Date formatting
+        import matplotlib.dates as mdates
+        if len(times) > 0:
+             try:
+                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                 self.figure.autofmt_xdate()
+             except: pass
+
+        self.canvas.draw()
+
+def main():
+    # Use 'spawn' start method to avoid deadlocks when using ProcessPoolExecutor from threads
+    if sys.platform != 'win32':
         try:
-            df.to_csv(path, index=False)
-            self._notify('INFO', 'Exported', f'Summary saved to {path}')
-        except Exception as e:
-            self._notify('ERROR', 'Export Error', f'Failed saving CSV: {e}', exc=e)
+            multiprocessing.set_start_method('spawn', force=True)
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
+    
+    # Modern styling (Dark Theme approximation)
+    app.setStyle("Fusion")
+    palette = QColor(50, 50, 50)
+    # ... (Full palette setup could go here)
+    
+    # Parse args manually or via smkplot.py passing
+    # Here we assume class handles it or we parse sys.argv
+    
+    gui = NativeEmissionGUI()
+    gui.show()
+    
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

@@ -680,9 +680,13 @@ def _batch_mode(args):
     fill_number = 0.0
     
     if fill_nan_val is not None:
-        if isinstance(fill_nan_val, bool) and not fill_nan_val:
-            should_fill = False
-        elif isinstance(fill_nan_val, str) and fill_nan_val.lower() == 'false':
+        if isinstance(fill_nan_val, bool):
+            should_fill = fill_nan_val
+            fill_number = 0.0  # True means fill with 0
+        elif str(fill_nan_val).lower() in ('true', 'yes'):
+            should_fill = True
+            fill_number = 0.0
+        elif str(fill_nan_val).lower() in ('false', 'no'):
             should_fill = False
         else:
             try:

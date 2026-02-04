@@ -197,6 +197,7 @@ def parse_args():
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
     ap.add_argument('--gui-lib', choices=['tk', 'qt'], default='qt', help='GUI toolkit to use: qt (default) or tk.')
+    ap.add_argument('--qt-test', action='store_true', help='Test the native Qt GUI implementation (from gui.py).')
 
     args = ap.parse_args()
 
@@ -345,6 +346,35 @@ def main():
     try:
         # Qt Dispatch
         if gui_engine == 'qt':
+            if getattr(args, 'qt_test', False):
+                logging.info("Launching Native Qt GUI (gui.py)...")
+                try:
+                    from PySide6.QtWidgets import QApplication
+                    from PySide6.QtGui import QFont, QPalette, QColor
+                    from PySide6.QtCore import Qt
+                    from gui import NativeEmissionGUI
+                    
+                    app = QApplication.instance() or QApplication(sys.argv)
+                    app.setStyle("Fusion")
+                    
+                    gui = NativeEmissionGUI(
+                        inputfile_path=args.filepath,
+                        counties_path=args.county_shapefile,
+                        emissions_delim=args.delim,
+                        grid_name=args.gridname,
+                        griddesc=args.griddesc,
+                        pollutant=args.pollutant,
+                        json_payload=args
+                    )
+                    gui.show()
+                    sys.exit(app.exec())
+                except ImportError as ie:
+                    logging.error(f"Native Qt launch failed: {ie}")
+                    return 1
+                except Exception as e:
+                    logging.exception(f"Native Qt Runtime Error: {e}")
+                    return 1
+
             logging.info("Launching Qt GUI (Local .venv)...")
             try:
                 from PySide6.QtWidgets import QApplication

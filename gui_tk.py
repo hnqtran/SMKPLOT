@@ -1,5 +1,5 @@
-#!/proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/.venv/bin/python
-"""GUI components for SMKPLOT.
+"""
+GUI components for SMKPLOT.
 
 ##############################################################################
 # STRICT PARAMETER SOURCE RULES
@@ -53,565 +53,67 @@ from data_processing import (
 from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
 
 # Backend selection: try Tk if DISPLAY exists, otherwise Agg
+_display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
+try:
+    if _display:
+        matplotlib.use('TkAgg')
+    else:
+        matplotlib.use('Agg')
+except Exception:
+    matplotlib.use('Agg')
 
-# --- Qt Compatibility Layer (Antigravity v2) ---
-import os
-import logging
-# Headless detection to prevent hanging
-if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-    logging.info("No display detected, setting Qt to offscreen mode")
+import matplotlib.pyplot as plt  # noqa: E402
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
-                               QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
-                               QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-                               QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
-                               QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView)
-from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer, QSize
-from PySide6.QtGui import QAction, QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor
-
-import matplotlib
-matplotlib.use('qtagg')
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvasQTAgg
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-
-def _qt_align(sticky):
-    if not sticky: return Qt.AlignCenter
-    s = str(sticky).lower()
-    
-    # Initialize with empty alignment
-    a = Qt.Alignment()
-    
-    # Horizontal
-    if 'w' in s and 'e' in s: pass 
-    elif 'w' in s: a |= Qt.AlignLeft
-    elif 'e' in s: a |= Qt.AlignRight
-    else: a |= Qt.AlignHCenter
-    
-    # Vertical
-    if 'n' in s and 's' in s: pass
-    elif 'n' in s: a |= Qt.AlignTop
-    elif 's' in s: a |= Qt.AlignBottom
-    else: a |= Qt.AlignVCenter
-    
-    return a
-
-class QtTkMixin:
-    """Mixin to add Tk-like methods (grid, pack, configure, bind) to QWidgets."""
-    def __init__(self):
-        self._grid_info = {}
-        
-    def grid(self, row=0, column=0, rowspan=1, columnspan=1, sticky='', padx=0, pady=0, **kwargs):
-        p = self.parentWidget()
-        if isinstance(p, QMainWindow):
-             cw = p.centralWidget()
-             if cw: p = cw
-        if p:
-            if p.layout() is None:
-                l = QGridLayout()
-                l.setContentsMargins(0, 0, 0, 0)
-                l.setSpacing(1)
-                p.setLayout(l)
-            if isinstance(p.layout(), QGridLayout):
-                align = _qt_align(sticky)
-                p.layout().addWidget(self, row, column, rowspan, columnspan, align)
-
-    def pack(self, side='top', fill='none', expand=False, padx=0, pady=0, **kwargs):
-        # Map pack to vertical or horizontal stack in a Grid
-        p = self.parentWidget()
-        if isinstance(p, QMainWindow):
-             cw = p.centralWidget()
-             if cw: p = cw
-        if p:
-            if p.layout() is None: p.setLayout(QGridLayout())
-            layout = p.layout()
-            if isinstance(layout, QGridLayout):
-                if layout.count() == 0:
-                    row = 0
-                    col = 0
-                else:
-                    r, c, rs, cs = layout.getItemPosition(layout.count() - 1)
-                    if str(side).lower() in ('left', 'right'):
-                        row = r
-                        col = c + cs
-                    else:
-                        row = r + rs
-                        col = 0
-                
-                st = ''
-                if fill in ('both', 'x'): st += 'ew'
-                if fill in ('both', 'y'): st += 'ns'
-                if expand: st += 'nsew'
-                
-                self.grid(row=row, column=col, sticky=st, padx=padx, pady=pady)
-                
-                # If expand is requested, we must tell the layout to grow this row/column
-                if expand:
-                    self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-                    layout.setRowStretch(row, 1)
-                    layout.setColumnStretch(col, 1)
-
-    def configure(self, **kwargs):
-        if 'state' in kwargs: self.setEnabled(kwargs['state'] != "disabled")
-        if 'text' in kwargs and hasattr(self, 'setText'): self.setText(kwargs['text'])
-        if 'command' in kwargs:
-             try: self.clicked.disconnect() 
-             except: pass
-             if kwargs['command']: self.clicked.connect(kwargs['command'])
-        if 'values' in kwargs and hasattr(self, 'clear') and hasattr(self, 'addItems'):
-             self.clear()
-             self.addItems([str(v) for v in kwargs['values']])
-        if 'image' in kwargs: pass # skip images for now
-
-    def config(self, **kwargs):
-        self.configure(**kwargs)
-             
-    def columnconfigure(self, index, weight=0, minsize=0):
-        l = self.layout()
-        if l and isinstance(l, QGridLayout): l.setColumnStretch(index, weight)
-    def rowconfigure(self, index, weight=0, minsize=0):
-        l = self.layout()
-        if l and isinstance(l, QGridLayout): l.setRowStretch(index, weight)
-    def grid_remove(self): self.hide()
-    def grid_forget(self): self.hide()
-    def bind(self, sequence=None, func=None, add=None):
-        # Basic mapping for Entry events
-        if hasattr(self, 'returnPressed') and sequence == '<Return>':
-            self.returnPressed.connect(lambda: func(None))
-        if hasattr(self, 'editingFinished') and sequence == '<FocusOut>':
-            self.editingFinished.connect(lambda: func(None))
-        if hasattr(self, 'itemSelectionChanged') and 'Select' in sequence:
-             self.itemSelectionChanged.connect(lambda: func(None))
-
-# --- Widget Shims ---
-class Frame(QFrame, QtTkMixin):
-    def __init__(self, master=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        self.setLayout(QGridLayout())
-        self.configure(**kwargs)
-
-class Label(QLabel, QtTkMixin):
-    def __init__(self, master=None, text='', textvariable=None, **kwargs):
-        super().__init__(text, master)
-        QtTkMixin.__init__(self)
-        if textvariable:
-            self.setText(str(textvariable.get()))
-            if hasattr(textvariable, 'changed'):
-                textvariable.changed.connect(lambda v: self.setText(str(v)))
-            else:
-                textvariable.trace_add('write', lambda *_: self.setText(str(textvariable.get())))
-        self.configure(**kwargs)
-
-class Button(QPushButton, QtTkMixin):
-    def __init__(self, master=None, text='', command=None, **kwargs):
-        super().__init__(text, master)
-        QtTkMixin.__init__(self)
-        if command: self.clicked.connect(command)
-        self.configure(**kwargs)
-
-class Checkbutton(QCheckBox, QtTkMixin):
-    def __init__(self, master=None, text='', variable=None, command=None, **kwargs):
-        super().__init__(text, master)
-        QtTkMixin.__init__(self)
-        if variable:
-            self.setChecked(bool(variable.get()))
-            if hasattr(variable, 'changed'):
-                variable.changed.connect(lambda _: self.setChecked(bool(variable.get())))
-            else:
-                variable.trace_add('write', lambda *_: self.setChecked(bool(variable.get())))
-            self.toggled.connect(lambda b: variable.set(b))
-        if command: self.clicked.connect(command)
-        self.configure(**kwargs)
-        
-class Entry(QLineEdit, QtTkMixin):
-    def __init__(self, master=None, width=None, textvariable=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        if hasattr(self, 'setFixedWidth') and width:
-            self.setFixedWidth(int(width)*8) # approx char width
-        if textvariable:
-            self.setText(str(textvariable.get()))
-            self.textChanged.connect(lambda t: textvariable.set(t))
-            if hasattr(textvariable, 'changed'):
-                textvariable.changed.connect(lambda v: self.setText(str(v)) if self.text() != str(v) else None)
-            else:
-                textvariable.trace_add('write', lambda *_: self.setText(str(textvariable.get())) if self.text() != str(textvariable.get()) else None)
-    def delete(self, first, last=None): self.setText("")
-    def insert(self, index, string): self.setText(string)
-    def get(self): return self.text()
-
-class Combobox(QComboBox, QtTkMixin):
-    def __init__(self, master=None, values=None, textvariable=None, state=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        if values: self.addItems(values)
-        if textvariable:
-            self.currentTextChanged.connect(lambda t: textvariable.set(t))
-            if hasattr(textvariable, 'changed'):
-                textvariable.changed.connect(lambda v: self.setCurrentText(str(v)) if self.currentText() != str(v) else None)
-            else:
-                textvariable.trace_add('write', lambda *_: self.setCurrentText(str(textvariable.get())) if self.currentText() != str(textvariable.get()) else None)
-    def current(self, newindex=None):
-        if newindex is None: return self.currentIndex()
-        self.setCurrentIndex(newindex)
-    def get(self): return self.currentText()
-    def set(self, value): self.setCurrentText(value) # Not standard Tk, but useful
-
-    def _check_multi_column(self):
-        # Disable multi-column view to keep Tight Layout
-        pass
-
-    def addItem(self, *args, **kwargs):
-        super().addItem(*args, **kwargs)
-        # self._check_multi_column()
-
-    def addItems(self, *args, **kwargs):
-        super().addItems(*args, **kwargs)
-        # self._check_multi_column()
-
-class OptionMenuBuf:
-    def __init__(self, combo):
-        self.combo = combo
-    def delete(self, first, last=None):
-        self.combo.clear()
-    def add_command(self, label=None, command=None):
-        if label: self.combo.addItem(str(label))
-
-class OptionMenu(QComboBox, QtTkMixin):
-    def __init__(self, master, variable, value, *values, command=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        items = list(values)
-        self.addItems([str(v) for v in items])
-        self.setCurrentText(str(value))
-        if variable:
-            variable.set(value)
-            self.currentTextChanged.connect(lambda t: variable.set(t))
-            if hasattr(variable, 'changed'):
-                variable.changed.connect(lambda v: self.setCurrentText(str(v)) if self.currentText() != str(v) else None)
-            else:
-                variable.trace_add('write', lambda *_: self.setCurrentText(str(variable.get())) if self.currentText() != str(variable.get()) else None)
-        if command:
-            self.currentTextChanged.connect(lambda t: command(t))
-        self.configure(**kwargs)
-        self._check_multi_column()
-
-    def _check_multi_column(self):
-        # If many items, use a grid-like wrapping view
-        if self.count() > 25:
-            v = QListView()
-            v.setFlow(QListView.LeftToRight)
-            v.setWrapping(True)
-            v.setResizeMode(QListView.Adjust)
-            v.setSpacing(2)
-            # Find max width of text to set grid size
-            fm = self.fontMetrics()
-            max_w = 120
-            for i in range(self.count()):
-                max_w = max(max_w, fm.horizontalAdvance(self.itemText(i)) + 20)
-            v.setGridSize(QSize(max_w, 24))
-            self.setView(v)
-            # Make the popup wide enough (e.g. 4 columns or max 1000px)
-            popup_w = min(1200, max_w * 4 + 40)
-            v.setMinimumWidth(popup_w)
-
-    def addItem(self, *args, **kwargs):
-        super().addItem(*args, **kwargs)
-        self._check_multi_column()
-
-    def addItems(self, *args, **kwargs):
-        super().addItems(*args, **kwargs)
-        self._check_multi_column()
-    def __getitem__(self, key):
-        if key == 'menu': return OptionMenuBuf(self)
-        raise KeyError(key)
-
-class Text(QTextEdit, QtTkMixin):
-    def __init__(self, master=None, height=10, width=90, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-    def delete(self, start, end=None): self.clear()
-    def insert(self, index, chars): self.insertPlainText(chars if chars else "")
-    def see(self, index): pass
-    def get(self, start, end=None): return self.toPlainText()
-
-class Scrollbar(QWidget, QtTkMixin):
-    def __init__(self, master=None, orient='vertical', command=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        self.hide()
-    def set(self, *args): pass
-
-class Style:
-    def __init__(self, master=None): pass
-    def configure(self, style, **kwargs): pass
-    def map(self, style, **kwargs): pass
-    def theme_use(self, theme): pass
-
-class Treeview(QTreeWidget, QtTkMixin):
-    def __init__(self, master=None, columns=None, show=None, **kwargs):
-        super().__init__(master)
-        QtTkMixin.__init__(self)
-        if columns:
-            self.setColumnCount(len(columns))
-            self.setHeaderLabels(list(columns))
-    def heading(self, column, text=None, command=None): pass
-    def column(self, column, width=None, minwidth=None, stretch=None, anchor=None, **kwargs): pass
-    def insert(self, parent, index, iid=None, **kwargs):
-        values = kwargs.get('values')
-        item = QTreeWidgetItem(self)
-        if values:
-            for i, v in enumerate(values):
-                item.setText(i, str(v))
-        return item
-    def delete(self, *items): self.clear()
-    def get_children(self, item=None): return []
-    def selection(self): return self.selectedItems()
-    def yview(self, *args): pass
-    def xview(self, *args): pass
-
-
-# --- Matplotlib Shims ---
-class NavigationToolbar2Tk(NavigationToolbar, QtTkMixin):
-    def __init__(self, canvas, window, **kwargs):
-        super().__init__(canvas, window)
-        QtTkMixin.__init__(self)
-        self.update()
-
-class FigureCanvas(_FigureCanvasQTAgg, QtTkMixin):
-    def __init__(self, figure, master=None, **kwargs):
-        _FigureCanvasQTAgg.__init__(self, figure)
-        QtTkMixin.__init__(self)
-        if master: self.setParent(master)
-    def get_tk_widget(self): return self
-
-FigureCanvasTkAgg = FigureCanvas
-
-# --- Variable Shims ---
-class StringVar(QObject):
-    changed = Signal(str)
-    def __init__(self, master=None, value=None, name=None):
-        super().__init__()
-        self._val = str(value) if value is not None else ''
-        self._callbacks = {}
-    def get(self): return self._val
-    def set(self, value):
-        if self._val != str(value):
-            self._val = str(value)
-            self.changed.emit(self._val)
-            for cb in self._callbacks.values(): cb()
-    def trace_add(self, mode, callback):
-        # We ignore mode, assume 'write'
-        cb_id = str(id(callback))
-        self._callbacks[cb_id] = callback
-        return cb_id
-class BooleanVar(StringVar):
-    def get(self): return bool(self._val == 'True' or self._val == '1')
-    def set(self, value): super().set(str(value))
-class IntVar(StringVar):
-    def get(self): return int(float(self._val or 0))
-    def set(self, value): super().set(str(value))
-class DoubleVar(StringVar):
-    def get(self): return float(self._val or 0.0)
-
-# --- Root/Toplevel Shim ---
-class Root(QMainWindow, QtTkMixin):
-    notify_signal = Signal(str, str)
-    finalize_signal = Signal(bool, object, object)
-    run_on_main_signal = Signal(object)
-    def __init__(self, *args, **kwargs):
-        master = args[0] if args else kwargs.get('master')
-        super().__init__(master)
-        if QApplication.instance():
-             QApplication.instance().setStyle("Fusion")
-             self._apply_modern_theme()
-        QtTkMixin.__init__(self)
-        self.run_on_main_signal.connect(lambda f: f())
-        self._central = QWidget()
-        self.setCentralWidget(self._central)
-        l = QGridLayout()
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(0)
-        self._central.setLayout(l)
-        self._protocols = {}
-        if master:
-            self.show()
-
-    def _apply_modern_theme(self):
-        qss = """
-        QMainWindow, QWidget {
-            background-color: #f8f9fa;
-            color: #212529;
-            font-family: 'Segoe UI', 'Roboto', sans-serif;
-            font-size: 10pt;
-        }
-        QPushButton {
-            background-color: #ffffff;
-            border: 1px solid #ced4da;
-            border-radius: 4px;
-            padding: 5px 15px;
-            color: #212529;
-        }
-        QPushButton:hover {
-            background-color: #e9ecef;
-            border-color: #adb5bd;
-        }
-        QPushButton:pressed {
-            background-color: #dee2e6;
-        }
-        QLineEdit, QComboBox, QSpinBox {
-            background-color: #ffffff;
-            border: 1px solid #ced4da;
-            border-radius: 4px;
-            padding: 4px 8px;
-            color: #212529;
-        }
-        QLineEdit:focus, QComboBox:focus {
-            border: 1px solid #007bff;
-            background-color: #ffffff;
-        }
-        QComboBox::drop-down {
-            subcontrol-origin: padding;
-            subcontrol-position: top right;
-            width: 20px;
-            border-left: 1px solid #ced4da;
-        }
-        QComboBox::down-arrow {
-            image: none;
-            border-left: 5px solid transparent;
-            border-right: 5px solid transparent;
-            border-top: 5px solid #6c757d;
-            margin-top: 2px;
-        }
-        QComboBox QAbstractItemView, QListView {
-            background-color: #ffffff;
-            selection-background-color: #007bff;
-            selection-color: white;
-            color: #212529;
-            border: 1px solid #ced4da;
-            outline: none;
-        }
-        QListView::item {
-            padding: 4px;
-            border-radius: 2px;
-        }
-        QListView::item:hover {
-            background-color: #e9ecef;
-        }
-        QProgressBar {
-            border: none;
-            background-color: #e9ecef;
-            height: 4px;
-        }
-        QProgressBar::chunk {
-            background-color: #007bff;
-        }
-        QStatusBar {
-            background-color: #f1f3f5;
-            color: #495057;
-            border-top: 1px solid #dee2e6;
-        }
-        QToolTip {
-            background-color: #ffffff;
-            color: #212529;
-            border: 1px solid #ced4da;
-            padding: 5px;
-        }
-        """
-        QApplication.instance().setStyleSheet(qss)
-    def title(self, text): self.setWindowTitle(text)
-    def geometry(self, g): 
-        try: 
-            w, h = map(int, g.split('+')[0].split('x'))
-            self.resize(w, h)
-        except: pass
-    def protocol(self, n, f): 
-        if n == "WM_DELETE_WINDOW": self._protocols['close'] = f
-    def closeEvent(self, e):
-        if 'close' in self._protocols:
-            try:
-                self._protocols['close']()
-            except SystemExit:
-                e.accept()
-                return
-            except Exception:
-                pass
-            e.ignore() 
-        else:
-            e.accept()
-    def withdraw(self): self.hide()
-    def deiconify(self): self.show()
-    def update_idletasks(self): QApplication.processEvents()
-    def rowconfigure(self, i, weight=0): 
-        if self._central.layout(): self._central.layout().setRowStretch(i, weight)
-    def columnconfigure(self, i, weight=0):
-        if self._central.layout(): self._central.layout().setColumnStretch(i, weight)
-    def winfo_screenwidth(self):
-        s = QApplication.primaryScreen()
-        return s.size().width() if s else 1600
-    def destroy(self): self.close()
-    def after(self, ms, func): 
-        QTimer.singleShot(ms, func)
-        return "id"
-    def minsize(self, w, h): self.setMinimumSize(int(w), int(h))
-    def winfo_width(self): return self.width()
-    def option_add(self, *args): pass
-    def resizable(self, *args): pass
-
-# --- Namespace Shims ---
-class tk_ns:
-    Tk = Root
-    Toplevel = Root
-    Frame=Frame; Label=Label; Button=Button; Checkbutton=Checkbutton; Entry=Entry; Combobox=Combobox; OptionMenu=OptionMenu; Text=Text
-    StringVar=StringVar; BooleanVar=BooleanVar; IntVar=IntVar; DoubleVar=DoubleVar
-    END="end"; W="w"; E="e"; N="n"; S="s"; EW="ew"; NSEW="nsew"
-    NORMAL="normal"; DISABLED="disabled"
-
-class ttk_ns:
-    Frame=Frame; Label=Label; Button=Button; Checkbutton=Checkbutton; Entry=Entry; Combobox=Combobox; OptionMenu=OptionMenu; Treeview=Treeview; Scrollbar=Scrollbar; Style=Style
-
-class messagebox:
-    @staticmethod
-    def showerror(t, m): QMessageBox.critical(None, t, m)
-    @staticmethod
-    def showinfo(t, m): QMessageBox.information(None, t, m)
-    @staticmethod
-    def showwarning(t, m): QMessageBox.warning(None, t, m)
-
-def _tk_ft(ft):
-    if not ft: return ""
-    if isinstance(ft, str): return ft
+USING_TK = matplotlib.get_backend().lower().startswith('tk')
+if USING_TK:
     try:
-        return ";;".join([f"{n} ({p})" for n, p in ft])
-    except: return ""
-
-class filedialog:
-    @staticmethod
-    def askopenfilename(**k): 
-        return QFileDialog.getOpenFileName(None, k.get('title','Open'), k.get('initialdir',''), _tk_ft(k.get('filetypes')))[0]
-    @staticmethod
-    def askopenfilenames(**k): 
-        f = QFileDialog.getOpenFileNames(None, k.get('title','Open'), k.get('initialdir',''), _tk_ft(k.get('filetypes')))[0]
-        return list(f) if f else []
-    @staticmethod
-    def asksaveasfilename(**k): 
-        return QFileDialog.getSaveFileName(None, k.get('title','Save'), k.get('initialdir',''), _tk_ft(k.get('filetypes')))[0]
-
-# --- Global Aliases ---
-tk = tk_ns
-ttk = ttk_ns
-USING_TK = True
+        import tkinter as tk  # type: ignore
+        from tkinter import ttk, filedialog  # type: ignore
+    except Exception:
+        USING_TK = False
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt  # re-import safe
+else:
+    # Provide stubs so type checker / runtime does not fail before GUI branch
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
+    filedialog = None  # type: ignore
 class EmissionGUI:
     def __init__(self, root, inputfile_path: Optional[str], counties_path: Optional[str], emissions_delim: Optional[str] = None, *, cli_args=None, app_version: str = "1.0"):
         self.root = root
-        if hasattr(self.root, 'notify_signal'):
-             self.root.notify_signal.connect(self._loader_notify)
-        if hasattr(self.root, 'finalize_signal'):
-             self.root.finalize_signal.connect(lambda p, l, s: self._finalize_loaded_emissions(show_preview=p, source_label=l, scc_data=s))
         self.root.title(f"SMKPLOT version {app_version} (Author: tranhuy@email.unc.edu)")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        # --- Monkey-patch for Graticule Recursion Guard ---
+        # Since we cannot touch plotting.py directly, we wrap the function here.
+        import plotting
+        original_draw_graticule = plotting._draw_graticule
+        
+        def guarded_draw_graticule(*args, **kwargs):
+            ax = args[0] if args else kwargs.get('ax')
+            if ax is None: return original_draw_graticule(*args, **kwargs)
+            
+            # Use a specialized guard to prevent infinite recursion during zoom events
+            if getattr(ax, '_smk_drawing_graticule', False):
+                return None
+            ax._smk_drawing_graticule = True
+            try:
+                # Force autoscale off during graticule drawing to prevent zoom loops
+                original_autoscale = ax.get_autoscale_on()
+                ax.set_autoscale_on(False)
+                res = original_draw_graticule(*args, **kwargs)
+                ax.set_autoscale_on(original_autoscale)
+                return res
+            finally:
+                ax._smk_drawing_graticule = False
+        
+        plotting._draw_graticule = guarded_draw_graticule
+        
+        # Update local alias to ensure GUI calls use the guarded version
+        import sys
+        module = sys.modules[__name__]
+        setattr(module, '_draw_graticule_fn', guarded_draw_graticule)
+        # --------------------------------------------------
         # UI scaling based on screen resolution (baseline ~1600px width)
         try:
             sw = max(1, int(self.root.winfo_screenwidth()))
@@ -646,26 +148,14 @@ class EmissionGUI:
         self.fill_nan_arg = getattr(cli_args, 'fill_nan', None) if cli_args else None or self._json_arguments.get('fill_nan', None)
         
         # Fill NaN with Zero checkbox state
-        # Parsing configuration setting:
-        # True / "true" -> Checked (fill with 0)
-        # 0 / 0.0 / "0" -> Checked (fill with 0)
-        # Any other value -> Unchecked (no fill or custom fill)
+        # If fill_nan_arg is approximately 0, default to checked
         default_zero = False
-        val = self.fill_nan_arg
-        if val is not None:
-            if isinstance(val, bool):
-                default_zero = val
-            elif str(val).lower() in ('true', 'yes'):
-                default_zero = True
-            elif str(val).lower() in ('false', 'no'):
-                default_zero = False
-            else:
-                try:
-                    # Check for numeric 0
-                    if abs(float(val)) < 1e-9:
-                        default_zero = True
-                except Exception:
-                    pass
+        if self.fill_nan_arg is not None:
+            try:
+                if abs(float(self.fill_nan_arg)) < 1e-9:
+                    default_zero = True
+            except Exception:
+                pass
         self.fill_zero_var = tk.BooleanVar(value=default_zero)
 
         self.filter_col = getattr(cli_args, 'filter_col', None) if cli_args else None or self._json_arguments.get('filter_col', None)
@@ -1046,59 +536,18 @@ class EmissionGUI:
 
     def _set_status(self, message: str, level: Optional[str] = None) -> None:
         """Update the GUI status bar, collapsing whitespace and capping length."""
-        lvl = (level or 'INFO').upper()
-        # Ensure logging occurs
-        if lvl == 'ERROR': logging.error(message)
-        elif lvl == 'WARNING': logging.warning(message)
-        else: logging.info(message)
-        
         if not USING_TK:
             return
-
-        def _do_update():
-            try:
-                if self.status_var is None:
-                    self.status_var = tk.StringVar(master=self.root, value='')
-                
-                # Apply premium styling to status bar based on level (Light Mode)
-                style = "QStatusBar { background: #f1f3f5; color: #495057; font-family: 'Segoe UI', sans-serif; font-weight: 500; border-top: 1px solid #dee2e6; }"
-                if lvl == 'ERROR':
-                    style = "QStatusBar { background: #fee2e2; color: #991b1b; font-weight: bold; border-top: 1px solid #fecaca; }"
-                elif lvl == 'WARNING':
-                    style = "QStatusBar { background: #fef3c7; color: #92400e; font-weight: bold; border-top: 1px solid #fde68a; }"
-                elif lvl == 'SUCCESS' or 'success' in message.lower():
-                    style = "QStatusBar { background: #dcfce7; color: #166534; font-weight: bold; border-top: 1px solid #bbf7d0; }"
-                
-                if hasattr(self.root, 'statusBar'):
-                    self.root.statusBar().setStyleSheet(style)
-
-                prefix = f"{lvl}: " if lvl else ''
-                collapsed = ' '.join(message.strip().split()) if message else ''
-                self.status_var.set((prefix + collapsed)[:512])
-                
-                # Progress Bar Logic
-                if hasattr(self, 'progress_bar'):
-                    c_low = collapsed.lower()
-                    busy_keys = ["loading", "processing", "building", "rendering", "extracting", "preparing", "fetching", "animation"]
-                    done_keys = ["ready", "error", "success", "cleared", "loaded", "complete", "finished", "done"]
-                    
-                    if any(x in c_low for x in busy_keys):
-                         self.progress_bar.show()
-                         self.progress_bar.setRange(0, 0)
-                    elif any(x in c_low for x in done_keys) and not any(x in c_low for x in ["loading", "rendering"]):
-                         self.progress_bar.hide()
-                         self.progress_bar.setRange(0, 100)
-                         self.progress_bar.setValue(0)
-                         
-                if self.status_label is not None:
-                    self.status_label.update_idletasks()
-            except Exception:
-                pass
-
-        if hasattr(self.root, 'run_on_main_signal'):
-             self.root.run_on_main_signal.emit(_do_update)
-        else:
-             _do_update()
+        try:
+            if self.status_var is None:
+                self.status_var = tk.StringVar(master=self.root, value='')
+            prefix = f"{level.upper()}: " if level else ''
+            collapsed = ' '.join(message.strip().split()) if message else ''
+            self.status_var.set((prefix + collapsed)[:512])
+            if self.status_label is not None:
+                self.status_label.update_idletasks()
+        except Exception:
+            pass
 
     def _format_attrs_for_display(self, source=None, *, max_units: int = 12, max_chars: int = 4000) -> str:
         """Return a human-friendly summary of DataFrame attrs for GUI display."""
@@ -1146,9 +595,6 @@ class EmissionGUI:
         return text
 
     def _loader_notify(self, level: str, message: str) -> None:
-        if QThread.currentThread() != QApplication.instance().thread():
-             self.root.after(0, lambda: self._loader_notify(level, message))
-             return
         lvl = (level or 'INFO').upper()
         msg = ' '.join(str(message).strip().split()) if message else ''
         if not msg:
@@ -1157,14 +603,6 @@ class EmissionGUI:
         if len(self._loader_messages) > 10:
             self._loader_messages = self._loader_messages[-10:]
         self._set_status(msg, level=lvl)
-        
-        if hasattr(self, 'progress_bar'):
-            if any(x in msg for x in ["Lazy-loading", "Loading", "Processing", "Building"]):
-                 self.progress_bar.show()
-                 self.progress_bar.setRange(0, 0)
-            elif any(x in msg for x in ["Ready", "Error", "Warning", "Success"]):
-                 self.progress_bar.hide()
-
         if USING_TK and getattr(self, 'preview', None) is not None and not getattr(self, '_preview_has_data', False):
             self._render_loader_messages()
 
@@ -1197,23 +635,19 @@ class EmissionGUI:
 
     def _on_close(self):
         """Harden shutdown: close plots, and force exit."""
-        if getattr(self, '_in_close_callback', False):
-            return
-        self._in_close_callback = True
         try:
             # Close all matplotlib figures to release memory and resources
             plt.close('all')
         except Exception:
             pass
         try:
-            # Shutdown Qt loop
-            QApplication.quit()
+            # Explicitly destroy the main window
+            self.root.destroy()
         except Exception:
             pass
-        # Force exit to ensure the process terminates immediately, 
-        # bypassing any hanging background threads or matplotlib artifacts.
-        import os
-        os._exit(0)
+        # Force exit to ensure the process terminates, especially if non-daemon threads are running.
+        # This helps return control to the terminal promptly.
+        sys.exit(0)
 
     # ---- Unified notification / logging helper ----
     def _notify(self, level: str, title: str, message: str, exc: Optional[Exception] = None, *, popup: Optional[bool] = None):
@@ -1234,7 +668,7 @@ class EmissionGUI:
         # Show dialog if Tk is active
         if popup and USING_TK:
             try:
-                # from tkinter import messagebox
+                from tkinter import messagebox
                 if lvl == 'INFO':
                     messagebox.showinfo(title, message)
                 elif lvl == 'WARNING':
@@ -1245,7 +679,7 @@ class EmissionGUI:
                 pass  # Suppress any UI errors after logging
 
     def _build_layout(self):
-        frm = ttk.Frame(self.root, padding=4)
+        frm = ttk.Frame(self.root, padding=8)
         frm.grid(row=0, column=0, sticky='nsew')
         # keep a reference to the main frame for later configuration
         self.frm = frm
@@ -1258,11 +692,7 @@ class EmissionGUI:
         self.emis_entry.grid(row=0, column=1, sticky='we')
         self.emis_entry.bind('<Return>', self._on_emissions_entry_change)
         self.emis_entry.bind('<FocusOut>', self._on_emissions_entry_change)
-        btn_browse_in = ttk.Button(frm, text="Browse", command=self.browse_inputfile)
-        btn_browse_in.grid(row=0, column=2, padx=4)
-        if QApplication.instance():
-            btn_browse_in.setIcon(QApplication.instance().style().standardIcon(QStyle.SP_DirHomeIcon))
-
+        ttk.Button(frm, text="Browse", command=self.browse_inputfile).grid(row=0, column=2, padx=4)
         # Delimiter state (widgets will be placed in button row)
         self.delim_var = tk.StringVar()
         self.custom_delim_var = tk.StringVar()
@@ -1287,11 +717,7 @@ class EmissionGUI:
         self.county_entry.grid(row=1, column=1, sticky='we')
         self.county_entry.bind('<Return>', self._on_counties_entry_change)
         self.county_entry.bind('<FocusOut>', self._on_counties_entry_change)
-        btn_browse_sh = ttk.Button(frm, text="Browse", command=self.browse_shpfile)
-        btn_browse_sh.grid(row=1, column=2, padx=4)
-        if QApplication.instance():
-             btn_browse_sh.setIcon(QApplication.instance().style().standardIcon(QStyle.SP_FileDialogStart))
-
+        ttk.Button(frm, text="Browse", command=self.browse_shpfile).grid(row=1, column=2, padx=4)
         # Online year selector and button
         self.counties_year_var = tk.StringVar(value='2020')
         ttk.OptionMenu(frm, self.counties_year_var, '2020', '2020', '2023', command=lambda *_: self.use_online_counties()).grid(row=1, column=3, sticky='we')
@@ -1302,8 +728,7 @@ class EmissionGUI:
         self.overlay_entry.grid(row=2, column=1, sticky='we')
         self.overlay_entry.bind('<Return>', self._on_overlay_entry_change)
         self.overlay_entry.bind('<FocusOut>', self._on_overlay_entry_change)
-        btn_browse_ov = ttk.Button(frm, text="Browse", command=self.browse_overlay_shpfile)
-        btn_browse_ov.grid(row=2, column=2, padx=4)
+        ttk.Button(frm, text="Browse", command=self.browse_overlay_shpfile).grid(row=2, column=2, padx=4)
 
         # Filter by Overlay Shapefile
         self.filter_overlay_var = tk.StringVar(value=str(getattr(self, 'initial_filter_overlay', 'False')))
@@ -1335,7 +760,7 @@ class EmissionGUI:
         # Pollutant selector
         ttk.Label(frm, text="Pollutant:").grid(row=5, column=0, sticky='w')
         self.pollutant_var = tk.StringVar()
-        self.pollutant_menu = ttk.Combobox(frm, textvariable=self.pollutant_var, state='readonly')
+        self.pollutant_menu = ttk.OptionMenu(frm, self.pollutant_var, None)
         self.pollutant_menu.grid(row=5, column=1, sticky='we')
 
         # (Scale and Zoom moved to button row to avoid horizontal expansion)
@@ -1353,8 +778,8 @@ class EmissionGUI:
         # Buttons
         btn_frame = ttk.Frame(frm)
         btn_frame.grid(row=6, column=0, columnspan=5, pady=6, sticky='we')
-        # Column stretching: let the bins entry grow (Column 18)
-        for c in (18,):
+        # Column stretching: let the bins entry grow
+        for c in (11,):
             try:
                 btn_frame.columnconfigure(c, weight=1)
             except Exception:
@@ -1411,71 +836,70 @@ class EmissionGUI:
         self.ncf_tstep_menu.bind('<<ComboboxSelected>>', _on_ncf_param_change)
         
         # Initially grid them (they will be disabled)
-        self.ncf_layer_label.grid(row=0, column=7, sticky='e', padx=(12,2))
+        self.ncf_layer_label.grid(row=0, column=7, sticky='e', padx=2)
         self.ncf_layer_menu.grid(row=0, column=8, sticky='w')
-        self.ncf_tstep_label.grid(row=0, column=9, sticky='e', padx=(12,2))
+        self.ncf_tstep_label.grid(row=0, column=9, sticky='e', padx=2)
         self.ncf_tstep_menu.grid(row=0, column=10, sticky='w')
 
-        # Row 1: Plotting Config (Scale, Plot By, Proj, Bins, Colormap)
+        # Shift subsequent columns due to insertion
+        # Scale next to Zoom to Data and before Bins
         self.scale_label = ttk.Label(btn_frame, text="Scale:")
-        self.scale_label.grid(row=1, column=0, sticky='e', padx=(4,2))
+        self.scale_label.grid(row=0, column=11, sticky='e', padx=(12,2)) # Was 7
         self.scale_var = tk.StringVar(value='linear')
         self.scale_menu_widget = ttk.OptionMenu(btn_frame, self.scale_var, 'linear', 'linear', 'log')
-        self.scale_menu_widget.grid(row=1, column=1, sticky='w')
-        
-        self.plotby_label = ttk.Label(btn_frame, text='By:')
-        self.plotby_label.grid(row=1, column=2, sticky='e', padx=(12,2))
+        self.scale_menu_widget.grid(row=0, column=12, sticky='w') # Was 8
+        # Plot-by control (Auto/County/Grid)
+        self.plotby_label = ttk.Label(btn_frame, text='Plot by:')
+        self.plotby_label.grid(row=0, column=13, sticky='e', padx=(12,2)) # Was 9
         self.plot_by_var = tk.StringVar(value='auto')
         self.plotby_menu_widget = ttk.OptionMenu(btn_frame, self.plot_by_var, 'auto', 'auto', 'county', 'grid')
-        self.plotby_menu_widget.grid(row=1, column=3, sticky='w')
-        
+        self.plotby_menu_widget.grid(row=0, column=14, sticky='w') # Was 10
+        # Projection selection (Auto / WGS84 / LCC)
         self.proj_label = ttk.Label(btn_frame, text='Proj:')
-        self.proj_label.grid(row=1, column=4, sticky='e', padx=(12,2))
+        self.proj_label.grid(row=0, column=15, sticky='e', padx=(12,2)) # Was 11
         self.projection_var = tk.StringVar(value='lcc')
         self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'lcc', 'auto', 'wgs84', 'lcc')
-        self.proj_menu_widget.grid(row=1, column=5, sticky='w')
-        
+        self.proj_menu_widget.grid(row=0, column=16, sticky='w') # Was 12
+        # Bins and Colormap controls
         self.bins_label = ttk.Label(btn_frame, text='Bins:')
-        self.bins_label.grid(row=1, column=6, sticky='e', padx=(12,2))
+        self.bins_label.grid(row=0, column=17, sticky='e', padx=(12,2)) # Was 13
         self.bins_entry = ttk.Entry(btn_frame, width=self._w_chars(28, min_chars=18, max_chars=40), textvariable=self.class_bins_var)
-        self.bins_entry.grid(row=1, column=7, sticky='we')
-        
-        self.cmap_label = ttk.Label(btn_frame, text='Map:')
-        self.cmap_label.grid(row=1, column=8, sticky='e', padx=(12,2))
+        self.bins_entry.grid(row=0, column=18, sticky='we') # Was 14
+        self.cmap_label = ttk.Label(btn_frame, text='Colormap:')
+        self.cmap_label.grid(row=0, column=19, sticky='e', padx=(12,2)) # Was 15
         self.cmap_menu_widget = ttk.OptionMenu(btn_frame, self.cmap_var, self.cmap_var.get(), *self._cmap_choices)
-        self.cmap_menu_widget.grid(row=1, column=9, sticky='w')
+        self.cmap_menu_widget.grid(row=0, column=20, sticky='w') # Was 16
 
-        # Row 2 (Optional/Context): SCC
+        # SCC selection dropdown (replaces free-text keyword)
         self.scc_select_var = tk.StringVar(value='All SCC')
-        self.scc_label = ttk.Label(btn_frame, text='SCC Filter:')
-        self.scc_entry = ttk.Combobox(btn_frame, textvariable=self.scc_select_var, values=[], width=self._w_chars(60, min_chars=30, max_chars=100), state='disabled')
-        self.scc_label.grid(row=2, column=0, sticky='e', padx=(4,2), pady=(4,0))
-        self.scc_entry.grid(row=2, column=1, columnspan=7, sticky='we', pady=(4,0))
-        
+        self.scc_label = ttk.Label(btn_frame, text='SCC:')
+        # Wider combobox to show long SCC descriptions
+        self.scc_entry = ttk.Combobox(btn_frame, textvariable=self.scc_select_var, values=[], width=self._w_chars(80, min_chars=40, max_chars=120), state='disabled')
+        # place after colormap
+        self.scc_label.grid(row=0, column=21, sticky='e', padx=(12,2)) # Was 17
+        self.scc_entry.grid(row=0, column=22, sticky='w') # Was 18
+        # initially disabled until we detect SCC columns
         try:
-            btn_frame.columnconfigure(7, weight=1)
             self.scc_entry.state(['disabled'])
             self.scc_label.state(['disabled'])
-        except Exception: pass
+        except Exception:
+            pass
 
-        # The 3-row layout is now stable; disable dynamic reflow to prevent layout collapse
+        # Responsive layout: reflow Bins/Colormap/SCC onto second row when window is narrow
         self._btn_frame = btn_frame
-        self._layout_mode = 'static'
-        # try:
-        #     self.root.bind('<Configure>', self._on_resize)
-        # except Exception:
-        #     pass
+        self._layout_mode = None  # 'wide' or 'compact'
+        try:
+            self.root.bind('<Configure>', self._on_resize)
+        except Exception:
+            pass
 
         # Text preview widget (persistent)
-        self.preview = tk.Text(frm, height=6, width=90)
-        self.preview.grid(row=7, column=0, columnspan=5, pady=2, sticky='nsew')
+        self.preview = tk.Text(frm, height=10, width=90)
+        self.preview.grid(row=7, column=0, columnspan=5, pady=4, sticky='nsew')
 
-        # Embedded plot frame (row 8) - map will display here
+        # Embedded plot frame (row 7) - map will display here (pop-out windows draw their own figs)
         self.plot_frame = ttk.Frame(frm)
-        self.plot_frame.grid(row=8, column=0, columnspan=5, sticky='nsew', pady=(2, 0))
-        # Ensure plot area has a semi-reasonable minimum vertical expansion
-        if hasattr(self.plot_frame, 'setMinimumHeight'):
-            self.plot_frame.setMinimumHeight(400)
+        self.plot_frame.grid(row=8, column=0, columnspan=5, sticky='nsew', pady=(4, 0))
 
         if USING_TK:
             try:
@@ -1484,21 +908,8 @@ class EmissionGUI:
             except Exception:
                 self.status_var = None
             if self.status_var is not None:
-                # Modern Status Bar with Progress
-                status_frame = ttk.Frame(frm)
-                status_frame.grid(row=9, column=0, columnspan=5, sticky='we', pady=(4, 0))
-                
-                self.status_label = ttk.Label(status_frame, textvariable=self.status_var, relief='sunken', anchor='w')
-                self.status_label.grid(row=0, column=0, sticky='we')
-                
-                self.progress_bar = QProgressBar()
-                self.progress_bar.setRange(0, 100)
-                self.progress_bar.setValue(0)
-                self.progress_bar.hide()
-                status_frame.layout().addWidget(self.progress_bar, 0, 1)
-                
-                status_frame.columnconfigure(0, weight=1)
-                status_frame.columnconfigure(1, weight=0)
+                self.status_label = ttk.Label(frm, textvariable=self.status_var, relief='sunken', anchor='w')
+                self.status_label.grid(row=9, column=0, columnspan=5, sticky='we', pady=(4, 0))
 
         # Configure stretch rows/columns for the main frame
         try:
@@ -1786,7 +1197,6 @@ class EmissionGUI:
         
 
     def _finalize_loaded_emissions(self, *, show_preview: bool, source_label: Optional[str] = None, scc_data=None) -> None:
-        logging.info("DEBUG: Inside _finalize_loaded_emissions")
         if not isinstance(self.emissions_df, pd.DataFrame):
             self._notify('ERROR', 'Invalid Data', 'Emissions dataset is not a DataFrame; cannot continue.')
             return
@@ -1804,10 +1214,8 @@ class EmissionGUI:
         if self._ff10_ready and self.grid_gdf is not None:
             self._ensure_ff10_grid_mapping()
 
-        logging.info("DEBUG: Updating SCC widgets")
         self._update_scc_widgets(scc_data=scc_data)
 
-        logging.info("DEBUG: Detecting pollutants")
         self.pollutants = detect_pollutants(self.emissions_df)
         if not self.pollutants and isinstance(self.emissions_df, pd.DataFrame):
             self.pollutants = self.emissions_df.attrs.get('available_pollutants', [])
@@ -1822,11 +1230,20 @@ class EmissionGUI:
         # Sort pollutants alphabetically for easier navigation
         self.pollutants = sorted(self.pollutants, key=lambda s: s.lower())
 
+        menu = self.pollutant_menu["menu"]
         try:
-            self.pollutant_menu.configure(values=self.pollutants)
+            menu.delete(0, "end")
         except Exception:
             pass
-        
+        PER_COLUMN = 25
+        for idx, p in enumerate(self.pollutants):
+            kw = {}
+            if idx > 0 and (idx % PER_COLUMN) == 0:
+                kw['columnbreak'] = 1
+            try:
+                menu.add_command(label=p, command=lambda v=p: self.pollutant_var.set(v), **kw)
+            except Exception:
+                pass
         try:
             self.pollutant_var.set(self.pollutants[0])
         except Exception:
@@ -1917,7 +1334,7 @@ class EmissionGUI:
                 self.ncf_layer_menu.state(['disabled'])
                 self.ncf_tstep_menu.state(['disabled'])
             if not self.inputfile_path:
-                self.pollutant_menu.configure(values=[])
+                self.pollutant_menu['menu'].delete(0, 'end')
         except Exception:
             pass
         
@@ -1928,7 +1345,6 @@ class EmissionGUI:
         ).start()
 
     def _load_inputfile_worker(self, show_preview, effective_delim, current_delim_state, ncf_preserve):
-        logging.info("DEBUG: Worker Thread Started")
         if not self.inputfile_path:
             self.emissions_df = None
             self.raw_df = None
@@ -1943,11 +1359,7 @@ class EmissionGUI:
                 try:
                     # Thread-safe notify wrapper
                     def safe_notify(level, message):
-                        logging.info(f"DEBUG: safe_notify called: {message}")
-                        if hasattr(self.root, 'notify_signal'):
-                            self.root.notify_signal.emit(level, message)
-                        else:
-                            self.root.after(0, lambda: self._loader_notify(level, message))
+                        self.root.after(0, lambda: self._loader_notify(level, message))
                     
                     # Handle multiple files (semicolon separated)
                     f_input = self.inputfile_path
@@ -1985,6 +1397,15 @@ class EmissionGUI:
                             ncf_params['layer_idx'] = 0
                             ncf_params['layer_op'] = 'select'
 
+                    # Define localized read function to ensure consistency during stat re-calc
+                    def _local_read(p):
+                        return read_inputfile(
+                            p, sector=self.sector, delim=effective_delim, 
+                            skiprows=self.skiprows, comment=self.comment_token, 
+                            encoding=self.encoding, notify=lambda *_: None, 
+                            lazy=True, workers=1, **ncf_params
+                        )
+
                     emissions_df, raw_df = read_inputfile(
                         f_input,
                         sector=self.sector,
@@ -1998,15 +1419,66 @@ class EmissionGUI:
                         flter_val=self.filter_values,
                         notify=safe_notify,
                         ncf_params=ncf_params,
-                        lazy=True
+                        lazy=True,
+                        workers=1
                     )
-                    logging.info("DEBUG: read_inputfile returned.")
+                    
+                    if isinstance(emissions_df, pd.DataFrame):
+                        # Flag for native rendering optimization (QuadMesh)
+                        try:
+                            source_type = emissions_df.attrs.get('source_type')
+                            is_gridded = (source_type == 'gridded_netcdf') or ('ROW' in emissions_df.columns and 'COL' in emissions_df.columns)
+                            if is_gridded:
+                                emissions_df._smk_is_native = True
+                                emissions_df.attrs['_smk_is_native'] = True
+                        except Exception: pass
+
+                        # Re-calculate lost stats for UI (since processor was reverted)
+                        try:
+                            from data_processing import detect_pollutants
+                            summaries = []
+                            file_list = f_input if isinstance(f_input, list) else [f_input]
+                            if len(file_list) > 1:
+                                for f in file_list:
+                                    if os.path.exists(str(f)):
+                                        f_df, _ = _local_read(f)
+                                        if isinstance(f_df, pd.DataFrame):
+                                             p_stats = {}
+                                             for p in detect_pollutants(f_df):
+                                                 try:
+                                                     vals = pd.to_numeric(f_df[p], errors='coerce').dropna()
+                                                     if not vals.empty:
+                                                         p_stats[p] = {
+                                                             'sum': float(vals.sum()),
+                                                             'max': float(vals.max()),
+                                                             'mean': float(vals.mean()),
+                                                             'count': int(len(vals))
+                                                         }
+                                                 except Exception: pass
+                                             summaries.append({'source': f, 'pollutants': p_stats})
+                            else:
+                                p_stats = {}
+                                for p in detect_pollutants(emissions_df):
+                                    try:
+                                        vals = pd.to_numeric(emissions_df[p], errors='coerce').dropna()
+                                        if not vals.empty:
+                                            p_stats[p] = {
+                                                'sum': float(vals.sum()),
+                                                'max': float(vals.max()),
+                                                'mean': float(vals.mean()),
+                                                'count': int(len(vals))
+                                            }
+                                    except Exception: pass
+                                summaries.append({'source': file_list[0], 'pollutants': p_stats})
+                            emissions_df.attrs['per_file_summaries'] = summaries
+                        except Exception as e:
+                            logging.warning(f"Stat re-calc failed: {e}")
+
                     if isinstance(emissions_df, pd.DataFrame):
                         emissions_df.attrs['ncf_params'] = ncf_params
 
                     # Build FIPS to ensure compatibility and consistent attributes
                     if isinstance(emissions_df, pd.DataFrame):
-                        logging.info("DEBUG: Building FIPS...")
                         try:
                             is_ncf = isinstance(f_input, str) and is_netcdf_file(f_input)
                             emissions_df = get_emis_fips(emissions_df, verbose=(not is_ncf))
@@ -2072,10 +1544,7 @@ class EmissionGUI:
                                 elif self.ncf_tstep_var.get() not in ts_vals:
                                     self.ncf_tstep_menu.set(ts_vals[1])
 
-                            if hasattr(self.root, 'run_on_main_signal'):
-                                self.root.run_on_main_signal.emit(_update_ncf_ui)
-                            else:
-                                self.root.after(0, _update_ncf_ui)
+                            self.root.after(0, _update_ncf_ui)
 
                             # Determine read params - use preserved values as they reflect user intent (which was cleared from var)
                             curr_lay_str = ncf_preserve.get('layer') or ''
@@ -2157,25 +1626,16 @@ class EmissionGUI:
                                     
                                     self.status_var.set("Grid geometry loaded from NetCDF.")
                                 
-                                if hasattr(self.root, 'run_on_main_signal'):
-                                    self.root.run_on_main_signal.emit(lambda g=ncf_grid_gdf: _set_ncf_grid(g))
-                                else:
-                                    self.root.after(0, lambda g=ncf_grid_gdf: _set_ncf_grid(g))
+                                self.root.after(0, lambda: _set_ncf_grid(ncf_grid_gdf))
                         except Exception as grid_err:
                             safe_notify('WARNING', f"Failed to auto-configure grid from NetCDF: {grid_err}")
 
                 except Exception as e:
                     err_msg = str(e)
                     if "No valid FIPS code columns found" in err_msg:
-                        if hasattr(self.root, 'run_on_main_signal'):
-                             self.root.run_on_main_signal.emit(lambda: self._notify('ERROR', 'Input Not Supported', 'The input file format is not supported (missing FIPS/Region columns).', exc=None))
-                        else:
-                             self.root.after(0, lambda: self._notify('ERROR', 'Input Not Supported', 'The input file format is not supported (missing FIPS/Region columns).', exc=None))
+                        self.root.after(0, lambda: self._notify('ERROR', 'Input Not Supported', 'The input file format is not supported (missing FIPS/Region columns).', exc=None))
                     else:
-                        if hasattr(self.root, 'run_on_main_signal'):
-                             self.root.run_on_main_signal.emit(lambda e=e: self._notify('ERROR', 'Emissions Load Error', str(e), exc=e))
-                        else:
-                             self.root.after(0, lambda e=e: self._notify('ERROR', 'Emissions Load Error', str(e), exc=e))
+                        self.root.after(0, lambda e=e: self._notify('ERROR', 'Emissions Load Error', str(e), exc=e))
                     return
                 
                 # Apply fill-nan if configured
@@ -2214,14 +1674,9 @@ class EmissionGUI:
                 self._last_loaded_delim_state = current_delim_state
                 
                 # Pre-compute SCC data in thread
-                logging.info("DEBUG: Computing SCC data...")
                 scc_data = self._compute_scc_data(self.raw_df)
                 
-                logging.info("DEBUG: Finalizing loaded emissions...")
-                if hasattr(self.root, 'finalize_signal'):
-                     self.root.finalize_signal.emit(show_preview, None, scc_data)
-                else:
-                     self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
+                self.root.after(0, lambda: self._finalize_loaded_emissions(show_preview=show_preview, scc_data=scc_data))
         
         except Exception as e:
             self.root.after(0, lambda: self._notify('ERROR', 'Async Load Error', str(e), exc=e))
@@ -2494,6 +1949,47 @@ class EmissionGUI:
                     _do_notify('WARNING', 'Geometry Missing Column', f"Selected geometry layer lacks '{merge_on}' column.")
                     raise ValueError("Handled")
 
+        pol_tuple = tuple(self.pollutants or [])
+        if not pol_tuple:
+            try:
+                pol_tuple = tuple(detect_pollutants(self.emissions_df))
+            except Exception:
+                pol_tuple = ()
+
+        cache_key = (
+            geometry_tag or mode,
+            merge_on or '',
+            id(base_gdf) if base_gdf is not None else 0,
+            id(self.emissions_df) if isinstance(self.emissions_df, pd.DataFrame) else 0,
+            id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
+            sel_code if use_scc_filter else '',
+            pol_tuple,
+            pollutant or '',
+            getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
+            getattr(self, 'fill_nan_arg', None),
+            # Filter overlay state
+            getattr(self, 'filter_overlay_var', None) and self.filter_overlay_var.get(),
+            id(self.overlay_gdf) if getattr(self, 'overlay_gdf', None) is not None else 0
+        )
+        cached = self._merged_cache.get(cache_key)
+        if cached is not None:
+            cached_merged, cached_prepared, cached_key = cached
+            try:
+                merged_view = cached_merged.copy()
+            except Exception:
+                merged_view = cached_merged
+            try:
+                if cached_prepared is not None:
+                    merged_view.attrs['__prepared_emis'] = cached_prepared
+            except Exception:
+                pass
+            try:
+                if cached_key:
+                    merged_view.attrs['__merge_key'] = cached_key
+            except Exception:
+                pass
+            return merged_view
+
         emis_for_merge = self.emissions_df if isinstance(self.emissions_df, pd.DataFrame) else None
         if emis_for_merge is None:
             _do_notify('ERROR', 'No Emissions Data', 'Emissions dataset is not loaded or invalid.')
@@ -2525,51 +2021,6 @@ class EmissionGUI:
                                 self.units_map[target_pol] = v_meta.get('units', '')
                     except Exception as e:
                         _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
-
-        pol_tuple = tuple(self.pollutants or [])
-        if not pol_tuple:
-            try:
-                pol_tuple = tuple(detect_pollutants(self.emissions_df))
-            except Exception:
-                pol_tuple = ()
-
-        cache_key = (
-            geometry_tag or mode,
-            merge_on or '',
-            id(base_gdf) if base_gdf is not None else 0,
-            id(self.emissions_df) if isinstance(self.emissions_df, pd.DataFrame) else 0,
-            # Add columns signature to detect new columns (lazy loaded)
-            tuple(self.emissions_df.columns) if isinstance(self.emissions_df, pd.DataFrame) else (),
-            id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
-            sel_code if use_scc_filter else '',
-            pol_tuple,
-            # pollutant removed to allow reuse of merged geometry across pollutants
-            getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
-            getattr(self, 'fill_nan_arg', None),
-            # Filter overlay state
-            getattr(self, 'filter_overlay_var', None) and self.filter_overlay_var.get(),
-            id(self.overlay_gdf) if getattr(self, 'overlay_gdf', None) is not None else 0
-        )
-        cached = self._merged_cache.get(cache_key)
-        if cached is not None:
-            cached_merged, cached_prepared, cached_key = cached
-            try:
-                merged_view = cached_merged.copy()
-            except Exception:
-                merged_view = cached_merged
-            try:
-                if cached_prepared is not None:
-                    merged_view.attrs['__prepared_emis'] = cached_prepared
-            except Exception:
-                pass
-            try:
-                if cached_key:
-                    merged_view.attrs['__merge_key'] = cached_key
-            except Exception:
-                pass
-            return merged_view
-        
-        # emis_for_merge is already defined above
 
         raw_df_for_scc = None
         if use_scc_filter and isinstance(self.raw_df, pd.DataFrame):
@@ -2674,55 +2125,29 @@ class EmissionGUI:
         # Apply fill_nan if configured (for map regions with no data)
         try:
             fill_arg = getattr(self, 'fill_nan_arg', None)
-            
-            # Use GUI checkbox state if available, else derive from argument
-            fill_zero_state = False
-            if hasattr(self, 'fill_zero_var'):
-                fill_zero_state = bool(self.fill_zero_var.get())
-            
+            fill_zero = getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get()
+
             do_fill = False
             fill_val = 0.0
 
-            if fill_zero_state:
+            if fill_zero:
                 do_fill = True
                 fill_val = 0.0
             elif fill_arg is not None:
-                # If "Fill NaN=0" is UNCHECKED, we specifically IGNORE the argument if it was 0
-                # But if argument is a non-zero value, we might still respect it?
-                # The user request implies: Only fill if specified.
-                # If checkbox is OFF, then fill_zero_state is False.
-                # If fill_arg is provided (e.g. from config), we should respect it ONLY IF
-                # the checkbox hasn't explicitly overridden it.
-                # However, the checkbox is initialized FROM the argument.
-                # So if the user unticks it, fill_zero_var becomes False.
-                
-                # Logic:
-                # 1. If checkbox is checked -> Fill 0.
-                # 2. If checkbox is unchecked -> Do NOT fill 0. 
-                #    (But what if fill_arg was 999? Should we fill 999?)
-                #    The checkbox is labeled "Fill NaN=0".
-                
-                # Let's support custom fill values if fill_arg is not 0/False
-                try:
-                    arg_val = float(fill_arg)
-                    if abs(arg_val) > 1e-9: # Non-zero custom fill
+                if isinstance(fill_arg, bool) and not fill_arg:
+                    do_fill = False
+                elif isinstance(fill_arg, str) and str(fill_arg).lower() == 'false':
+                    do_fill = False
+                else:
+                    try:
+                        fill_val = float(fill_arg)
                         do_fill = True
-                        fill_val = arg_val
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
                 
             if do_fill:
                 # Identify pollutant columns to fill
-                pols = list(getattr(self, 'pollutants', []) or [])
-                
-                # Ensure the currently active pollutant is included (crucial for lazy-loaded vars)
-                cur_pol = pollutant
-                if not cur_pol and hasattr(self, 'pollutant_var'):
-                    try: cur_pol = self.pollutant_var.get()
-                    except: pass
-                if cur_pol and cur_pol not in pols:
-                    pols.append(cur_pol)
-
+                pols = getattr(self, 'pollutants', [])
                 if pols:
                     cols_to_fill = [c for c in pols if c in merged.columns]
                     if cols_to_fill:
@@ -3158,10 +2583,7 @@ class EmissionGUI:
         try:
             # Thread-safe notify wrapper
             def safe_notify(level, title, msg, exc=None, **kwargs):
-                if hasattr(self.root, 'run_on_main_signal'):
-                    self.root.run_on_main_signal.emit(lambda l=level, t=title, m=msg, ex=exc, kw=kwargs: self._notify(l, t, m, exc=ex, **kw))
-                else:
-                    self.root.after(0, lambda l=level, t=title, m=msg, ex=exc, kw=kwargs: self._notify(l, t, m, exc=ex, **kw))
+                self.root.after(0, lambda: self._notify(level, title, msg, exc=exc, **kwargs))
 
             try:
                 merged = self._merged(
@@ -3179,12 +2601,8 @@ class EmissionGUI:
                 raise ve
             
             if merged is None:
-                if hasattr(self.root, 'run_on_main_signal'):
-                    self.root.run_on_main_signal.emit(lambda: self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.'))
-                    self.root.run_on_main_signal.emit(self._enable_plot_btn)
-                else:
-                    self.root.after(0, lambda: self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.'))
-                    self.root.after(0, self._enable_plot_btn)
+                self.root.after(0, lambda: self._notify('WARNING', 'Missing Data', 'Load smkreport and shapefile first.'))
+                self.root.after(0, self._enable_plot_btn)
                 return
 
             # Reproject
@@ -3199,18 +2617,11 @@ class EmissionGUI:
             except Exception:
                 merged_plot = merged
             
-            if hasattr(self.root, 'run_on_main_signal'):
-                self.root.run_on_main_signal.emit(lambda m=merged, mp=merged_plot, p=pollutant, pi=plot_crs_info: self._finalize_plot(m, mp, p, pi))
-            else:
-                self.root.after(0, lambda m=merged, mp=merged_plot, p=pollutant, pi=plot_crs_info: self._finalize_plot(m, mp, p, pi))
+            self.root.after(0, lambda: self._finalize_plot(merged, merged_plot, pollutant, plot_crs_info))
             
         except Exception as e:
-            if hasattr(self.root, 'run_on_main_signal'):
-                self.root.run_on_main_signal.emit(lambda e=e: self._notify('ERROR', 'Plot Prep Error', str(e), exc=e))
-                self.root.run_on_main_signal.emit(self._enable_plot_btn)
-            else:
-                self.root.after(0, lambda e=e: self._notify('ERROR', 'Plot Prep Error', str(e), exc=e))
-                self.root.after(0, self._enable_plot_btn)
+            self.root.after(0, lambda: self._notify('ERROR', 'Plot Prep Error', str(e), exc=e))
+            self.root.after(0, self._enable_plot_btn)
 
     def _finalize_plot(self, merged, merged_plot, pollutant, plot_crs_info):
         import time
@@ -3230,7 +2641,7 @@ class EmissionGUI:
         # Lazy import for embedding
         from matplotlib.figure import Figure
         try:
-            pass; # from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         except Exception as e:
             self._notify('ERROR', 'Backend Error', f'Failed to load TkAgg backend: {e}', exc=e)
             return
@@ -3321,15 +2732,6 @@ class EmissionGUI:
                 fig_h = max(3.5, min(10.0, base_h * getattr(self, '_ui_scale', 1.0)))
             except Exception:
                 fig_w, fig_h = 9.0, 5.0
-            
-            try:
-                # Force window size based on figure size + padding for toolbar
-                w_px = int(fig_w * 100)
-                h_px = int(fig_h * 100) + 100
-                win.geometry(f"{w_px}x{h_px}")
-            except Exception:
-                pass
-
             local_fig = Figure(figsize=(fig_w, fig_h), dpi=100)
             local_ax = local_fig.add_subplot(111)
             canvas = FigureCanvasTkAgg(local_fig, master=plot_container)
@@ -3633,9 +3035,10 @@ class EmissionGUI:
                         # Determine formatter that shows requested precision
                         def _fmt_precise(x, pos=None):
                             if x == 0: return "0"
-                            # Use .6g which allows up to 6 significant digits (e.g. 100,000)
-                            # without forcing scientific notation, unless very small (< 1e-4) or very large.
-                            return f"{x:.6g}"
+                            # If very small, use up to 4 decimal places, else standard
+                            if 0 < abs(x) < 0.1:
+                                return f"{x:.4g}"
+                            return f"{x:.4g}"
                         
                         from matplotlib.ticker import FuncFormatter
 
@@ -3848,12 +3251,9 @@ class EmissionGUI:
             title_lines.append(f"SCC: {sel_disp}")
         
         # Apply Title to Axes (Fix for missing title)
-        title_holder = {'text': ""}
         try:
             if title_lines:
-                base_t = "\n".join(title_lines)
-                local_ax.set_title(base_t, fontsize=12)
-                title_holder['text'] = base_t
+                local_ax.set_title("\n".join(title_lines), fontsize=12)
         except Exception:
             pass
 
@@ -3870,8 +3270,13 @@ class EmissionGUI:
         
         # Text artist (Stats) anchored to bottom-left inside axes
         # Defined early so it can be updated by Time Nav
-        # Moved to Title Area as requested
-        # stats_text = ... (Removed)
+        stats_text = local_ax.text(
+            0.01, 0.01,
+            "",
+            transform=local_ax.transAxes,
+            ha='left', va='bottom', fontsize=9, color='#333333', zorder=30,
+            bbox=dict(facecolor='white', edgecolor='#aaaaaa', alpha=0.7, pad=2)
+        )
 
         if is_ncf_source:
             ts_frame = ttk.Frame(plot_container)
@@ -4099,20 +3504,19 @@ class EmissionGUI:
 
                             u_str = f" ({units})" if units else ""
                             new_title = f"{pollutant}{u_str}\nTime: {time_lbl}"
-                            try: title_holder['text'] = new_title
-                            except: pass
-                            
-                            stats_part = ""
+                            local_ax.set_title(new_title)
+
                             if filtered.size > 0:
                                 mn = np.min(filtered); mx = np.max(filtered)
                                 u = np.mean(filtered); s = np.sum(filtered)
                                 def _fs(v): return f"{v:.4g}"
-                                stats_part = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
-                                if units: stats_part += f" {units}"
+                                stats_txt = f"Min: {_fs(mn)}  Mean: {_fs(u)}  Max: {_fs(mx)}  Sum: {_fs(s)}"
+                                if units: stats_txt += f" {units}"
+                                try: stats_text.set_text(stats_txt)
+                                except: pass
                             else:
-                                stats_part = "No Data in View"
-                            
-                            local_ax.set_title(new_title + "\n" + stats_part, fontsize=12)
+                                try: stats_text.set_text("No Data in View")
+                                except: pass
                         except Exception as ex:
                             print(f"Stats update error: {ex}")
                          
@@ -4290,16 +3694,9 @@ class EmissionGUI:
                 ts_view = tk.Toplevel(self.root)
                 ts_title = f"{pollutant} Time Series ({mode.title()}) - {len(subset)} Cells"
                 ts_view.title(ts_title)
-                try:
-                    # 800x500 base size for time series popups
-                    w_ts = int(800 * getattr(self, '_ui_scale', 1.0))
-                    h_ts = int(500 * getattr(self, '_ui_scale', 1.0))
-                    ts_view.geometry(f"{w_ts}x{h_ts}")
-                except Exception:
-                    ts_view.geometry("800x500")
                  
                 import matplotlib.pyplot as plt
-                pass; # from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
                  
                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
                 times = result['times']
@@ -4358,15 +3755,8 @@ class EmissionGUI:
             def _display_ts_window(result, title_msg):
                 ts_view = tk.Toplevel(self.root)
                 ts_view.title(title_msg)
-                try:
-                    # 800x500 base size for time series popups
-                    w_ts = int(800 * getattr(self, '_ui_scale', 1.0))
-                    h_ts = int(500 * getattr(self, '_ui_scale', 1.0))
-                    ts_view.geometry(f"{w_ts}x{h_ts}")
-                except Exception:
-                    ts_view.geometry("800x500")
                 import matplotlib.pyplot as plt
-                pass; # from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+                from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
                  
                 fig_ts, ax_ts = plt.subplots(figsize=(8, 4))
                 times = result['times']
@@ -4787,90 +4177,100 @@ class EmissionGUI:
                 )
 
             def _update_stats_for_view():
-                def _do_update(stats_t):
-                    txt = _format_stats(stats_t)
-                    base = title_holder.get('text', "")
-                    if not base: base = "\n".join(title_lines)
-                    local_ax.set_title(base + "\n" + txt, fontsize=12)
+                if global_stats is None:
+                    stats_text.set_text(_format_stats(None))
                     try:
                         local_fig.canvas.draw_idle()
                     except Exception:
                         pass
-
-                if global_stats is None:
-                    _do_update(None)
                     return
                 xlim = local_ax.get_xlim()
                 ylim = local_ax.get_ylim()
                 if base_view_holder['limits'] is None:
                     base_view_holder['limits'] = (xlim, ylim)
-                    _do_update(global_stats)
+                    stats_text.set_text(_format_stats(global_stats))
+                    try:
+                        local_fig.canvas.draw_idle()
+                    except Exception:
+                        pass
                     return
                 if _view_matches_base(xlim, ylim):
-                    _do_update(global_stats)
+                    stats_text.set_text(_format_stats(global_stats))
+                    try:
+                        local_fig.canvas.draw_idle()
+                    except Exception:
+                        pass
                     return
                 try:
                     from shapely.geometry import box as _box
                 except Exception:
-                    _do_update(global_stats)
-                    return
-                if not (xlim[0] < xlim[1] and ylim[0] < ylim[1]):
-                    _do_update(global_stats)
-                    return
-                
-                try:
-                    bbox_geom = _box(min(xlim), min(ylim), max(xlim), max(ylim))
+                    stats_text.set_text(_format_stats(global_stats))
                     try:
-                        sidx = gdf_for_stats.sindex
-                    except Exception:
-                        sidx = None
-                    if sidx is not None:
-                        try:
-                            idx = list(sidx.intersection(bbox_geom.bounds))
-                            sub = gdf_for_stats.iloc[idx]
-                        except Exception:
-                            sub = gdf_for_stats
-                    else:
-                        sub = gdf_for_stats
-                    try:
-                        sub = sub[sub.geometry.intersects(bbox_geom)]
+                        local_fig.canvas.draw_idle()
                     except Exception:
                         pass
-                    subset_values = None
-                    if (
-                        prepared_for_stats is not None
-                        and merge_key_name
-                        and hasattr(sub, 'columns')
-                        and merge_key_name in sub.columns
-                        and merge_key_name in prepared_for_stats.columns
-                    ):
-                        try:
-                            keys = sub[merge_key_name]
-                            keys = keys[keys.notna()]
-                            if not keys.empty:
-                                subset_values = prepared_for_stats.loc[
-                                    prepared_for_stats[merge_key_name].isin(keys.unique()),
-                                    pol,
-                                ]
-                        except Exception:
-                            subset_values = None
-                    if subset_values is None:
-                        if sub is not None and hasattr(sub, 'index'):
-                            try:
-                                subset_values = merged.loc[sub.index, pol]
-                            except Exception:
-                                try:
-                                    subset_values = sub.get(pol) if hasattr(sub, 'get') else None
-                                except Exception:
-                                    subset_values = None
-                        elif sub is not None and hasattr(sub, 'get'):
-                            subset_values = sub.get(pol)
-                    subset_stats = _calc_stats(subset_values)
-                    if subset_stats is None:
-                        subset_stats = global_stats
-                    _do_update(subset_stats)
+                    return
+                if not (xlim[0] < xlim[1] and ylim[0] < ylim[1]):
+                    stats_text.set_text(_format_stats(global_stats))
+                    try:
+                        local_fig.canvas.draw_idle()
+                    except Exception:
+                        pass
+                    return
+                bbox_geom = _box(min(xlim), min(ylim), max(xlim), max(ylim))
+                try:
+                    sidx = gdf_for_stats.sindex
                 except Exception:
-                    _do_update(global_stats)
+                    sidx = None
+                if sidx is not None:
+                    try:
+                        idx = list(sidx.intersection(bbox_geom.bounds))
+                        sub = gdf_for_stats.iloc[idx]
+                    except Exception:
+                        sub = gdf_for_stats
+                else:
+                    sub = gdf_for_stats
+                try:
+                    sub = sub[sub.geometry.intersects(bbox_geom)]
+                except Exception:
+                    pass
+                subset_values = None
+                if (
+                    prepared_for_stats is not None
+                    and merge_key_name
+                    and hasattr(sub, 'columns')
+                    and merge_key_name in sub.columns
+                    and merge_key_name in prepared_for_stats.columns
+                ):
+                    try:
+                        keys = sub[merge_key_name]
+                        keys = keys[keys.notna()]
+                        if not keys.empty:
+                            subset_values = prepared_for_stats.loc[
+                                prepared_for_stats[merge_key_name].isin(keys.unique()),
+                                pol,
+                            ]
+                    except Exception:
+                        subset_values = None
+                if subset_values is None:
+                    if sub is not None and hasattr(sub, 'index'):
+                        try:
+                            subset_values = merged.loc[sub.index, pol]
+                        except Exception:
+                            try:
+                                subset_values = sub.get(pol) if hasattr(sub, 'get') else None
+                            except Exception:
+                                subset_values = None
+                    elif sub is not None and hasattr(sub, 'get'):
+                        subset_values = sub.get(pol)
+                subset_stats = _calc_stats(subset_values)
+                if subset_stats is None:
+                    subset_stats = global_stats
+                stats_text.set_text(_format_stats(subset_stats))
+                try:
+                    local_fig.canvas.draw_idle()
+                except Exception:
+                    pass
             # Connect to axis limit changes
             # Connect to axis limit changes
             plot_state['stats_cbids'] = []
@@ -5103,6 +4503,104 @@ class EmissionGUI:
         self._invalidate_merge_cache()
         if notify_success:
             self._notify('INFO', 'FF10 Grid Mapping', 'Mapped FF10 point records to grid cells.', popup=False)
+
+    def show_detailed_stats(self):
+        """Show pollutant statistics per file."""
+        pol = self.pollutant_var.get()
+        if not pol:
+            return
+        if self.emissions_df is None:
+            return
+            
+        win = tk.Toplevel(self.root)
+        win.title(f"Detailed Statistics: {pol}")
+        win.geometry(f"{int(800*self._ui_scale)}x{int(400*self._ui_scale)}")
+        
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill='both', expand=True)
+        
+        columns = ('Source', 'Sum', 'Max', 'Mean', 'Count')
+        table = ttk.Treeview(frm, columns=columns, show='headings')
+        for col in columns:
+            table.heading(col, text=col)
+            table.column(col, width=100, anchor='e')
+        table.column('Source', width=300, anchor='w')
+        
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=vsb.set)
+        
+        table.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+        
+        summaries = self.emissions_df.attrs.get('per_file_summaries', [])
+        
+        # Combined stats from current DF
+        combined_row = {}
+        try:
+            # Only use numeric values
+            vals = pd.to_numeric(self.emissions_df[pol], errors='coerce').dropna()
+            if not vals.empty:
+                combined_row = {
+                    'source': 'TOTAL (Combined)',
+                    'sum': float(vals.sum()),
+                    'max': float(vals.max()),
+                    'mean': float(vals.mean()),
+                    'count': len(vals)
+                }
+        except Exception: pass
+        
+        rows = []
+        for s in summaries:
+            pstats = s.get('pollutants', {}).get(pol)
+            if pstats:
+                rows.append({
+                    'source': os.path.basename(str(s.get('source'))),
+                    'sum': pstats['sum'],
+                    'max': pstats['max'],
+                    'mean': pstats['mean'],
+                    'count': pstats['count']
+                })
+        
+        if combined_row:
+             rows.append(combined_row)
+             
+        if not rows:
+            ttk.Label(frm, text=f"No statistics available for {pol}.\nLoad multiple files to see breakdown.").pack()
+            table.pack_forget()
+            vsb.pack_forget()
+        else:
+            for r in rows:
+                table.insert('', 'end', values=(
+                    r['source'],
+                    f"{r['sum']:.4g}",
+                    f"{r['max']:.4g}",
+                    f"{r['mean']:.4g}",
+                    str(r['count'])
+                ))
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
+
+    def show_meta(self):
+        """Show metadata summary."""
+        if self.emissions_df is None:
+            return
+        meta_text = self._last_attrs_summary or self._format_attrs_for_display(self.emissions_df)
+        
+        win = tk.Toplevel(self.root)
+        win.title("Metadata")
+        win.geometry(f"{int(800*self._ui_scale)}x{int(600*self._ui_scale)}")
+        
+        txt = tk.Text(win, font=("Courier", 10))
+        txt.insert('1.0', meta_text)
+        txt.config(state='disabled')
+        
+        vsb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        
+        txt.pack(side='left', fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+        
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=5)
 
     def _build_summary(self, mode: str) -> pd.DataFrame:
         raw = self._get_raw_for_summary()

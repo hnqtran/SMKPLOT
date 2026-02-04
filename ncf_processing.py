@@ -1903,14 +1903,18 @@ def get_ncf_animation_data(
             logging.error(f"Inline Animation data failed: {e}")
             return None
 
+    logging.debug(f"Entering get_ncf_animation_data for {pollutant}")
     with netCDF4.Dataset(ncf_path, 'r') as ds:
+        logging.debug("Opened dataset")
         tflag_vals = []
         if 'TFLAG' in ds.variables:
+            logging.debug("Reading TFLAG")
             tflag = ds.variables['TFLAG'][:]
             # TFLAG is usually (TSTEP, VAR, 2). 
             dates = tflag[:, 0, 0]
             times = tflag[:, 0, 1]
             tflag_vals = [f"{d}_{t:06d}" for d, t in zip(dates, times)]
+            logging.debug(f"Found {len(tflag_vals)} time steps")
         else:
             # Fallback
             dim_t = ds.dimensions.get('TSTEP')
@@ -1924,6 +1928,7 @@ def get_ncf_animation_data(
             # Read full data: (T, LAY, ROW, COL)
             # Optimize: if layer_idx is fixed, slice it early
             dims = var_obj.dimensions
+            logging.debug(f"Extracting {pollutant} with dims {dims}")
             
             # Logic to slice correct dims
             # IOAPI: TSTEP, LAY, ROW, COL
@@ -1941,7 +1946,9 @@ def get_ncf_animation_data(
                 # For animation, memory is concern. But let's try reading all if aggregating.
             
             try:
+                logging.debug(f"Reading data slice for {pollutant}")
                 data = var_obj[tuple(slices)] # Now (T, [LAY], ROW, COL) or (T, ROW, COL)
+                logging.debug(f"Data read complete. Shape: {data.shape}")
                 
                 # If we still have LAY (because of aggregation)
                 current_dims = [d for i, d in enumerate(dims) if isinstance(slices[i], slice)]
@@ -1959,12 +1966,13 @@ def get_ncf_animation_data(
                     # Select cells
                     r_idx = np.array(row_indices, dtype=int)
                     c_idx = np.array(col_indices, dtype=int)
-                     
+                    
                     # Check bounds validity
                     if len(r_idx) > 0 and (r_idx.max() >= data.shape[1] or c_idx.max() >= data.shape[2]):
                         return None
 
                     # Vectorized selection: data[:, r, c]
+                    logging.debug(f"Performing vectorized selection for {len(r_idx)} cells")
                     result = data[:, r_idx, c_idx] # (T, N)
                     return {'times': tflag_vals, 'values': result, 'units': units}
                 
