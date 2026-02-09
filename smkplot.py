@@ -177,7 +177,7 @@ def parse_args():
     ap.add_argument('--stack-groups', help='Path to STACK_GROUPS file (for Inline Point Source processing).')
     ap.add_argument('--griddesc', help='Path to GRIDDESC file (for batch grid plotting).')
     ap.add_argument('--gridname', help='Name of the grid in GRIDDESC (for batch grid plotting).')
-    ap.add_argument('--pltyp', choices=['county', 'grid'], default='county', help='Plot by county or grid (batch mode). Default: county.')
+    ap.add_argument('--pltyp', choices=['county', 'grid'], default=None, help='Plot by county or grid (batch mode). Default: county.')
     ap.add_argument('--force-lcc', action='store_true', help='Force legacy CONUS LCC projection in batch mode even without GRIDDESC (deprecated behavior).')
     ap.add_argument('--projection', choices=['auto','wgs84','lcc'], default='lcc', help='Projection mode: auto (if gridname provided, use grid projection; else WGS84), wgs84 (always geographic), lcc (always LCC; grid-specific if grid provided else default CONUS).')
     ap.add_argument('--pollutant', help='Pollutant(s) to plot (batch mode or to preselect in GUI). Separate multiple values with comma or space.')
@@ -196,8 +196,7 @@ def parse_args():
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
-    ap.add_argument('--gui-lib', choices=['tk', 'qt'], default='qt', help='GUI toolkit to use: qt (default) or tk.')
-    ap.add_argument('--qt-test', action='store_true', help='Test the native Qt GUI implementation (from gui.py).')
+    ap.add_argument('--gui', choices=['qt', 'tk', 'auto'], default='auto', help='GUI toolkit to use: qt, tk or auto (default).')
 
     args = ap.parse_args()
 
@@ -302,6 +301,8 @@ def main():
         logging.info("Batch mode explicitly requested.")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
+        if getattr(args, 'pltyp', None) is None:
+            args.pltyp = 'county'
         from batch import _batch_mode  # Lazy import
         return _batch_mode(args)
 
@@ -317,17 +318,51 @@ def main():
     has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     
     # Selection of engine
-    gui_engine = args.gui_lib or 'qt'
+    # 'qt' -> gui_qt.py (PySide6 Shim)
+    # 'tk' -> gui_tk.py (Tkinter)
+    # 'auto' -> Try gui.py (Native) -> gui_qt.py -> gui_tk.py
+
+    requested_mode = args.gui or 'auto'
+    target_impl = None
+
+    if requested_mode == 'auto':
+        # Priority 1: Native PySide6 (gui.py)
+        try:
+            import PySide6
+            import gui
+            target_impl = 'native'
+            logging.info("Auto-selected: Native PySide6 GUI (gui.py)")
+        except ImportError:
+            # Priority 2: Shimmed Qt (gui_qt.py) - also uses PySide6 but with Shim
+            try:
+                import PySide6
+                import gui_qt
+                target_impl = 'qt_shim'
+                logging.info("Auto-selected: Shimmed Qt GUI (gui_qt.py)")
+            except ImportError:
+                 # Priority 3: Tkinter
+                 try:
+                     import tkinter
+                     target_impl = 'tk'
+                     logging.info("Auto-selected: Tkinter GUI (gui_tk.py)")
+                 except ImportError:
+                     target_impl = None
+                     logging.warning("No GUI libraries found.")
+    elif requested_mode == 'qt':
+        target_impl = 'qt_shim'
+    elif requested_mode == 'tk':
+         target_impl = 'tk'
     
     # Special case: check if GUI is actually possible
+    has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     if not has_display:
         # One last attempt to see if we can connect to a display (might be needed for some X11 forwarding)
         try:
-            if gui_engine == 'qt':
+            if target_impl in ['native', 'qt_shim']:
                 from PySide6.QtWidgets import QApplication
                 app = QApplication.instance() or QApplication([sys.argv[0]])
                 has_display = True
-            else:
+            elif target_impl == 'tk':
                 import tkinter as tk
                 t = tk.Tk(); t.withdraw(); t.destroy()
                 has_display = True
@@ -339,47 +374,47 @@ def main():
         logging.error("Unable to initialize GUI: No DISPLAY detected. Falling back to batch mode.")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
+        if getattr(args, 'pltyp', None) is None:
+            args.pltyp = 'county'
         from batch import _batch_mode
         return _batch_mode(args)
 
     # GUI path
     try:
-        # Qt Dispatch
-        if gui_engine == 'qt':
-            if getattr(args, 'qt_test', False):
-                logging.info("Launching Native Qt GUI (gui.py)...")
-                try:
-                    from PySide6.QtWidgets import QApplication
-                    from PySide6.QtGui import QFont, QPalette, QColor
-                    from PySide6.QtCore import Qt
-                    from gui import NativeEmissionGUI
-                    
-                    app = QApplication.instance() or QApplication(sys.argv)
-                    app.setStyle("Fusion")
-                    
-                    gui = NativeEmissionGUI(
-                        inputfile_path=args.filepath,
-                        counties_path=args.county_shapefile,
-                        emissions_delim=args.delim,
-                        grid_name=args.gridname,
-                        griddesc=args.griddesc,
-                        pollutant=args.pollutant,
-                        json_payload=args
-                    )
-                    gui.show()
-                    sys.exit(app.exec())
-                except ImportError as ie:
-                    logging.error(f"Native Qt launch failed: {ie}")
-                    return 1
-                except Exception as e:
-                    logging.exception(f"Native Qt Runtime Error: {e}")
-                    return 1
+        # Native PySide6 Dispatch (gui.py)
+        if target_impl == 'native':
+            logging.info("Launching Native Qt GUI (gui.py)...")
+            try:
+                from PySide6.QtWidgets import QApplication
+                from gui import NativeEmissionGUI
+                
+                app = QApplication.instance() or QApplication(sys.argv)
+                app.setStyle("Fusion")
+                
+                gui = NativeEmissionGUI(
+                    inputfile_path=args.filepath,
+                    counties_path=args.county_shapefile,
+                    emissions_delim=args.delim,
+                    grid_name=args.gridname,
+                    griddesc=args.griddesc,
+                    pollutant=args.pollutant,
+                    json_payload=args
+                )
+                gui.show()
+                sys.exit(app.exec())
+            except ImportError as ie:
+                logging.error(f"Native Qt launch failed: {ie}")
+                return 1
+            except Exception as e:
+                logging.exception(f"Native Qt Runtime Error: {e}")
+                return 1
 
-            logging.info("Launching Qt GUI (Local .venv)...")
+        # Shimmed Qt Dispatch (gui_qt.py)
+        elif target_impl == 'qt_shim':
+            logging.info("Launching Shimmed Qt GUI (gui_qt.py)...")
             try:
                 from PySide6.QtWidgets import QApplication
                 from PySide6.QtGui import QFont
-                # Import the Shimmed GUI and its fake 'tk' module to get Root
                 from gui_qt import EmissionGUI as QtGUI, tk as qt_tk
                 
                 app = QApplication.instance() or QApplication(sys.argv)
@@ -389,10 +424,7 @@ def main():
                     app.setFont(font)
                 except: pass
                 
-                # Create Root (QMainWindow wrapped)
                 root = qt_tk.Tk() 
-                
-                # Instantiate
                 app_gui = QtGUI(
                     root,
                     args.filepath,
@@ -401,20 +433,20 @@ def main():
                     cli_args=args,
                     app_version=SMKPLOT_VERSION
                 )
-                
                 root.show()
                 sys.exit(app.exec())
             except ImportError as ie:
-                logging.error(f"Qt launch failed: {ie}. Check PySide6 installation in .venv.")
-                return 1
+                 logging.error(f"Qt Launch Failed: {ie}")
+                 return 1
             except Exception as e:
-                logging.error(f"Qt Runtime Error: {e}")
-                import traceback
-                traceback.print_exc()
-                return 1
+                 logging.error(f"Qt Runtime Error: {e}")
+                 import traceback
+                 traceback.print_exc()
+                 return 1
 
+        # Tkinter Dispatch (gui_tk.py)
         import tkinter as tk  # re-import safe
-        from gui import EmissionGUI  # Lazy import
+        from gui_tk import EmissionGUI  # Lazy import
         root = tk.Tk()
         app = EmissionGUI(
             root,

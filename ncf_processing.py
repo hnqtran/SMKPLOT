@@ -865,7 +865,10 @@ def read_ncf_emissions(
             
             # Add GRID_RC after filtering to be faster
             logging.info("DEBUG: Adding GRID_RC...")
-            gdf['GRID_RC'] = [f"{r:d}_{c:d}" for r, c in zip(gdf['ROW'], gdf['COL'])]
+            try:
+                gdf['GRID_RC'] = gdf['ROW'].astype(str) + "_" + gdf['COL'].astype(str)
+            except Exception:
+                gdf['GRID_RC'] = [f"{r:d}_{c:d}" for r, c in zip(gdf['ROW'], gdf['COL'])]
             
             # Set CRS
             proj_obj = get_proj_object_from_info(gi)
@@ -1501,6 +1504,8 @@ def get_ncf_timeseries(
 
                 # Now data is (T, N_Selected_Sources)
                 # Handle singleton dimensions (e.g. COL=1)
+                logging.debug(f"[TS Extraction] Raw Data Shape: {data.shape}")
+                
                 if data.ndim > 2:
                         # Flatten trailing singletons
                         if data.shape[-1] == 1:
@@ -1511,6 +1516,7 @@ def get_ncf_timeseries(
                 # New logic: Return Total PLUS Individual components if feasible.
                   
                 series_total = np.sum(data, axis=-1)
+                logging.debug(f"[TS Extraction] Series Total Shape: {series_total.shape}")
                   
                 # Create result structure
                 # To avoid breaking existing consumers, we can return 'values' as the total, 
@@ -2040,10 +2046,12 @@ def read_inline_emissions_lazy(inln_path, stack_groups_path, pollutants, tstep_i
             reductions.sort(key=lambda x: x[0], reverse=True)
             
             for ax, op in reductions:
+                logging.debug(f"[InlineLazy] Reducing Axis {ax} with Op '{op}'. Data Shape: {data.shape}")
                 if op == 'mean': data = np.mean(data, axis=ax)
                 elif op == 'max': data = np.max(data, axis=ax)
                 elif op == 'min': data = np.min(data, axis=ax)
                 else: data = np.sum(data, axis=ax)
+                logging.debug(f"[InlineLazy] Result Shape: {data.shape}, Sum: {np.sum(data)}")
             
             data = data.flatten()
             grid = np.zeros((gi['nrows'], gi['ncols']), dtype=np.float32)

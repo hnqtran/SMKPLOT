@@ -43,7 +43,7 @@ from shapely.geometry import Polygon
 
 from config import (
     US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
-    DEFAULT_ONLINE_COUNTIES_URL
+    DEFAULT_ONLINE_COUNTIES_URL, SCC_COLS, DESC_COLS
 )
 from utils import normalize_delim, is_netcdf_file
 from data_processing import (
@@ -166,6 +166,22 @@ class QtTkMixin:
 
     def config(self, **kwargs):
         self.configure(**kwargs)
+
+    def state(self, flags):
+        if not flags: return
+        s = flags[0]
+        if s == "disabled": self.setEnabled(False)
+        elif s == "!disabled": self.setEnabled(True)
+        elif s == "readonly": self.setEnabled(True) # simplified
+
+    def __setitem__(self, key, value):
+        self.configure(**{key: value})
+
+    def __getitem__(self, key):
+        # Specific shims for common Tk attributes
+        if key == 'values' and hasattr(self, 'count'):
+             return [self.itemText(i) for i in range(self.count())]
+        raise KeyError(key)
              
     def columnconfigure(self, index, weight=0, minsize=0):
         l = self.layout()
@@ -238,6 +254,7 @@ class Entry(QLineEdit, QtTkMixin):
                 textvariable.changed.connect(lambda v: self.setText(str(v)) if self.text() != str(v) else None)
             else:
                 textvariable.trace_add('write', lambda *_: self.setText(str(textvariable.get())) if self.text() != str(textvariable.get()) else None)
+        self.configure(**kwargs)
     def delete(self, first, last=None): self.setText("")
     def insert(self, index, string): self.setText(string)
     def get(self): return self.text()
@@ -253,6 +270,9 @@ class Combobox(QComboBox, QtTkMixin):
                 textvariable.changed.connect(lambda v: self.setCurrentText(str(v)) if self.currentText() != str(v) else None)
             else:
                 textvariable.trace_add('write', lambda *_: self.setCurrentText(str(textvariable.get())) if self.currentText() != str(textvariable.get()) else None)
+        if state is not None: kwargs['state'] = state
+        if values is not None: kwargs['values'] = values
+        self.configure(**kwargs)
     def current(self, newindex=None):
         if newindex is None: return self.currentIndex()
         self.setCurrentIndex(newindex)
@@ -2230,40 +2250,65 @@ class EmissionGUI:
         has = False
         items = []
         scc_map = {}
+        if not isinstance(df, pd.DataFrame):
+            return has, items, scc_map
+        
         try:
-            if isinstance(df, pd.DataFrame):
-                lower = {c.lower() for c in df.columns}
-                has = ('scc' in lower) or any(c in lower for c in ['scc description','scc_description'])
-                if has:
-                    # Build unique list of SCC + description
-                    cmap = {c.lower(): c for c in df.columns}
-                    scc_col = cmap.get('scc')
-                    desc_col = cmap.get('scc description') or cmap.get('scc_description')
-                    scc_series = df[scc_col].astype(str) if scc_col else pd.Series(['']*len(df))
-                    desc_series = df[desc_col].astype(str) if desc_col else pd.Series(['']*len(df))
-                    # Use code_key as primary key (prefer SCC, fallback to description)
-                    code_key = scc_series.where(scc_series.str.strip() != '', other=desc_series)
-                    display = code_key.str.strip()
-                    with_desc = desc_series.str.strip()
-                    # Combine display with description when available and not duplicate
-                    display = display.where(with_desc == '' , other=(code_key.str.strip() + ' – ' + with_desc))
-                    # Create unique by code_key keeping first description
-                    tmp = pd.DataFrame({'code': code_key.fillna(''), 'disp': display.fillna('')})
-                    tmp = tmp.drop_duplicates(subset=['code'])
-                    # Sort by code for stability
-                    try:
-                        tmp = tmp.sort_values('code')
-                    except Exception:
-                        pass
-                    items = [('All SCC', '')] + [(row.disp if row.disp else row.code, row.code) for row in tmp.itertuples(index=False)]
+            raw_cols = list(df.columns)
+            raw_cols_lower = {c.lower(): c for c in raw_cols}
+            scc_col = next((raw_cols_lower[c] for c in SCC_COLS if c in raw_cols_lower), None)
+            desc_col = next((raw_cols_lower[c] for c in DESC_COLS if c in raw_cols_lower), None)
+            
+            print(f">>> SCC_DEBUG: Columns found: {raw_cols}")
+            print(f">>> SCC_DEBUG: scc_col={scc_col}, desc_col={desc_col}")
+            
+            if scc_col:
+                has = True
+                # 2. Extract unique combinations and ensure string type
+                if desc_col:
+                    subset = df[[scc_col, desc_col]].drop_duplicates().astype(str)
+                    # Clean up whitespace
+                    subset[scc_col] = subset[scc_col].str.strip()
+                    subset[desc_col] = subset[desc_col].str.strip()
+                    # Filter out empty codes
+                    subset = subset[subset[scc_col].str.len() > 0]
+                    # Create display string
+                    subset['display'] = subset[scc_col] + " | " + subset[desc_col]
+                    
+                    # Sort by SCC code
+                    subset = subset.sort_values(scc_col)
+                    
+                    # Build map and items list
+                    items = [('All SCC', '')] + [(row.display, row[scc_col]) for row in subset.itertuples(index=False)]
                     scc_map = {d: c for d, c in items}
-        except Exception:
+                else:
+                    unique_sccs = sorted(df[scc_col].astype(str).str.strip().unique())
+                    unique_sccs = [s for s in unique_sccs if s]
+                    items = [('All SCC', '')] + [(s, s) for s in unique_sccs]
+                    scc_map = {s: s for s, _ in items}
+                print(f">>> SCC_DEBUG: Success. Found {len(items)-1} SCC items.")
+            elif desc_col:
+                # Fallback: if only description exists, use it as code
+                has = True
+                unique_descs = sorted(df[desc_col].astype(str).str.strip().unique())
+                unique_descs = [s for s in unique_descs if s]
+                items = [('All SCC', '')] + [(s, s) for s in unique_descs]
+                scc_map = {s: s for s, _ in items}
+                print(f">>> SCC_DEBUG: Success (Desc only). Found {len(items)-1} SCC items.")
+            else:
+                print(f">>> SCC_DEBUG: No SCC or Description column found.")
+                
+        except Exception as e:
+            print(f">>> SCC_DEBUG: FAILED with error: {e}")
+            logging.warning(f"SCC data computation failed: {e}")
             has = False
             items = []
             scc_map = {}
+            
         return has, items, scc_map
 
     def _update_scc_widgets(self, scc_data=None):
+        print(f">>> SCC_DEBUG: _update_scc_widgets called (raw_df is None: {self.raw_df is None})")
         if scc_data:
             has, items, scc_map = scc_data
         else:
@@ -2281,15 +2326,18 @@ class EmissionGUI:
         # Enable/disable widgets accordingly
         try:
             if self._has_scc_cols:
+                print(f">>> SCC_DEBUG: Enabling SCC widgets (count={len(self.scc_entry['values'])})")
                 self.scc_entry.state(['!disabled'])
                 self.scc_label.state(['!disabled'])
             else:
+                print(">>> SCC_DEBUG: Disabling SCC widgets (no cols found)")
                 self.scc_entry.state(['disabled'])
                 self.scc_label.state(['disabled'])
                 if self.scc_select_var:
                     self.scc_select_var.set('All SCC')
                 self._scc_display_to_code = {}
-        except Exception:
+        except Exception as e:
+            print(f">>> SCC_DEBUG: Widget update FAILED: {e}")
             pass
 
     def load_griddesc(self):
@@ -3755,10 +3803,7 @@ class EmissionGUI:
                 # Slightly behind the polygons (zorder=0 in draw function)
                 self._draw_graticule(local_ax, tf_fwd, tf_inv, lon_step=None, lat_step=None)
                 # Equal aspect to preserve shapes visually
-                try:
-                    local_ax.set_aspect('equal', adjustable='box')
-                except Exception:
-                    pass
+                # Aspect ratio is handled by Figure size and axis management
             else:
                 logging.warning("DEBUG GUI Graticule SKIPPED: Missing transformers or CRS")
         except Exception:

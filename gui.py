@@ -58,7 +58,8 @@ from PySide6.QtWidgets import (
     QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
     QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView,
     QDockWidget, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem
+    QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem,
+    QAbstractItemView
 )
 from PySide6.QtCore import (
     Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings
@@ -87,7 +88,7 @@ import matplotlib.patches as mpatches
 try:
     from config import (
         US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
-        DEFAULT_ONLINE_COUNTIES_URL
+        DEFAULT_ONLINE_COUNTIES_URL, SCC_COLS, DESC_COLS
     )
     from utils import normalize_delim, is_netcdf_file
     from data_processing import (
@@ -98,6 +99,77 @@ try:
     )
     from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
     from ncf_processing import get_ncf_dims, create_ncf_domain_gdf, read_ncf_grid_params
+
+    # --- Robust Monkey-patch for Graticule Recursion Guard ---
+    import plotting
+    _orig_draw_graticule = plotting._draw_graticule
+
+    def _guarded_draw_graticule(*args, **kwargs):
+        ax = args[0] if args else kwargs.get('ax')
+        if ax is None: return _orig_draw_graticule(*args, **kwargs)
+        if getattr(ax, '_smk_drawing_graticule', False): return {'lines': [], 'texts': []}
+        
+        # Additional safety check for finite bounds
+        try:
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+            if not (np.isfinite(xlim).all() and np.isfinite(ylim).all()):
+                return {'lines': [], 'texts': []}
+        except Exception: 
+            return {'lines': [], 'texts': []}
+
+        ax._smk_drawing_graticule = True
+        try:
+            # Force autoscale off during graticule drawing to prevent zoom loops
+            old_autoscale = ax.get_autoscale_on()
+            ax.set_autoscale_on(False)
+            res = _orig_draw_graticule(*args, **kwargs)
+            # Ensure we return a dict even if original returned None/empty
+            if not isinstance(res, dict):
+                 res = {'lines': [], 'texts': []}
+            ax.set_autoscale_on(old_autoscale)
+            return res
+        finally:
+            ax._smk_drawing_graticule = False
+
+    plotting._draw_graticule = _guarded_draw_graticule
+    _draw_graticule_fn = _guarded_draw_graticule
+
+    _orig_create_map_plot = plotting.create_map_plot
+    def _guarded_create_map_plot(*args, **kwargs):
+        # Allow disabling quadmesh via kwargs even if plotting.py doesn't natively support the toggle
+        disable_qm = kwargs.pop('disable_quadmesh', False)
+        force_qm = kwargs.pop('force_quadmesh', False)
+        gdf = args[0] if args else kwargs.get('gdf')
+        
+        if disable_qm and gdf is not None:
+            # Temporarily hide _smk_grid_info to trick plotting.py into using standard plotting
+            orig_info = gdf.attrs.get('_smk_grid_info')
+            if orig_info:
+                gdf.attrs['_smk_grid_info'] = None
+                try:
+                    res = _orig_create_map_plot(*args, **kwargs)
+                finally:
+                    gdf.attrs['_smk_grid_info'] = orig_info
+                return res
+        
+        # Guard internal _draw_graticule calls inside create_map_plot
+        ax = kwargs.get('ax')
+        if not ax and len(args) > 3: ax = args[3]
+        if ax:
+             if getattr(ax, '_smk_drawing_graticule', False):
+                  return _orig_create_map_plot(*args, **kwargs)
+             ax._smk_drawing_graticule = True
+             try:
+                  return _orig_create_map_plot(*args, **kwargs)
+             finally:
+                  ax._smk_drawing_graticule = False
+        
+        return _orig_create_map_plot(*args, **kwargs)
+    
+    plotting.create_map_plot = _guarded_create_map_plot
+    create_map_plot = _guarded_create_map_plot
+    # --------------------------------------------------------
 except ImportError:
     # Fallback for when running directly
     sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -373,9 +445,7 @@ class PlotWindow(QMainWindow):
         
         from plotting import create_map_plot, _label_colorbar
         ax = self.figure.add_subplot(111)
-        try:
-            ax.set_aspect('equal', adjustable='box')
-        except: pass
+        # Aspect ratio is handled by Figure size and create_map_plot management
         
         # Plotting parameters
         cmap = meta.get('cmap', 'viridis')
@@ -424,6 +494,7 @@ class NativeEmissionGUI(QMainWindow):
     update_log_signal = Signal(str)
     data_loaded_signal = Signal(list, bool) # pollutants, is_netcdf
     plot_ready_signal = Signal(object, str, dict) # gdf, column, meta
+    stop_progress_signal = Signal() # New signal to re-enable UI safely
     
     def __init__(self, 
                  inputfile_path: Optional[str] = None, 
@@ -437,35 +508,6 @@ class NativeEmissionGUI(QMainWindow):
                  app_version: str = "2.0"):
         super().__init__()
 
-        # --- Monkey-patch for Graticule Recursion Guard ---
-        # Since we cannot touch plotting.py directly, we wrap the function here.
-        import plotting
-        original_draw_graticule = plotting._draw_graticule
-        
-        def guarded_draw_graticule(*args, **kwargs):
-            ax = args[0] if args else kwargs.get('ax')
-            if ax is None: return original_draw_graticule(*args, **kwargs)
-            
-            # Use a specialized guard to prevent infinite recursion during zoom events
-            if getattr(ax, '_smk_drawing_graticule', False):
-                return None
-            ax._smk_drawing_graticule = True
-            try:
-                # Force autoscale off during graticule drawing to prevent zoom loops
-                original_autoscale = ax.get_autoscale_on()
-                ax.set_autoscale_on(False)
-                res = original_draw_graticule(*args, **kwargs)
-                ax.set_autoscale_on(original_autoscale)
-                return res
-            finally:
-                ax._smk_drawing_graticule = False
-        
-        plotting._draw_graticule = guarded_draw_graticule
-        
-        # Update local alias to ensure internal methods use the guarded version
-        import sys
-        module = sys.modules[__name__]
-        setattr(module, '_draw_graticule_fn', guarded_draw_graticule)
         # --------------------------------------------------
 
         self.setWindowTitle(f"SMKPLOT v{app_version} (Native Qt) (Author: tranhuy@email.unc.edu)")
@@ -580,6 +622,7 @@ class NativeEmissionGUI(QMainWindow):
         self.update_log_signal.connect(self.log_text.append)
         self.data_loaded_signal.connect(self._post_load_update)
         self.plot_ready_signal.connect(self._render_plot_on_main)
+        self.stop_progress_signal.connect(self._stop_progress)
         
         # --- Auto-Load if arguments present ---
         QTimer.singleShot(100, self._startup_load)
@@ -630,13 +673,73 @@ class NativeEmissionGUI(QMainWindow):
                 background-color: #fcfdfe;
             }
             
-            QComboBox::drop-down { border-left: 0px; }
+            QComboBox {
+                combobox-popup: 0;
+            }
+            QComboBox::drop-down { 
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 24px;
+                border-left: 1px solid #d1d5db;
+                background: #f1f5f9;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 6px solid #0f172a;
+                margin-top: 2px;
+            }
             QComboBox QAbstractItemView {
                 background-color: #ffffff;
                 color: #111827;
                 selection-background-color: #3b82f6;
                 selection-color: #ffffff;
-                border: 1px solid #d1d5db;
+                border: 1px solid #94a3b8;
+                outline: none;
+                min-width: 450px;
+            }
+            QListView::item {
+                padding: 6px;
+                border-bottom: 0.5px solid #f1f5f9;
+            }
+            QListView::item:hover {
+                background-color: #f1f5f9;
+            }
+            
+            /* Scrollbars */
+            QScrollBar:vertical {
+                border: none;
+                background: #f1f5f9;
+                width: 16px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #475569;
+                min-height: 40px;
+                border-radius: 8px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #1e293b;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                border: none;
+                background: #f1f5f9;
+                height: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #cbd5e1;
+                min-width: 20px;
+                border-radius: 5px;
+                margin: 2px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
             }
 
             /* Buttons */
@@ -722,14 +825,28 @@ class NativeEmissionGUI(QMainWindow):
         # Tabbed config
         self.tabs = QTabWidget()
         
-        # Page 1: Data Source
+        # Page 1: Data Source & View Settings
         page_source = QWidget(); l_source = QVBoxLayout(page_source)
         l_source.setContentsMargins(6, 6, 6, 6)
         l_source.setSpacing(2)
+        
+        # Source Sections
         self._init_inputs_section(l_source)
         self._init_variable_section(l_source)
+        
+        # View / Plot Settings (Moved from separate tab)
+        self._init_plot_settings_section(l_source)
+        
+        # Reset View helper
+        btn_reset = QPushButton("Reset View to All Data")
+        btn_reset.setIcon(self.style().standardIcon(QStyle.SP_FileDialogToParent))
+        btn_reset.clicked.connect(self.reset_home_view)
+        l_source.addWidget(btn_reset)
+
+        self._init_animation_section(l_source)
+        
         l_source.addStretch()
-        self.tabs.addTab(page_source, "Source")
+        self.tabs.addTab(page_source, "Source & View")
         
         # Page 2: Filtering
         page_filter = QWidget(); l_filter = QVBoxLayout(page_filter)
@@ -738,23 +855,7 @@ class NativeEmissionGUI(QMainWindow):
         l_filter.addStretch()
         self.tabs.addTab(page_filter, "Filter")
         
-        # Page 3: Map View
-        page_visuals = QWidget(); l_visuals = QVBoxLayout(page_visuals)
-        l_visuals.setContentsMargins(6, 6, 6, 6)
-        l_visuals.setSpacing(2)
-        self._init_plot_settings_section(l_visuals)
-        
-        # Reset View helper
-        btn_reset = QPushButton("Reset View to All Data")
-        btn_reset.setIcon(self.style().standardIcon(QStyle.SP_FileDialogToParent))
-        btn_reset.clicked.connect(self.reset_home_view)
-        l_visuals.addWidget(btn_reset)
-        
-        self._init_animation_section(l_visuals)
-        l_visuals.addStretch()
-        self.tabs.addTab(page_visuals, "View")
-        
-        # Page 4: Analysis
+        # Page 3: Analysis (Stats)
         page_stats = QWidget(); l_stats = QVBoxLayout(page_stats)
         l_stats.setContentsMargins(6, 6, 6, 6)
         self._init_summary_section(l_stats)
@@ -765,31 +866,31 @@ class NativeEmissionGUI(QMainWindow):
         left_layout.addWidget(self.tabs)
         
         # Always-visible footer buttons
-        footer = QFrame()
-        footer.setFrameShape(QFrame.NoFrame)
-        footer_layout = QHBoxLayout(footer)
-        footer_layout.setContentsMargins(2, 4, 2, 4)
+        self.footer_frame = QFrame()
+        self.footer_frame.setFrameShape(QFrame.NoFrame)
+        self.footer_frame.setMinimumHeight(60)
+        footer_layout = QHBoxLayout(self.footer_frame)
+        footer_layout.setContentsMargins(5, 5, 5, 5)
         footer_layout.setSpacing(10)
         
         self.btn_main_plot = QPushButton("GENERATE PLOT")
         self.btn_main_plot.setObjectName("primaryBtn")
-        self.btn_main_plot.setMinimumHeight(40)
-        self.btn_main_plot.clicked.connect(self.update_plot)
-        footer_layout.addWidget(self.btn_main_plot, 1)
+        self.btn_main_plot.setMinimumHeight(45)
+        self.btn_main_plot.clicked.connect(self._on_main_plot_clicked)
+        
+        footer_layout.addWidget(self.btn_main_plot, 2)
 
         btn_exp_all = QPushButton("Quick CSV")
         btn_exp_all.setToolTip("Export plot data to CSV immediately")
         btn_exp_all.clicked.connect(self.export_data)
-        footer_layout.addWidget(btn_exp_all, 0)
+        footer_layout.addWidget(btn_exp_all, 1)
         
-        left_layout.addWidget(footer)
+        btn_export_tool = QPushButton("Export Tool")
+        btn_export_tool.setMinimumHeight(40)
+        btn_export_tool.clicked.connect(self.export_data)
+        footer_layout.addWidget(btn_export_tool, 1)
         
-        btn_export_all = QPushButton("Export Tool")
-        btn_export_all.setMinimumHeight(45)
-        btn_export_all.clicked.connect(self.export_data)
-        footer_layout.addWidget(btn_export_all, 1)
-        
-        left_layout.addWidget(footer)
+        left_layout.addWidget(self.footer_frame)
         
         self.main_splitter.addWidget(left_panel)
 
@@ -928,6 +1029,9 @@ class NativeEmissionGUI(QMainWindow):
         grid_row.addWidget(btn_griddesc)
         
         self.cmb_gridname = QComboBox()
+        self.cmb_gridname.setMaxVisibleItems(8)
+        self.cmb_gridname.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_gridname.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.cmb_gridname.addItem("Select Grid")
         self.cmb_gridname.currentTextChanged.connect(self._grid_name_changed)
         grid_row.addWidget(self.cmb_gridname, 1)
@@ -938,8 +1042,16 @@ class NativeEmissionGUI(QMainWindow):
         ncf_lyt = QHBoxLayout(self.ncf_frame)
         ncf_lyt.setContentsMargins(0,0,0,0)
         self.cmb_ncf_layer = QComboBox()
+        self.cmb_ncf_layer.setMaxVisibleItems(8)
+        self.cmb_ncf_layer.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_ncf_layer.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.cmb_ncf_layer.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
         self.cmb_ncf_time = QComboBox()
+        self.cmb_ncf_time.setMaxVisibleItems(8)
+        self.cmb_ncf_time.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_ncf_time.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.cmb_ncf_time.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
         ncf_lyt.addWidget(QLabel("Lay:"))
         ncf_lyt.addWidget(self.cmb_ncf_layer)
@@ -972,10 +1084,17 @@ class NativeEmissionGUI(QMainWindow):
         pol_layout = QHBoxLayout()
         pol_layout.setSpacing(4)
         self.cmb_pollutant = QComboBox()
+        self.cmb_pollutant.setMaxVisibleItems(8)
+        # Enable smooth pixel-based scrolling for long lists
+        self.cmb_pollutant.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_pollutant.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.cmb_pollutant.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.cmb_pollutant.view().setMinimumWidth(450)
         self.cmb_pollutant.currentIndexChanged.connect(self._pollutant_changed)
         pol_layout.addWidget(self.cmb_pollutant, 3)
         
         self.txt_pol_search = QLineEdit()
+        self.txt_pol_search.setClearButtonEnabled(True)
         self.txt_pol_search.setPlaceholderText("Search...")
         self.txt_pol_search.setMinimumWidth(80)
         self.txt_pol_search.textChanged.connect(self._filter_pollutant_list)
@@ -997,6 +1116,12 @@ class NativeEmissionGUI(QMainWindow):
         scc_layout = QHBoxLayout()
         scc_layout.setSpacing(4)
         self.cmb_scc = QComboBox()
+        self.cmb_scc.setMaxVisibleItems(8)
+        # Enable smooth pixel-based scrolling for long lists
+        self.cmb_scc.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_scc.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.cmb_scc.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.cmb_scc.view().setMinimumWidth(450)
         self.cmb_scc.setEditable(True)
         self.cmb_scc.setInsertPolicy(QComboBox.NoInsert)
         self.cmb_scc.addItem("All SCC")
@@ -1004,6 +1129,7 @@ class NativeEmissionGUI(QMainWindow):
         scc_layout.addWidget(self.cmb_scc, 3)
         
         self.txt_scc_search = QLineEdit()
+        self.txt_scc_search.setClearButtonEnabled(True)
         self.txt_scc_search.setPlaceholderText("Find...")
         self.txt_scc_search.setMinimumWidth(60)
         self.txt_scc_search.textChanged.connect(self._filter_scc_list)
@@ -1011,10 +1137,11 @@ class NativeEmissionGUI(QMainWindow):
         layout.addRow("SCC Filter:", scc_layout)
         
         if parent_layout: parent_layout.addWidget(group)
+        if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
 
     def _init_filter_section(self, parent_layout=None):
-        group = QGroupBox("3. Filtering")
+        group = QGroupBox("Advanced Filtering")
         layout = QFormLayout(group)
         layout.setContentsMargins(8, 14, 8, 8)
         layout.setVerticalSpacing(4)
@@ -1029,15 +1156,23 @@ class NativeEmissionGUI(QMainWindow):
         btn_shp = QPushButton("Browse")
         btn_shp.clicked.connect(self.browse_filter_shpfile)
         shp_row.addWidget(btn_shp, 0)
-        layout.addRow("Shape:", shp_row)
+        layout.addRow("Select Shapefile:", shp_row)
+        
+        self.cmb_filter_op = QComboBox()
+        self.cmb_filter_op.addItems(['clipped', 'intersect', 'within', 'False'])
+        self.cmb_filter_op.setCurrentText('False')
+        layout.addRow("Spatial Operation:", self.cmb_filter_op)
         
         self.cmb_filter_col = QComboBox()
+        self.cmb_filter_col.setMaxVisibleItems(8)
+        self.cmb_filter_col.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_filter_col.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.cmb_filter_col.setEditable(True)
-        layout.addRow("Column:", self.cmb_filter_col)
+        layout.addRow("Filter Column:", self.cmb_filter_col)
         
         self.txt_filter_val = QLineEdit()
         self.txt_filter_val.setPlaceholderText("Value1, Value2...")
-        layout.addRow("Values:", self.txt_filter_val)
+        layout.addRow("Filter Values:", self.txt_filter_val)
         
         range_layout = QHBoxLayout()
         self.txt_range_min = QLineEdit()
@@ -1047,18 +1182,13 @@ class NativeEmissionGUI(QMainWindow):
         range_layout.addWidget(self.txt_range_min)
         range_layout.addWidget(QLabel("to"))
         range_layout.addWidget(self.txt_range_max)
-        layout.addRow("Range:", range_layout)
-        
-        self.cmb_filter_op = QComboBox()
-        self.cmb_filter_op.addItems(['clipped', 'intersect', 'within', 'False'])
-        self.cmb_filter_op.setCurrentText('False')
-        layout.addRow("Spat Op:", self.cmb_filter_op)
+        layout.addRow("Value Range:", range_layout)
         
         if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
 
     def _init_plot_settings_section(self, parent_layout=None):
-        group = QGroupBox("4. View Options")
+        group = QGroupBox("3. View Options")
         layout = QFormLayout(group)
         layout.setContentsMargins(8, 14, 8, 8)
         layout.setVerticalSpacing(4)
@@ -1069,8 +1199,12 @@ class NativeEmissionGUI(QMainWindow):
         layout.addRow("Custom Bins:", self.txt_bins)
         
         self.cmb_cmap = QComboBox()
+        self.cmb_cmap.setMaxVisibleItems(8)
+        self.cmb_cmap.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.cmb_cmap.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        self.cmb_cmap.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cmb_cmap.addItems(sorted([m for m in plt.colormaps() if not m.endswith('_r')]))
-        self.cmb_cmap.setCurrentText('viridis')
+        self.cmb_cmap.setCurrentText('jet')
         layout.addRow("Colormap:", self.cmb_cmap)
         
         ov_row = QHBoxLayout()
@@ -1262,14 +1396,52 @@ class NativeEmissionGUI(QMainWindow):
         
         if level == "ERROR":
             logging.error(message)
-            self.progress_bar.setVisible(False)
+            self._stop_progress()
             if not is_headless:
                 QMessageBox.critical(self, "Error", message)
         elif level == "WARNING":
-            self.status_label.setText(f"Warning: {message}")
             logging.warning(message)
-            self.progress_bar.setVisible(False)
+            self.status_label.setText(f"Warning: {message}")
+            if "failed" in message.lower() or "error" in message.lower():
+                self._stop_progress()
+            
+            # --- Smart Error Interception ---
+            if not is_headless:
+                if "Counties not loaded" in message or "No suitable geometry" in message:
+                    reply = QMessageBox.question(
+                        self, "Missing Geometry", 
+                        "Plotting within counties requires a county shapefile.\n\nWould you like to fetch the default US Counties map (approx 5MB) now?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        self.use_online_counties()
+                elif "Grid not loaded" in message:
+                    reply = QMessageBox.question(
+                        self, "Missing Grid Definition", 
+                        "Plotting grid data requires a GRIDDESC file and Grid Name.\n\nWould you like to select a GRIDDESC file now?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        self.select_griddesc_file()
+            # --------------------------------
+
         else:
+            self.status_label.setText(message)
+            logging.info(message)
+            # Pulse progress if busy
+            busy_keywords = ["Loading", "Plotting", "Generating", "Computing", "Extracting"]
+            stop_keywords = ["Ready", "finished", "Plotted", "available", "loaded", "complete"]
+            
+            if any(k in message for k in busy_keywords):
+                self.progress_bar.setRange(0, 0) # Pulse
+                self.progress_bar.setVisible(True)
+            elif any(k in message for k in stop_keywords):
+                self.progress_bar.setVisible(False)
+                # Fallback re-enable if worker finished
+                if "finished" in message:
+                    sys.stdout.write(">>> GUI_FLOW: _handle_notification re-enabling button <<<\n")
+                    sys.stdout.flush()
+                    self.btn_main_plot.setEnabled(True)
             self.status_label.setText(message)
             logging.info(message)
             # Pulse progress if busy
@@ -1364,7 +1536,8 @@ class NativeEmissionGUI(QMainWindow):
                  self.txt_bins.setText(str(bins_val))
              
         # COLORMAP (Support both cmap and colormap)
-        cmap_val = cli.get('cmap') or cli.get('colormap')
+        # Default to 'jet' if not specified
+        cmap_val = cli.get('cmap') or cli.get('colormap') or 'jet'
         if cmap_val:
              cmap = str(cmap_val)
              is_rev = cmap.endswith('_r')
@@ -1389,8 +1562,16 @@ class NativeEmissionGUI(QMainWindow):
         
         nan_val = cli.get('fill_nan')
         if nan_val is not None:
-             self.chk_nan0.setChecked(True)
-             # Logic in GUI is typically binary (use 0 or not), but we can store the val
+             default_checked = False
+             if isinstance(nan_val, bool): default_checked = nan_val
+             elif str(nan_val).lower() in ('true', 'yes'): default_checked = True
+             elif str(nan_val).lower() in ('false', 'no'): default_checked = False
+             else:
+                 try:
+                     if abs(float(nan_val)) < 1e-9: default_checked = True
+                 except: pass
+             self.chk_nan0.setChecked(default_checked)
+             
              if hasattr(self, 'txt_nan_val'): self.txt_nan_val.setText(str(nan_val))
 
         low = cli.get('fixed_min') or cli.get('fixed_range_min') or cli.get('vmin')
@@ -1498,7 +1679,7 @@ class NativeEmissionGUI(QMainWindow):
         except Exception as e:
             self.notify_signal.emit("WARNING", f"Counties load error: {e}")
         finally:
-            QTimer.singleShot(0, self._stop_progress)
+            self.stop_progress_signal.emit()
 
     @Slot()
     def select_griddesc_file(self):
@@ -1586,7 +1767,7 @@ class NativeEmissionGUI(QMainWindow):
             self.grid_gdf = None
             self.notify_signal.emit("ERROR", f"Failed to create grid shape: {e}")
         finally:
-            self._stop_progress()
+            self.stop_progress_signal.emit()
 
     def _default_conus_lcc_crs(self):
         """Standard CONUS LCC projection."""
@@ -1710,6 +1891,7 @@ class NativeEmissionGUI(QMainWindow):
                 is_nc = True
                 
             ncf_params = self._get_ncf_params() if is_nc else {}
+            logging.info(f"DEBUG: _load_worker NCF Params: {ncf_params}")
                 
             # Safely call read_inputfile
             # Note: We need a thread-safe notifier
@@ -1793,38 +1975,31 @@ class NativeEmissionGUI(QMainWindow):
                 try:
                     summaries = []
                     file_list = fpath if isinstance(fpath, list) else [fpath]
-                    if len(file_list) > 1:
-                        for f in file_list:
-                            if os.path.exists(f):
-                                f_df, _ = _local_read(f)
-                                if isinstance(f_df, pd.DataFrame):
-                                     p_stats = {}
-                                     for p in detect_pollutants(f_df):
-                                         try:
-                                             vals = pd.to_numeric(f_df[p], errors='coerce').dropna()
-                                             if not vals.empty:
-                                                 p_stats[p] = {
-                                                     'sum': float(vals.sum()),
-                                                     'max': float(vals.max()),
-                                                     'mean': float(vals.mean()),
-                                                     'count': int(len(vals))
-                                                 }
-                                         except Exception: pass
-                                     summaries.append({'source': f, 'pollutants': p_stats})
-                    else:
-                        p_stats = {}
-                        for p in detect_pollutants(df):
-                            try:
-                                vals = pd.to_numeric(df[p], errors='coerce').dropna()
-                                if not vals.empty:
+                    
+                    # Optimization: Vectorized summary for all pollutants at once
+                    if isinstance(df, pd.DataFrame):
+                        pols = detect_pollutants(df)
+                        if pols:
+                            worker_notify("INFO", f"Calculating stats for {len(pols)} variables...")
+                            sums = df[pols].sum()
+                            maxs = df[pols].max()
+                            means = df[pols].mean()
+                            counts = df[pols].count()
+                            
+                            p_stats = {}
+                            for p in pols:
+                                try:
                                     p_stats[p] = {
-                                        'sum': float(vals.sum()),
-                                        'max': float(vals.max()),
-                                        'mean': float(vals.mean()),
-                                        'count': int(len(vals))
+                                        'sum': float(sums[p]),
+                                        'max': float(maxs[p]),
+                                        'mean': float(means[p]),
+                                        'count': int(counts[p])
                                     }
-                            except Exception: pass
-                        summaries.append({'source': file_list[0], 'pollutants': p_stats})
+                                except Exception: pass
+                            summaries.append({'source': file_list[0], 'pollutants': p_stats})
+                        else:
+                            summaries.append({'source': file_list[0], 'pollutants': {}})
+                    
                     df.attrs['per_file_summaries'] = summaries
                 except Exception as e:
                     logging.warning(f"Stat re-calc failed: {e}")
@@ -1864,7 +2039,7 @@ class NativeEmissionGUI(QMainWindow):
             traceback.print_exc()
         finally:
             worker_notify("INFO", "Worker finished.")
-            QTimer.singleShot(0, self._stop_progress)
+            self.stop_progress_signal.emit()
 
     def _invalidate_merge_cache(self):
         """Clear the cached merged dataframes."""
@@ -1872,6 +2047,9 @@ class NativeEmissionGUI(QMainWindow):
 
     def _start_progress(self, msg="Processing...", pol=None):
         """Show progress bar and status message."""
+        sys.stdout.write(f">>> GUI_FLOW: Entering _start_progress (msg: {msg}) <<<\n")
+        sys.stdout.flush()
+        logging.warning(f"GUI_DEBUG: [_start_progress] Disabling button. msg: {msg}")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0) # Indeterminate
         if pol:
@@ -1880,8 +2058,12 @@ class NativeEmissionGUI(QMainWindow):
             self.status_label.setText(msg)
         self.btn_main_plot.setEnabled(False)
 
+    @Slot()
     def _stop_progress(self):
         """Hide progress bar and restore UI."""
+        sys.stdout.write(">>> GUI_FLOW: Entering _stop_progress <<<\n")
+        sys.stdout.flush()
+        logging.warning("GUI_DEBUG: [_stop_progress] Re-enabling button.")
         self.progress_bar.setVisible(False)
         self.status_label.setText("Ready")
         self.btn_main_plot.setEnabled(True)
@@ -1991,6 +2173,7 @@ class NativeEmissionGUI(QMainWindow):
 
         self._invalidate_merge_cache()
         self._ff10_grid_ready = False
+        self._base_view = None # Reset zoom for new data
 
         try:
             source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type')
@@ -2001,34 +2184,8 @@ class NativeEmissionGUI(QMainWindow):
         if self._ff10_ready and self.grid_gdf is not None:
             self._ensure_ff10_grid_mapping()
 
-        # Find raw SCCs for widgets
-        scc_data = []
-        if self.raw_df is not None:
-            scc_cols = [c for c in self.raw_df.columns if c.lower() in ['scc', 'scc code', 'scc_code']]
-            if scc_cols:
-                scc_col = scc_cols[0]
-                desc_cols = [c for c in self.raw_df.columns if c.lower() in ['scc description', 'scc_description', 'scc_desc']]
-                if desc_cols:
-                    desc_col = desc_cols[0]
-                    # Create display strings: "CODE | DESCRIPTION"
-                    scc_df = self.raw_df[[scc_col, desc_col]].drop_duplicates().astype(str)
-                    scc_df = scc_df[scc_df[scc_col].str.strip() != '']
-                    scc_data = scc_df.apply(lambda x: f"{x[scc_col]} | {x[desc_col]}", axis=1).tolist()
-                    self._scc_display_to_code = dict(zip(scc_data, scc_df[scc_col].tolist()))
-                else:
-                    scc_data = self.raw_df[scc_col].drop_duplicates().astype(str).tolist()
-                    scc_data = [s for s in scc_data if s.strip() != '']
-                    self._scc_display_to_code = {s: s for s in scc_data}
+        # (SCC population moved further down to avoid redundant execution and overwriting)
 
-        self.cmb_scc.blockSignals(True)
-        self.cmb_scc.clear()
-        self.cmb_scc.addItem("All SCC")
-        if scc_data:
-            self.cmb_scc.addItems(sorted(scc_data))
-            self.cmb_scc.setEnabled(True)
-        else:
-            self.cmb_scc.setEnabled(False)
-        self.cmb_scc.blockSignals(False)
 
         # Use provided pollutants list or detect
         if not pollutants:
@@ -2060,6 +2217,10 @@ class NativeEmissionGUI(QMainWindow):
         elif self.pollutants:
             self.cmb_pollutant.setCurrentIndex(0)
         self.cmb_pollutant.blockSignals(False)
+        self._full_pollutant_list = None 
+        
+        # Trigger manual update to sync units label
+        self._pollutant_changed()
 
         # Update metadata summary
         if hasattr(self.emissions_df, 'attrs'):
@@ -2110,45 +2271,58 @@ class NativeEmissionGUI(QMainWindow):
             self.cmb_filter_col.addItems(raw_cols)
             
             # SCC Detection & Mapping
-            scc_col = next((c for c in raw_cols if c.lower() in ['scc', 'scc code', 'scc_code']), None)
-            desc_cols = [c for c in raw_cols if c.lower() in ['scc description', 'scc_description']]
-            desc_col = desc_cols[0] if desc_cols else None
-            
             self._scc_display_to_code = {}
-            if scc_col:
-                try:
-                    df_scc = self.raw_df[[scc_col]].copy()
-                    df_scc[scc_col] = df_scc[scc_col].astype(str).str.strip()
+            try:
+                raw_cols_list = list(self.raw_df.columns)
+                raw_cols_lower = {c.lower(): c for c in raw_cols_list}
+                scc_col = next((raw_cols_lower[c] for c in SCC_COLS if c in raw_cols_lower), None)
+                desc_col = next((raw_cols_lower[c] for c in DESC_COLS if c in raw_cols_lower), None)
+                
+                print(f">>> SCC_DEBUG: Columns found: {raw_cols_list}")
+                print(f">>> SCC_DEBUG: scc_col={scc_col}, desc_col={desc_col}")
+                
+                if scc_col:
                     if desc_col:
-                        df_scc[desc_col] = self.raw_df[desc_col].astype(str).str.strip()
-                        # Create "Code - Description" string
-                        df_scc['display'] = df_scc[scc_col] + " - " + df_scc[desc_col]
+                        df_scc = self.raw_df[[scc_col, desc_col]].drop_duplicates().astype(str)
+                        df_scc[scc_col] = df_scc[scc_col].str.strip()
+                        df_scc[desc_col] = df_scc[desc_col].str.strip()
+                        df_scc = df_scc[df_scc[scc_col].str.len() > 0]
+                        df_scc['display'] = df_scc[scc_col] + " | " + df_scc[desc_col]
                     else:
-                        df_scc['display'] = df_scc[scc_col]
+                        unique_sccs = sorted(self.raw_df[scc_col].astype(str).str.strip().unique())
+                        unique_sccs = [s for s in unique_sccs if s]
+                        df_scc = pd.DataFrame({'display': unique_sccs, scc_col: unique_sccs})
                         
-                    unique_sccs = df_scc.drop_duplicates().sort_values(scc_col)
-                    self._scc_display_to_code = { row.display: row[scc_col] for row in unique_sccs.itertuples() }
-                    
-                    self.cmb_scc.blockSignals(True)
-                    self.cmb_scc.clear()
-                    self.cmb_scc.addItem("All SCC")
-                    self.cmb_scc.addItems(sorted(self._scc_display_to_code.keys()))
-                    self.cmb_scc.setEnabled(True)
-                    self._scc_full_list = None # Reset search cache
-                    self.cmb_scc.blockSignals(False)
-                except Exception as e:
-                    logging.warning(f"SCC mapping failed: {e}")
-                    self.cmb_scc.clear()
-                    self.cmb_scc.addItem("All SCC")
-                    self.cmb_scc.setEnabled(False)
-            else:
+                    self._scc_display_to_code = dict(zip(df_scc['display'], df_scc[scc_col]))
+                    print(f">>> SCC_DEBUG: Success. Found {len(self._scc_display_to_code)} SCC items.")
+                elif desc_col:
+                    unique_descs = sorted(self.raw_df[desc_col].astype(str).str.strip().unique())
+                    unique_descs = [s for s in unique_descs if s]
+                    self._scc_display_to_code = {s: s for s in unique_descs}
+                    print(f">>> SCC_DEBUG: Success (Desc only). Found {len(self._scc_display_to_code)} items.")
+                else:
+                    print(f">>> SCC_DEBUG: No SCC or Description column found.")
+
+                self.cmb_scc.blockSignals(True)
                 self.cmb_scc.clear()
                 self.cmb_scc.addItem("All SCC")
+                if self._scc_display_to_code:
+                    self.cmb_scc.addItems(sorted(self._scc_display_to_code.keys()))
+                    self.cmb_scc.setEnabled(True)
+                    print(f">>> SCC_DEBUG: SCC dropdown ENABLED.")
+                else:
+                    self.cmb_scc.setEnabled(False)
+                    print(f">>> SCC_DEBUG: SCC dropdown DISABLED (no items).")
+                self.cmb_scc.blockSignals(False)
+                self._scc_full_list = None 
+            except Exception as e:
+                print(f">>> SCC_DEBUG: FAILED with error: {e}")
+                logging.warning(f"SCC mapping failed: {e}")
                 self.cmb_scc.setEnabled(False)
 
         # Set plot type from config (validation happens in _merged() during plot)
         # Following gui_qt.py pattern: just read the config, don't try to validate/correct
-        requested_pltyp = self._json_arguments.get('pltyp', 'auto')
+        requested_pltyp = self._json_arguments.get('pltyp') or 'auto'
         if requested_pltyp in ['auto', 'grid', 'county']:
             self.cmb_pltyp.setCurrentText(requested_pltyp)
 
@@ -2188,10 +2362,14 @@ class NativeEmissionGUI(QMainWindow):
         
     def _shape_worker(self):
         try:
-             gdf = read_shpfile(self.counties_path)
+             gdf = read_shpfile(self.counties_path, True)
              if gdf is not None:
                  self.counties_gdf = gdf
+                 self._invalidate_merge_cache()
                  self.notify_signal.emit("INFO", f"Loaded counties: {len(gdf)} features")
+                 # Trigger redraw if county mode is active
+                 if self.cmb_pltyp.currentText().lower() == 'county' and self.emissions_df is not None:
+                      QTimer.singleShot(800, self.update_plot)
         except Exception as e:
             self.notify_signal.emit("WARNING", f"Shapefile load error: {e}")
 
@@ -2199,6 +2377,13 @@ class NativeEmissionGUI(QMainWindow):
         # Update units label if metadata available
         pol = self.cmb_pollutant.currentText()
         unit = self.units_map.get(pol, "-")
+        
+        # Fallback to variable_metadata if units_map doesn't have it (Common for NetCDF)
+        if (unit == "-" or not unit) and hasattr(self, 'emissions_df') and self.emissions_df is not None:
+             vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
+             if isinstance(vmeta, dict) and pol in vmeta:
+                  unit = vmeta[pol].get('units', "-")
+        
         self.lbl_units.setText(f"Unit: {unit}")
         # Invalidate animation cache if pollutant changed
         self._t_data_cache = None
@@ -2470,7 +2655,9 @@ class NativeEmissionGUI(QMainWindow):
             return
             
         try:
-            pol = self.cmb_pollutant.currentText()
+            pol = getattr(ax, '_smk_pollutant', self.cmb_pollutant.currentText())
+            if not pol:
+                pol = self.cmb_pollutant.currentText()
             unit = self.units_map.get(pol, "")
             time_lbl = getattr(ax, '_smk_time_lbl', None)
             
@@ -2522,98 +2709,115 @@ class NativeEmissionGUI(QMainWindow):
                             # A. Grid Optimization 
                             info = gdf.attrs.get('_smk_grid_info')
                             proj_sel = self.cmb_proj.currentText().lower()
-                            is_native = proj_sel in ('auto', 'wgs84', 'native', 'epsg:4326', 'default') 
+                            
+                            # Native implies the plot axes match the grid's native coordinates (usually LCC or WGS84)
+                            is_native = proj_sel in ('auto', 'wgs84', 'native', 'epsg:4326', 'default', 'lcc') 
                             
                             if info and is_native and 'ROW' in gdf.columns:
-                                col0 = int(np.floor((x0 - info['xorig']) / info['xcell']))
-                                col1 = int(np.ceil((x1 - info['xorig']) / info['xcell']))
-                                row0 = int(np.floor((y0 - info['yorig']) / info['ycell']))
-                                row1 = int(np.ceil((y1 - info['yorig']) / info['ycell']))
-                                
-                                mask = (gdf['ROW'] > row0) & (gdf['ROW'] <= row1+1) & \
-                                       (gdf['COL'] > col0) & (gdf['COL'] <= col1+1)
-                                filtered = vals[mask.values] if mask.size == vals.size else vals
+                                try:
+                                    col0 = int(np.floor((x0 - info['xorig']) / info['xcell']))
+                                    col1 = int(np.ceil((x1 - info['xorig']) / info['xcell']))
+                                    row0 = int(np.floor((y0 - info['yorig']) / info['ycell']))
+                                    row1 = int(np.ceil((y1 - info['yorig']) / info['ycell']))
+                                    
+                                    mask = (gdf['ROW'] > row0) & (gdf['ROW'] <= row1+1) & \
+                                           (gdf['COL'] > col0) & (gdf['COL'] <= col1+1)
+                                    # Use .values for speed and to avoid index alignment issues
+                                    m_vals = mask.values if hasattr(mask, 'values') else np.array(mask)
+                                    filtered = vals[m_vals] if m_vals.size == vals.size else vals
+                                except Exception:
+                                    filtered = vals
                             else:
                                 # B. Precise Spatial Slicing
-                                sidx = getattr(gdf, 'sindex', None)
-                                if sidx:
-                                    idxs = list(sidx.intersection(view_box.bounds))
-                                    if idxs:
-                                        # Validate indices are within bounds
-                                        valid_idxs = [i for i in idxs if 0 <= i < len(gdf)]
-                                        if valid_idxs:
-                                            sub_gdf = gdf.iloc[valid_idxs]
-                                            precise_mask = sub_gdf.geometry.intersects(view_box)
-                                            final_ilocs = np.array(valid_idxs)[precise_mask.values]
-                                            final_ilocs = final_ilocs[(final_ilocs >= 0) & (final_ilocs < len(vals))]
-                                            filtered = vals[final_ilocs] if len(final_ilocs) > 0 else np.array([])
+                                try:
+                                    sidx = getattr(gdf, 'sindex', None)
+                                    if sidx and hasattr(gdf, 'geometry') and gdf.geometry is not None:
+                                        idxs = list(sidx.intersection(view_box.bounds))
+                                        if idxs:
+                                            valid_idxs = [i for i in idxs if 0 <= i < len(gdf)]
+                                            if valid_idxs:
+                                                sub_gdf = gdf.iloc[valid_idxs]
+                                                precise_mask = sub_gdf.geometry.intersects(view_box)
+                                                final_ilocs = np.array(valid_idxs)[precise_mask.values]
+                                                final_ilocs = final_ilocs[(final_ilocs >= 0) & (final_ilocs < len(vals))]
+                                                filtered = vals[final_ilocs] if len(final_ilocs) > 0 else np.array([])
+                                        else:
+                                            filtered = np.array([])
+                                    elif hasattr(gdf, 'geometry') and gdf.geometry is not None:
+                                        # Fallback: Brute force intersection
+                                        mask = gdf.geometry.intersects(view_box)
+                                        filtered = vals[mask.values] if mask.size == vals.size else vals
                                     else:
-                                        filtered = np.array([])
-                                else:
-                                    # Fallback: Brute force intersection
-                                    mask = gdf.geometry.intersects(view_box)
-                                    filtered = vals[mask.values] if mask.size == vals.size else vals
+                                        # Vector data without geometry set (uncommon) or skeleton
+                                        filtered = vals
+                                except Exception:
+                                    filtered = vals
 
                 # Calculate Stats
                 filtered_arr = np.asanyarray(filtered)
                 clean = filtered_arr[~np.isnan(filtered_arr)] if filtered_arr.size > 0 else np.array([])
                 
+                # 4. Construct Multi-line Title (Mirroring gui_qt.py style)
+                title_lines = []
+                
+                # Line 1: Pollutant (Unit)
+                # gui_qt.py: f"{pollutant}{u_str}"
+                l1 = f"{pol}"
+                if unit: l1 += f" ({unit})"
+                title_lines.append(l1)
+                
+                # Line 2: Time (if applicable)
+                if time_lbl:
+                    title_lines.append(f"Time: {time_lbl}")
+                elif self.cmb_ncf_time.isVisible():
+                     title_lines.append(f"Time: {self.cmb_ncf_time.currentText()}")
+                
+                # Line 3: Stats & Side Panel Update
                 if clean.size > 0:
                     mn, mx = np.nanmin(clean), np.nanmax(clean)
                     u, s = np.nanmean(clean), np.nansum(clean)
                     
-                    def _f(v): 
-                        if abs(v) < 1e-3 or abs(v) > 1e6: return f"{v:.4e}"
-                        return f"{v:.4g}"
+                    def _f(v): return f"{v:.4g}"
                         
                     stats_str = f"Min: {_f(mn)}  Mean: {_f(u)}  Max: {_f(mx)}  Sum: {_f(s)}"
                     if unit: stats_str += f" {unit}"
-                    
-                    # 4. Construct Multi-line Title
-                    title_lines = [f"{pol} Emissions"]
-                    if unit:
-                        title_lines[0] += f" ({unit})"
-                    
-                    scc = self.cmb_scc.currentText()
-                    if scc and scc != "ALL":
-                        title_lines.append(f"SCC: {scc}")
-                    
-                    if self.cmb_ncf_layer.isVisible():
-                        title_lines.append(f"Layer: {self.cmb_ncf_layer.currentText()}")
-                    
-                    if time_lbl:
-                        title_lines.append(f"Time: {time_lbl}")
-                    elif self.cmb_ncf_time.isVisible():
-                         title_lines.append(f"Time: {self.cmb_ncf_time.currentText()}")
-                    
-                    # Append stats to title (Requested by user)
                     title_lines.append(stats_str)
                     
-                    ax.set_title("\n".join(title_lines), fontsize=12, pad=10)
-
-                    # Also update the persistent side panel if it exists
+                    # Update side panel
                     try:
-                        self.lbl_stats_sum.setText(f"{s:.4g}")
-                        self.lbl_stats_max.setText(f"{mx:.4g}")
-                        self.lbl_stats_mean.setText(f"{u:.4g}")
-                        self.lbl_stats_count.setText(str(len(clean)))
+                        if hasattr(self, 'lbl_stats_sum'):
+                            self.lbl_stats_sum.setText(f"{s:.4g}")
+                            self.lbl_stats_max.setText(f"{mx:.4g}")
+                            self.lbl_stats_mean.setText(f"{u:.4g}")
+                            self.lbl_stats_count.setText(str(len(clean)))
                     except Exception: pass
-                    
-                    # Remove floating stats text box if it exists
-                    if hasattr(ax, '_smk_stats_text'):
-                        try:
-                            ax._smk_stats_text.remove()
-                            del ax._smk_stats_text
-                        except: pass
                     
                     self.statusBar().showMessage(f"View Stats | {stats_str}", 3000)
                 else:
-                    ax.set_title(f"{pol} (No Data in View)", fontsize=12)
-                    if hasattr(ax, '_smk_stats_text'):
-                        try:
-                            ax._smk_stats_text.remove()
-                            del ax._smk_stats_text
-                        except: pass
+                    title_lines.append("No Data in View")
+                    # Clear side panel if empty
+                    try:
+                        if hasattr(self, 'lbl_stats_sum'):
+                            self.lbl_stats_sum.setText("-")
+                            self.lbl_stats_max.setText("-")
+                            self.lbl_stats_mean.setText("-")
+                            self.lbl_stats_count.setText("0")
+                    except Exception: pass
+                
+                ax.set_title("\n".join(title_lines), fontsize=12, pad=10)
+                
+                # Remove legacy floating stats text box if it exists
+                if hasattr(ax, '_smk_stats_text'):
+                    try:
+                        ax._smk_stats_text.remove()
+                        del ax._smk_stats_text
+                    except: pass
+                
+                # Force redraw to show updated title
+                ax.figure.canvas.draw_idle()
+                
+            except Exception as e:
+                logging.debug(f"Title update warning: {e}")
                 
                 ax.figure.canvas.draw_idle()
             except Exception as e:
@@ -2622,123 +2826,204 @@ class NativeEmissionGUI(QMainWindow):
         except Exception as e:
             logging.debug(f"Global title update failed: {e}")
 
+    @Slot()
+    def _on_main_plot_clicked(self):
+        """Internal handler for the main plot button click."""
+        sys.stdout.write("\n>>> GUI_EVENT: [GENERATE PLOT] Button Clicked! <<<\n")
+        sys.stdout.flush()
+        logging.warning("GUI_DEBUG: [_on_main_plot_clicked] Entering...")
+        self.on_generate_clicked()
+
+    def on_generate_clicked(self):
+        """Dedicated slot for the Generate Plot button."""
+        sys.stdout.write(">>> GUI_FLOW: Entering on_generate_clicked <<<\n")
+        sys.stdout.flush()
+        logging.warning("GUI_DEBUG: [on_generate_clicked] Entering method...")
+        self.update_plot()
+
     # --- Updated Plot Logic ---
     def update_plot(self):
         """Main Plotting Logic, mirroring gui_qt.py exactly."""
-        if self.emissions_df is None:
-            if hasattr(self, 'input_files_list') and self.input_files_list:
-                self.on_load_clicked()
-                return
-            self.notify_signal.emit('WARNING', 'Load smkreport and shapefile first.')
-            return
-
-        pol = self.cmb_pollutant.currentText()
-        if not pol and hasattr(self, 'pollutants') and self.pollutants:
-             pol = self.pollutants[0]
-             self.cmb_pollutant.setCurrentText(pol)
-        
-        if not pol:
-            self.notify_signal.emit('WARNING', 'No pollutant selected.')
-            return
-
-        # Capture UI state (Mirroring gui_qt.py variables)
-        plot_by_mode = self.cmb_pltyp.currentText().lower()
-        scc_selection = self.cmb_scc.currentText()
-        scc_code_map = self._scc_display_to_code.copy() if self._scc_display_to_code else {}
-        
-        # Determine plotting CRS
-        plot_crs_info = self._plot_crs()
-
-        # NEW: Capture Plot Meta on Main Thread (Thread Safety)
         try:
+            sys.stdout.write(f">>> GUI_FLOW: update_plot for '{self.cmb_pollutant.currentText()}' <<<\n")
+            sys.stdout.flush()
+            logging.warning(f"GUI_DEBUG: [update_plot] Started for '{self.cmb_pollutant.currentText()}'")
+            
+            if self.emissions_df is None:
+                print("DEBUG: [update_plot] emissions_df is None. Checking for auto-load paths...")
+                logging.info("DEBUG: [update_plot] emissions_df is None.")
+                if hasattr(self, 'input_files_list') and self.input_files_list:
+                    logging.info("DEBUG: [update_plot] Attempting auto-load...")
+                    self.load_input_file(self.input_files_list)
+                    return
+                self.notify_signal.emit('WARNING', 'Load smkreport and shapefile first.')
+                return
+
+            pol = self.cmb_pollutant.currentText()
+            if not pol and hasattr(self, 'pollutants') and self.pollutants:
+                 pol = self.pollutants[0]
+                 print(f"DEBUG: [update_plot] Auto-selecting first pollutant: {pol}")
+                 self.cmb_pollutant.setCurrentText(pol)
+                 # Re-fetch pol after UI update
+                 pol = self.cmb_pollutant.currentText()
+            
+            if not pol:
+                print("DEBUG: [update_plot] ABORT: No pollutant selected.")
+                logging.info("DEBUG: [update_plot] No pollutant selected.")
+                self.notify_signal.emit('WARNING', 'No pollutant selected.')
+                return
+
+            print(f"DEBUG: [update_plot] Proceeding with pollutant: {pol}")
+            logging.info(f"DEBUG: [update_plot] Processing pollutant: {pol}")
+
+            # Capture UI state (Mirroring gui_qt.py variables)
+            plot_by_mode = self.cmb_pltyp.currentText().lower()
+            scc_selection = self.cmb_scc.currentText()
+            scc_code_map = self._scc_display_to_code.copy() if self._scc_display_to_code else {}
+            
+            # Determine plotting CRS
+            plot_crs_info = self._plot_crs()
+
+            # NEW: Capture Plot Meta on Main Thread (Thread Safety)
+            def safe_float(txt):
+                if not txt: return None
+                try: return float(txt)
+                except: return None
+
             is_rev = self.chk_rev_cmap.isChecked()
             cmap_name = self.cmb_cmap.currentText()
             if is_rev: cmap_name += '_r'
             
+            # Robust Unit resolution for meta
+            unit = self.units_map.get(pol, "")
+            if not unit and hasattr(self, 'emissions_df') and self.emissions_df is not None:
+                 vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
+                 if isinstance(vmeta, dict) and pol in vmeta:
+                      unit = vmeta[pol].get('units', "")
+
             meta_fixed = {
                 'cmap': cmap_name,
                 'use_log': self.chk_log.isChecked(),
                 'bins_txt': self.txt_bins.text(),
                 'bins': self._parse_bins(),
-                'unit': self.units_map.get(pol, ''),
-                'vmin': float(self.txt_rmin.text()) if self.txt_rmin.text() else None,
-                'vmax': float(self.txt_rmax.text()) if self.txt_rmax.text() else None,
+                'unit': unit,
+                'vmin': safe_float(self.txt_rmin.text()),
+                'vmax': safe_float(self.txt_rmax.text()),
                 'show_graticule': self.chk_graticule.isChecked() if hasattr(self, 'chk_graticule') else True,
                 'zoom_to_data': self.chk_zoom.isChecked(),
                 'fill_nan': self.chk_nan0.isChecked()
             }
+            
+            logging.warning(f"GUI_DEBUG: [update_plot] Starting background thread for {pol}...")
+            print(f"GUI_DEBUG: [update_plot] Starting background thread for {pol}...", flush=True)
+            self._start_progress(pol=pol)
+            
+            threading.Thread(
+                target=self._plot_worker, 
+                args=(pol, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed),
+                daemon=True
+            ).start()
+            
         except Exception as e:
-            logging.error(f"Failed to capture meta: {e}")
-            meta_fixed = {}
-
-        self._start_progress(pol=pol)
-        
-        threading.Thread(
-            target=self._plot_worker, 
-            args=(pol, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed),
-            daemon=True
-        ).start()
+            sys.stdout.write(f">>> GUI_ERROR: update_plot failed: {e} <<<\n")
+            sys.stdout.flush()
+            logging.error(f"DEBUG: [update_plot] FAILED on main thread: {e}")
+            logging.error(traceback.format_exc())
+            self._stop_progress()
+            self.notify_signal.emit("ERROR", f"Plot Update: {e}")
 
     def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None, fill_nan=False) -> Optional[gpd.GeoDataFrame]:
         """Prepare and merge emissions with geometry, mirroring gui_qt.py logic exactly."""
+        def _do_notify(level, title, msg, exc=None, **kwargs):
+            if notify: notify(level, title, msg, exc, **kwargs)
+            else: self.notify_signal.emit(level, f"{title}: {msg}")
+
+        # Determine target pollutant early
+        target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
+        logging.warning(f"GUI_DEBUG: [_merged] Start. Pollutant: {target_pol}, FillNaN: {fill_nan}")
+        
         if self.emissions_df is None:
+            logging.warning("GUI_DEBUG: [_merged] emissions_df is NONE. Aborting.")
             return None
 
-        # Determine if we have a native NetCDF/already-gridded dataset
+        # Determine if we already have geometry (e.g. Inline Point Source processed or FF10 mapped)
+        has_geometry = isinstance(self.emissions_df, gpd.GeoDataFrame) and self.emissions_df.geometry is not None
+        
+        # Robust Native/Gridded Check: Attributes are fragile, so check columns too
         is_native = getattr(self.emissions_df, 'attrs', {}).get('_smk_is_native', False)
-
-        def _do_notify(level, title, msg, exc=None, **kwargs):
-            if notify:
-                notify(level, title, msg, exc, **kwargs)
-            else:
-                self.notify_signal.emit(level, f"{title}: {msg}")
-
+        if not is_native and hasattr(self.emissions_df, 'columns'):
+             is_native = ('ROW' in self.emissions_df.columns and 'COL' in self.emissions_df.columns)
+             
         mode = (plot_by_mode if plot_by_mode is not None else self.cmb_pltyp.currentText().lower())
         
-        # Shortcut for Native Grids if in 'auto' or 'grid' mode AND large enough for QuadMesh optimization
-        if is_native and mode in ['auto', 'grid'] and len(self.emissions_df) > 10000:
-            target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
-            # For native datasets (NetCDF/Inline), we can proceed if the pollutant is available
+        logging.warning(f"GUI_DEBUG: [_merged] State: has_geometry={has_geometry}, is_native={is_native}, mode={mode}, len={len(self.emissions_df)}")
+
+        # LAZY FETCH: Check if we need to fetch the pollutant into the main DF before proceeding
+        if target_pol and hasattr(self.emissions_df, 'columns') and target_pol not in self.emissions_df.columns:
+            # ... (lines 2818-2838) ...
+            ds = getattr(self.emissions_df, 'attrs', {}).get('_smk_xr_ds')
+            if ds is not None:
+                try:
+                    _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
+                    from ncf_processing import read_ncf_emissions
+                    ncf_params = self.emissions_df.attrs.get('ncf_params', {})
+                    path = self.input_files_list[0] if getattr(self, 'input_files_list', None) else None
+                    if path:
+                        new_data = read_ncf_emissions(path, pollutants=[target_pol], xr_ds=ds, **ncf_params)
+                        if target_pol in new_data.columns:
+                            self.emissions_df[target_pol] = new_data[target_pol].values
+                            if target_pol not in self.units_map:
+                                v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
+                                self.units_map[target_pol] = v_meta.get('units', '')
+                except Exception as e:
+                    _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
+
+        # Shortcut for Native Grids or Already-Geometrized Data
+        if (is_native or has_geometry) and mode in ['auto', 'grid']:
             if target_pol and target_pol in getattr(self.emissions_df, 'columns', []):
-                logging.debug(f"Native grid shortcut for {target_pol}")
+                logging.warning(f"GUI_DEBUG: [_merged] Native/Geometry shortcut triggered for {target_pol}")
                 
-                # Slicing is disabled to avoid duplicate column header issues
-                res_df = self.emissions_df.copy()
+                # Performance Optimization: Only copy columns needed for plotting/hover
+                keep_cols = [target_pol, 'ROW', 'COL', 'GRID_RC', 'FIPS', 'region_cd', 'REGION_CD']
+                present_cols = [c for c in keep_cols if c in self.emissions_df.columns]
                 
-                # Apply fill_nan in shortcut
+                if has_geometry and isinstance(self.emissions_df, gpd.GeoDataFrame):
+                    res_df = self.emissions_df[present_cols + [self.emissions_df.geometry.name]].copy()
+                else:
+                    res_df = self.emissions_df[present_cols].copy()
+
                 if fill_nan:
                     res_df[target_pol] = res_df[target_pol].fillna(0)
-
-                # Ensure GRID_RC exists (Required for Hover tools and coordination)
+                
+                # ... (rest remains same) ...
+                # Ensure GRID_RC exists
                 if 'GRID_RC' not in res_df.columns and 'ROW' in res_df.columns and 'COL' in res_df.columns:
-                    try: 
-                        # Vectorized string conversion is faster
-                        res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
-                        # Cache it back to source to avoid re-calculation on next pollutant switch
-                        if 'GRID_RC' not in self.emissions_df.columns:
-                            self.emissions_df['GRID_RC'] = res_df['GRID_RC']
+                    try: res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
                     except: pass
                 
-                # Downstream pipeline (Reprojection/Plotter) expects a GeoDataFrame
-                if not isinstance(res_df, gpd.GeoDataFrame):
-                    res_gdf = gpd.GeoDataFrame(res_df, geometry=None)
-                    # Preserve attributes which contain the grid info
-                    res_gdf.attrs = self.emissions_df.attrs.copy()
-                    
-                    # NEW: Robustly inject grid info from active grid if missing in dataset
-                    if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
-                         if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
-                              res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
-                    
-                    # Try to assign CRS from grid info if missing
-                    if getattr(res_gdf, 'crs', None) is None:
-                        try:
-                            info = res_gdf.attrs.get('_smk_grid_info')
-                            if info and info.get('proj_str'):
-                                res_gdf.set_crs(info['proj_str'], inplace=True)
-                        except: pass
-                    return res_gdf
-                return res_df
+                # Return if GDF
+                if isinstance(res_df, gpd.GeoDataFrame):
+                    return res_df
+                
+                # Convert to GDF
+                res_gdf = gpd.GeoDataFrame(res_df, geometry=None)
+                res_gdf.attrs = self.emissions_df.attrs.copy()
+                # Ensure it's tagged as native
+                res_gdf.attrs['_smk_is_native'] = True
+               
+                # Inject grid info if missing
+                if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
+                     if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
+                          res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
+                
+                if getattr(res_gdf, 'crs', None) is None:
+                    try:
+                        info = res_gdf.attrs.get('_smk_grid_info')
+                        if info and info.get('proj_str'):
+                            res_gdf.set_crs(info['proj_str'], inplace=True)
+                    except: pass
+                
+                return res_gdf
 
         base_gdf: Optional[gpd.GeoDataFrame] = None
         merge_on: Optional[str] = None
@@ -2758,7 +3043,7 @@ class NativeEmissionGUI(QMainWindow):
             except Exception:
                 sel_code = ''
         
-        has_scc_cols = any(c.lower() in ['scc', 'scc code', 'scc_code'] for c in self.emissions_df.columns)
+        has_scc_cols = any(c.lower() in SCC_COLS for c in self.emissions_df.columns)
         use_scc_filter = bool(has_scc_cols and sel_code)
 
         if mode == 'grid':
@@ -2780,11 +3065,20 @@ class NativeEmissionGUI(QMainWindow):
             geometry_tag = 'grid'
         elif mode == 'county':
             if self.counties_gdf is None:
-                _do_notify('WARNING', 'Counties not loaded', 'Load a counties shapefile or use the online counties option.')
-                raise ValueError("Handled")
-            base_gdf = self.counties_gdf
-            merge_on = 'FIPS'
-            geometry_tag = 'county'
+                if self.grid_gdf is not None:
+                    _do_notify('INFO', 'Geo Fallback', 'Counties shapefile still loading. Falling back to Grid view for now.')
+                    base_gdf = self.grid_gdf
+                    merge_on = 'GRID_RC'
+                    geometry_tag = 'grid'
+                    if not is_native:
+                        self._ensure_ff10_grid_mapping(notify_success=False)
+                else:
+                    _do_notify('WARNING', 'Counties not loaded', 'Load a counties shapefile or use the online counties option.')
+                    raise ValueError("Handled")
+            else:
+                base_gdf = self.counties_gdf
+                merge_on = 'FIPS'
+                geometry_tag = 'county'
         else: # auto
             if self.grid_gdf is not None:
                 if 'GRID_RC' not in getattr(self.emissions_df, 'columns', []):
@@ -2812,18 +3106,23 @@ class NativeEmissionGUI(QMainWindow):
 
         if merge_on and isinstance(base_gdf, gpd.GeoDataFrame):
             if merge_on not in base_gdf.columns:
-                if merge_on == 'FIPS' and 'region_cd' in base_gdf.columns:
-                    try:
+                # Try standard aliases for FIPS
+                if merge_on == 'FIPS':
+                    if 'GEOID' in base_gdf.columns:
+                        base_gdf = base_gdf.copy()
+                        base_gdf['FIPS'] = base_gdf['GEOID']
+                    elif 'region_cd' in base_gdf.columns:
                         base_gdf = base_gdf.copy()
                         base_gdf['FIPS'] = base_gdf['region_cd']
-                    except Exception:
-                        pass
+                    else:
+                         _do_notify('WARNING', 'Geometry Missing FIPS', f"Selected geometry layer lacks 'FIPS', 'GEOID', or 'region_cd' column.")
+                         raise ValueError("Handled")
                 else:
                     _do_notify('WARNING', 'Geometry Missing Column', f"Selected geometry layer lacks '{merge_on}' column.")
                     raise ValueError("Handled")
 
         pol_tuple = tuple(self.pollutants or [])
-        target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
+        # target_pol determined above
 
         # Cache key including NaN fill and spatial filter state
         cache_key = (
@@ -2831,10 +3130,11 @@ class NativeEmissionGUI(QMainWindow):
             merge_on or '',
             id(base_gdf) if base_gdf is not None else 0,
             id(self.emissions_df) if isinstance(self.emissions_df, pd.DataFrame) else 0,
+            tuple(self.emissions_df.columns) if hasattr(self.emissions_df, 'columns') else (),
             id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
             sel_code if use_scc_filter else '',
             pol_tuple,
-            target_pol or '',
+            target_pol if fill_nan else '',
             fill_nan,
             self.cmb_filter_op.currentText() if hasattr(self, 'cmb_filter_op') else 'False',
             id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0
@@ -2856,29 +3156,25 @@ class NativeEmissionGUI(QMainWindow):
         if emis_for_merge is None:
             return None
 
-        # ON-DEMAND LAZY NETCDF FETCH
-        if target_pol and target_pol not in emis_for_merge.columns:
-            ds = emis_for_merge.attrs.get('_smk_xr_ds')
-            if ds is not None:
-                _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
-                try:
-                    from ncf_processing import read_ncf_emissions
-                    ncf_params = emis_for_merge.attrs.get('ncf_params', {})
-                    new_data = read_ncf_emissions(self.input_files_list[0], pollutants=[target_pol], xr_ds=ds, **ncf_params)
-                    if target_pol in new_data.columns:
-                        emis_for_merge[target_pol] = new_data[target_pol].values
-                        self.emissions_df[target_pol] = new_data[target_pol].values # Sync back
-                        if target_pol not in self.units_map:
-                            v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
-                            self.units_map[target_pol] = v_meta.get('units', '')
-                except Exception as e:
-                    _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
+        # Lazy Fetch already handled at top of function
+        
+        # --- FF10/County Join Helper ---
+        if geometry_tag == 'county' and merge_on == 'FIPS':
+            # Ensure emissions data has a FIPS column for the join
+            if 'FIPS' not in emis_for_merge.columns:
+                # Try region_cd (ff10 standard)
+                r_col = next((c for c in emis_for_merge.columns if c.lower() == 'region_cd'), None)
+                if r_col:
+                    emis_for_merge['FIPS'] = emis_for_merge[r_col].astype(str).str.zfill(6)
+                elif not any(c.lower() == 'fips' for c in emis_for_merge.columns):
+                     # If no explicit FIPS, maybe it's point data without fips yet?
+                     pass
 
         # SCC Filtering & Re-aggregation
         if merge_on not in emis_for_merge.columns or use_scc_filter:
             raw_to_use = self.raw_df
             if use_scc_filter and self.raw_df is not None:
-                scc_col = next((c for c in raw_to_use.columns if c.lower() in ['scc', 'scc code', 'scc_code']), None)
+                scc_col = next((c for c in raw_to_use.columns if c.lower() in SCC_COLS), None)
                 if scc_col:
                     raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
             
@@ -2951,7 +3247,8 @@ class NativeEmissionGUI(QMainWindow):
     def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed):
         """Worker thread to prepare data and reproject, mirroring gui_qt.py exactly."""
         try:
-            logging.info(f"Plotting worker started for: {pollutant}")
+            logging.warning(f"GUI_DEBUG: [PlotWorker] Starting for {pollutant}")
+            print(f"GUI_DEBUG: [PlotWorker] Thread started for {pollutant}", flush=True)
             
             def safe_notify(level, title, msg, exc=None, **kwargs):
                 try:
@@ -2960,6 +3257,7 @@ class NativeEmissionGUI(QMainWindow):
                     pass
 
             try:
+                logging.info(f"DEBUG: [PlotWorker] Calling _merged...")
                 merged = self._merged(
                     plot_by_mode=plot_by_mode, 
                     scc_selection=scc_selection, 
@@ -2968,22 +3266,35 @@ class NativeEmissionGUI(QMainWindow):
                     pollutant=pollutant,
                     fill_nan=meta_fixed.get('fill_nan', False)
                 )
+                if merged is not None:
+                    print(f"DEBUG: [PlotWorker] _merged success. Rows: {len(merged)}")
+                else:
+                    print("DEBUG: [PlotWorker] _merged returned NONE.")
+                logging.info(f"DEBUG: [PlotWorker] _merged returned. Type: {type(merged)}, Rows: {len(merged) if merged is not None else 0}")
             except ValueError as ve:
+                print(f"DEBUG: [PlotWorker] VALUE ERROR: {ve}")
+                logging.error(f"DEBUG: [PlotWorker] _merged raised ValueError: {ve}")
                 if str(ve) == "Handled":
-                     QTimer.singleShot(0, self._stop_progress)
+                     self.stop_progress_signal.emit()
                      return
                 raise ve
+            except Exception as e:
+                print(f"DEBUG: [PlotWorker] ERROR in _merged: {e}")
+                logging.error(f"DEBUG: [PlotWorker] _merged raised Exception: {e}")
+                raise e
 
             if merged is None:
+                logging.warning("DEBUG: [PlotWorker] Merged GDF is None. Aborting.")
                 try:
                     self.notify_signal.emit('WARNING', 'Missing Data. Load smkreport and shapefile first.')
                 except RuntimeError:
                     pass
-                QTimer.singleShot(0, self._stop_progress)
+                self.stop_progress_signal.emit()
                 return
 
             # REPROJECTION LOGIC
             plot_crs, tf_fwd, tf_inv = plot_crs_info
+            logging.info(f"DEBUG: [PlotWorker] Target CRS: {plot_crs}")
             
             try:
                 # Ensure merged has a CRS for to_crs() to work (defaulting to 4326 if missing)
@@ -3000,6 +3311,12 @@ class NativeEmissionGUI(QMainWindow):
                      if should_shortcut:
                           logging.info("Native grid shortcut: Skipping per-cell vector reprojection.")
                           merged_plot = merged
+                          # IMPORTANT: still set the CRS property so the plotting tools know the target projection
+                          if getattr(merged_plot, 'crs', None) != plot_crs:
+                               try: merged_plot.set_crs(plot_crs, allow_override=True, inplace=True)
+                               except: 
+                                    try: merged_plot.crs = plot_crs
+                                    except: pass
                      else:
                           logging.info(f"Reprojecting plot data to: {plot_crs}")
                           merged_plot = merged.to_crs(plot_crs)
@@ -3020,6 +3337,7 @@ class NativeEmissionGUI(QMainWindow):
             meta = meta_fixed.copy()
             meta['tf_fwd'] = tf_fwd
             meta['tf_inv'] = tf_inv
+            meta['plot_crs'] = plot_crs # Pass for reference in UI thread
             
             # Calculate Zoom Bounds if requested
             if meta.get('zoom_to_data') and pollutant in merged_plot.columns:
@@ -3036,23 +3354,38 @@ class NativeEmissionGUI(QMainWindow):
                 meta['zoom_gdf'] = merged_plot
 
             try:
+                logging.info(f"DEBUG: [PlotWorker] Emitting plot_ready_signal for {pollutant}")
                 self.plot_ready_signal.emit(merged_plot, pollutant, meta)
+                logging.info(f"DEBUG: [PlotWorker] Signal emitted.")
             except RuntimeError:
-                pass
+                logging.error("DEBUG: [PlotWorker] RuntimeError emitting signal.")
             
         except Exception as e:
+            logging.error(f"DEBUG: [PlotWorker] FAILED: {e}")
+            logging.error(traceback.format_exc())
             try:
                 self.notify_signal.emit("ERROR", f"Plot Preparation Error: {e}")
             except RuntimeError:
                 pass
-            logging.exception("Plot worker failed")
         finally:
-            QTimer.singleShot(0, self._stop_progress)
+            logging.info("DEBUG: [PlotWorker] Finished. Stopping progress.")
+            self.stop_progress_signal.emit()
 
     @Slot(object, str, dict)
     def _render_plot_on_main(self, gdf, column, meta):
         """Main thread slot to update the matplotlib figure."""
+        if getattr(self, '_smk_rendering', False): 
+            return
+        self._smk_rendering = True
         try:
+            if gdf is None or gdf.empty:
+                logging.warning("GDF is empty. Nothing to plot.")
+                self.figure.clear()
+                self.canvas.draw()
+                self._stop_progress()
+                return
+
+            logging.info(f"DEBUG: [_render_plot_on_main] Entered. Pollutant: {column}, GDF Rows: {len(gdf)}")
             # 1. Clear and setup figure
             self.figure.clear()
             
@@ -3125,25 +3458,28 @@ class NativeEmissionGUI(QMainWindow):
             show_graticule = meta.get('show_graticule', True)
             unit = self.units_map.get(column, "")
             
-            # 3. Get transformers (needed for hover & graticule)
-            # Preference: Use transformers from meta (calculated during projection setup)
-            # Fallback: Recalculate if they are missing or CRS changed
+            # 3. Resolve actual CRS (needed for transfers and overlays)
+            actual_crs = getattr(gdf, 'crs', None) or meta.get('plot_crs')
+            if actual_crs is None:
+                 actual_crs = "EPSG:4326"
+            
+            logging.info(f"DEBUG: Rendering plot with Actual CRS: {actual_crs}")
+            logging.info(f"DEBUG: Calling create_map_plot...")
+
+            # 4. Get transformers (needed for hover & graticule)
             tf_fwd = meta.get('tf_fwd')
             tf_inv = meta.get('tf_inv')
             if tf_fwd is None or tf_inv is None:
-                tf_fwd, tf_inv = self._get_transformers(gdf.crs)
+                tf_fwd, tf_inv = self._get_transformers(actual_crs)
 
-            # 4. Initialize Axis & Aspect Ratio
-            # Use 'box' adjustment to maintain stability during zoom/resize
-            ax.set_aspect('equal', adjustable='box')
+            # Aspect ratio is handled by Figure size and create_map_plot management
             
-            # 5. Render main plot
+            # 6. Render main plot
             self._merged_gdf = gdf
-            # Store current values for dynamic title stats
             ax._smk_current_vals = gdf[column].values
+            ax._smk_pollutant = column 
             ax._smk_time_lbl = None
             
-            # Style & Optimization (Mirroring gui_qt.py)
             p_lw = 0.05
             p_ec = 'black'
             if len(gdf) > 20000:
@@ -3151,12 +3487,12 @@ class NativeEmissionGUI(QMainWindow):
                 p_ec = 'none'
 
             unit = self.units_map.get(column, "")
-            # Fallback for units
             if not unit:
                 vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
                 if isinstance(vmeta, dict) and column in vmeta:
                      unit = vmeta[column].get('units', '')
 
+            logging.info(f"DEBUG: [_render_plot_on_main] Starting create_map_plot...")
             collection = create_map_plot(
                 gdf=gdf,
                 column=column,
@@ -3165,17 +3501,43 @@ class NativeEmissionGUI(QMainWindow):
                 cmap_name=cmap,
                 bins=bins,
                 log_scale=use_log,
-                overlay_counties=self.counties_gdf,
-                overlay_shape=self.overlay_gdf,
-                unit_label=unit, # Pass units directly for better detection
-                crs_proj=getattr(gdf, 'crs', None),
-                tf_fwd=tf_fwd if show_graticule else None,
-                tf_inv=tf_inv if show_graticule else None,
-                zoom_to_data=False, # Limits already set above
+                overlay_counties=None, # Handle manually in GUI for zorder control
+                overlay_shape=None,
+                unit_label=unit,
+                crs_proj=actual_crs,
+                tf_fwd=None, # Handle graticule manually after zoom
+                tf_inv=None,
+                zoom_to_data=False,
                 linewidth=p_lw,
-                edgecolor=p_ec
+                edgecolor=p_ec,
+                disable_quadmesh=not self.chk_quadmesh.isChecked()
             )
+            logging.info(f"DEBUG: [_render_plot_on_main] create_map_plot finished.")
             
+            # --- Robust Overlay Support (GUI Managed) ---
+            # Ensure the plot is at lower zorder
+            if collection:
+                 collection.set_zorder(0)
+            
+            def _gui_add_overlays(_ax, _counties, _shapes, _target_crs):
+                from plotting import _resolve_cmap_and_theme
+                _, theme = _resolve_cmap_and_theme(cmap)
+                if _counties is not None:
+                    try:
+                        c_gdf = _counties.to_crs(_target_crs) if _target_crs and getattr(_counties, 'crs', None) else _counties
+                        c_gdf.boundary.plot(ax=_ax, color=theme['county_color'], linewidth=theme['county_lw'], alpha=0.8, zorder=5)
+                    except: pass
+                if _shapes is not None:
+                    s_list = _shapes if isinstance(_shapes, list) else [_shapes]
+                    clrs = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
+                    for idx, s_gdf in enumerate(s_list):
+                        try:
+                            s_out = s_gdf.to_crs(_target_crs) if _target_crs and getattr(s_gdf, 'crs', None) else s_gdf
+                            s_out.boundary.plot(ax=_ax, color=clrs[idx % len(clrs)], linewidth=theme['overlay_lw'], alpha=0.9, linestyle='--', zorder=6)
+                        except: pass
+            
+            _gui_add_overlays(ax, self.counties_gdf, self.overlay_gdf, actual_crs)
+
             # --- Zoom Calculation (Robust for Gridded Shortcut) ---
             if zoom_to_data or self._base_view is None:
                 try:
@@ -3209,6 +3571,17 @@ class NativeEmissionGUI(QMainWindow):
                     ax.set_ylim(min(miny, maxy) - abs(pady), max(miny, maxy) + abs(pady))
                 except Exception as ze:
                     logging.warning(f"Zoom calculation failed: {ze}")
+            else:
+                # Restore previous view to prevent "zoom out" reset
+                if self._base_view:
+                    try:
+                        ax.set_xlim(self._base_view[0])
+                        ax.set_ylim(self._base_view[1])
+                    except: pass
+
+            # 5b. Render Graticule (Handle manually after zoom to ensure coverage)
+            if show_graticule and tf_fwd and tf_inv:
+                 self._draw_graticule(ax, tf_fwd, tf_inv)
             
             # Initial Draw to register axes
             self.canvas.draw_idle()
@@ -3219,36 +3592,52 @@ class NativeEmissionGUI(QMainWindow):
             
             # Step-wise draw to register axes and allow tick generation
             self.canvas.draw()
+
+            # --- FIX: Prevent graticule labels from spilling outside frame ---
+            try:
+                gx0, gx1 = ax.get_xlim()
+                gy0, gy1 = ax.get_ylim()
+                # Use a smaller buffer (1%) to avoid hiding labels in global views
+                gbuf_x = 0.01 * abs(gx1 - gx0)
+                gbuf_y = 0.01 * abs(gy1 - gy0)
+                for txt in ax.texts:
+                    if '°' in txt.get_text():
+                        txt.set_clip_on(True)
+                        tpos = txt.get_position()
+                        # Only hide if the label center is actually outside the view bounds
+                        # or extremely close to the edge (buffer)
+                        if txt.get_ha() == 'center':
+                            if tpos[0] < gx0 or tpos[0] > gx1:
+                                txt.set_visible(False)
+                        if txt.get_va() == 'center':
+                            if tpos[1] < gy0 or tpos[1] > gy1:
+                                txt.set_visible(False)
+            except Exception: pass
             
             # 7. Format Colorbar (Mirroring gui_qt.py)
-            # Identify the colorbar axis. Prefer the direct colorbar object if attached to collection.
+            # Identify the colorbar axis
             cbar_ax = None
-            if collection is not None and hasattr(collection, 'colorbar') and collection.colorbar is not None:
-                cbar_ax = collection.colorbar.ax
+            all_axes = self.figure.axes
+            new_candidate = [a for a in all_axes if a not in pre_axes and a is not ax]
+            if new_candidate:
+                cbar_ax = new_candidate[0]
             
             if cbar_ax is None:
-                # Fallback to axis search
-                all_axes = self.figure.axes
-                new_candidate = [a for a in all_axes if a not in pre_axes and a is not ax]
-                if new_candidate:
-                    cbar_ax = new_candidate[0]
-                
-                if cbar_ax is None:
-                    for cand in all_axes:
-                        if cand is ax: continue
-                        if str(cand.get_label()) == '<colorbar>':
+                for cand in all_axes:
+                    if cand is ax: continue
+                    if str(cand.get_label()) == '<colorbar>':
+                        cbar_ax = cand
+                        break
+            
+            if cbar_ax is None:
+                for cand in all_axes:
+                    if cand is ax: continue
+                    try:
+                        bbox = cand.get_position()
+                        if min(bbox.width, bbox.height) < 0.3 * max(bbox.width, bbox.height):
                             cbar_ax = cand
                             break
-                
-                if cbar_ax is None:
-                    for cand in all_axes:
-                        if cand is ax: continue
-                        try:
-                            bbox = cand.get_position()
-                            if min(bbox.width, bbox.height) < 0.3 * max(bbox.width, bbox.height):
-                                cbar_ax = cand
-                                break
-                        except: pass
+                    except: pass
 
             norm = getattr(collection, 'norm', None) if collection is not None else None
 
@@ -3259,6 +3648,18 @@ class NativeEmissionGUI(QMainWindow):
                     orient_vertical = (bbox.height >= bbox.width)
                 except Exception:
                     orient_vertical = True
+
+                # --- REPAIR COLORBAR CONTENT ---
+                # Check if the axis is empty (missing the color mesh/patches)
+                if len(cbar_ax.collections) == 0 and len(cbar_ax.patches) == 0:
+                    try:
+                        # Use the Figure's colorbar method to ensure it draws on correctly
+                        cbar_repair = cbar_ax.figure.colorbar(
+                            collection, cax=cbar_ax, 
+                            orientation='vertical' if orient_vertical else 'horizontal'
+                        )
+                        collection.colorbar = cbar_repair
+                    except Exception: pass
 
                 # 7b. Label colorbar with units if available (Use local unit variable)
                 try:
@@ -3275,31 +3676,46 @@ class NativeEmissionGUI(QMainWindow):
                     bins_ticks = (bins if bins is not None else [])
 
                     if bins_ticks:
+                        is_boundary = isinstance(norm, BoundaryNorm) if norm else False
                         ticks = [t for t in bins_ticks if (t > 0) ] if is_log else list(bins_ticks)
                         if ticks:
-                            # Trigger scientific if values are extreme
-                            txt_bins = self.txt_bins.text().lower() if hasattr(self, 'txt_bins') else ""
-                            use_sci = 'e' in txt_bins or any(abs(t) >= 1e6 or (0 < abs(t) < 1e-4) for t in ticks)
-
-                            if not use_sci:
-                                # Positional format for human readability if not too small
-                                try:
-                                    labels = [np.format_float_positional(t, trim='-') for t in ticks]
-                                    fmt = FixedFormatter(labels)
-                                except Exception:
-                                    fmt = FuncFormatter(lambda x, p: f"{x:g}")
+                            if is_boundary:
+                                # For BoundaryNorm, use the colorbar object to map ticks correctly
+                                cbar = getattr(collection, 'colorbar', None)
+                                if cbar:
+                                    cbar.set_ticks(ticks)
+                                    # Format labels to avoid scientific notation for standard ranges
+                                    labels = []
+                                    for v in ticks:
+                                        # Use standard float format then strip trailing zeros
+                                        s = f"{float(v):.10f}".rstrip('0').rstrip('.')
+                                        # If it's zero or too small for .10f, use .10g
+                                        if not s or s == "0": s = f"{v:.10g}"
+                                        # If still scientific or too long, use human-friendly g
+                                        if 'e' in s or len(s) > 12: s = f"{v:g}"
+                                        labels.append(s)
+                                    
+                                    if orient_vertical:
+                                        cbar_ax.yaxis.set_ticklabels(labels)
+                                    else:
+                                        cbar_ax.xaxis.set_ticklabels(labels)
+                                    cbar.update_ticks()
                             else:
-                                # Scientific format for extreme values
-                                fmt = FuncFormatter(lambda x, p: f"{x:.4g}")
-                            
-                            if orient_vertical:
-                                cbar_ax.yaxis.set_major_locator(FixedLocator(ticks))
-                                cbar_ax.yaxis.set_major_formatter(fmt)
-                                cbar_ax.xaxis.set_ticks([])
-                            else:
-                                cbar_ax.xaxis.set_major_locator(FixedLocator(ticks))
-                                cbar_ax.xaxis.set_major_formatter(fmt)
-                                cbar_ax.yaxis.set_ticks([])
+                                # Determine formatter that shows requested precision
+                                def _fmt_precise(x, pos=None):
+                                    if x == 0: return "0"
+                                    return f"{x:.6g}"
+                                
+                                fmt = FuncFormatter(_fmt_precise)
+                                
+                                if orient_vertical:
+                                    cbar_ax.yaxis.set_major_locator(FixedLocator(ticks))
+                                    cbar_ax.yaxis.set_major_formatter(fmt)
+                                    cbar_ax.xaxis.set_ticks([])
+                                else:
+                                    cbar_ax.xaxis.set_major_locator(FixedLocator(ticks))
+                                    cbar_ax.xaxis.set_major_formatter(fmt)
+                                    cbar_ax.yaxis.set_ticks([])
                     else:
                         # Default Formatter for standard linear/log scales
                         if is_log:
@@ -3386,6 +3802,7 @@ class NativeEmissionGUI(QMainWindow):
             self.notify_signal.emit("ERROR", f"Render failed: {e}")
             traceback.print_exc()
         finally:
+            self._smk_rendering = False
             self._stop_progress()
 
     def reset_home_view(self):
@@ -3433,6 +3850,27 @@ class NativeEmissionGUI(QMainWindow):
              
              # Check if ncf
              is_ncf = self.plot_controls_frame.isVisible()
+             
+             # Debug Click Value vs TS Value
+             try:
+                 # Check current value in merged GDF
+                 t_val = "N/A"
+                 c_idx = -1
+                 if self.emissions_df is not None:
+                      # Find index in emissions_df where ROW=row_look and COL=col_look
+                      # Standard Gridded
+                      mask = (self.emissions_df['ROW'] == row_look) & (self.emissions_df['COL'] == col_look)
+                      if mask.any():
+                           # Get first match
+                           rec = self.emissions_df[mask].iloc[0]
+                           pol = self.cmb_pollutant.currentText()
+                           if pol in rec:
+                                t_val = rec[pol]
+                 
+                 logging.info(f"DEBUG: Click Cell ({row_look}, {col_look}). Main Plot Value: {t_val}")
+             except Exception as e:
+                 logging.debug(f"Click debug check failed: {e}")
+                 
              if not is_ncf: return
              
              from ncf_processing import get_ncf_timeseries
@@ -3456,11 +3894,15 @@ class NativeEmissionGUI(QMainWindow):
          try:
              # Run extraction (blocking is okay for short TS, or move to thread if slow)
              from ncf_processing import get_ncf_timeseries
+             # Support for Inline TS
+             sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
+             
              res = get_ncf_timeseries(
                 self.input_files_list[0],
                 self.cmb_pollutant.currentText(),
                 [r-1], [c-1],
-                layer_idx=l_idx, layer_op=l_op, op='mean'
+                layer_idx=l_idx, layer_op=l_op, op='mean',
+                stack_groups_path=sg_path
              )
              
              if res:
@@ -3517,7 +3959,14 @@ class NativeEmissionGUI(QMainWindow):
         re_arr = gdf['region_cd'].values if 'region_cd' in gdf_cols else (gdf['REGION_CD'].values if 'REGION_CD' in gdf_cols else None)
         g_arr = gdf['GRID_RC'].values if 'GRID_RC' in gdf_cols else None
         p_arr = gdf[pollutant].values if pollutant in gdf_cols else None
-        geom_arr = gdf.geometry.values if hasattr(gdf, 'geometry') else []
+        
+        # Robustly handle missing geometry for optimized grids
+        geom_arr = None
+        try:
+            if hasattr(gdf, 'geometry') and gdf.geometry is not None:
+                geom_arr = gdf.geometry.values
+        except: 
+            geom_arr = None
 
         # 2. Pre-build Grid lookup transformer to avoid CRS/Projection overhead
         info = getattr(gdf, 'attrs', {}).get('_smk_grid_info')
@@ -3588,9 +4037,14 @@ class NativeEmissionGUI(QMainWindow):
                 best_val = -1.0
                 
                 for idx in cand_idx:
-                    geom = geom_arr[idx]
-                    # Robust containment check required for 100% accuracy near edges
-                    if geom is not None and geom.contains(pt):
+                    # For optimized grids, geom_arr might be None or empty. 
+                    # If we found indices via Grid Math (Strategy 1), we can trust them if geometry is missing.
+                    geom = None
+                    if geom_arr is not None and idx < len(geom_arr):
+                        geom = geom_arr[idx]
+
+                    # Condition: If geometry exists, must contain point. If missing, trust Strategy 1.
+                    if geom is None or geom.contains(pt):
                         parts = [base]
                         
                         # Region/FIPS lookup
@@ -3767,39 +4221,50 @@ class NativeEmissionGUI(QMainWindow):
 
     def _filter_scc_list(self, text):
         """Filter the SCC ComboBox list based on search text."""
-        if not hasattr(self, '_scc_full_list') or not self._scc_full_list:
+        if not hasattr(self, '_scc_full_list') or self._scc_full_list is None:
+            # Capture whatever is currently in the box (usually populated by _post_load_update)
             items = [self.cmb_scc.itemText(i) for i in range(self.cmb_scc.count())]
+            if not items or items == ["All SCC"]:
+                return # Nothing to filter yet
             self._scc_full_list = items
         
         self.cmb_scc.blockSignals(True)
         self.cmb_scc.clear()
-        query = text.lower()
-        filtered = [it for it in self._scc_full_list if query in it.lower()]
-        if not filtered:
-             filtered = ["All SCC"]
+        query = text.lower().strip()
+        
+        if not query:
+            filtered = self._scc_full_list
+        else:
+            filtered = [it for it in self._scc_full_list if query in it.lower()]
+            # Always ensure "All SCC" is available at the top for easy reset
+            if "All SCC" not in filtered:
+                filtered.insert(0, "All SCC")
+
         self.cmb_scc.addItems(filtered)
         self.cmb_scc.blockSignals(False)
 
     def _filter_pollutant_list(self, text):
         """Filter the Pollutant ComboBox based on search text."""
-        if not hasattr(self, '_full_pollutant_list'):
+        if not hasattr(self, '_full_pollutant_list') or self._full_pollutant_list is None:
             self._full_pollutant_list = [self.cmb_pollutant.itemText(i) for i in range(self.cmb_pollutant.count())]
         
         current = self.cmb_pollutant.currentText()
         self.cmb_pollutant.blockSignals(True)
         self.cmb_pollutant.clear()
+        query = text.lower().strip()
         
-        query = text.lower()
-        matches = [p for p in self._full_pollutant_list if query in p.lower()]
-        if not matches:
-            matches = self._full_pollutant_list
+        if not query:
+            filtered = self._full_pollutant_list
+        else:
+            filtered = [it for it in self._full_pollutant_list if query in it.lower()]
             
-        self.cmb_pollutant.addItems(matches)
+        self.cmb_pollutant.addItems(filtered)
         
+        # Restore selection if it still exists in filtered list
         idx = self.cmb_pollutant.findText(current)
         if idx >= 0:
             self.cmb_pollutant.setCurrentIndex(idx)
-        
+            
         self.cmb_pollutant.blockSignals(False)
 
     def save_plot(self):
@@ -3875,6 +4340,80 @@ class NativeEmissionGUI(QMainWindow):
             return tf_fwd, tf_inv
         except:
             return None, None
+
+    def _draw_graticule(self, ax, tf_fwd, tf_inv, lon_step=None, lat_step=None, with_labels=True):
+        """Draw longitude/latitude lines on the given axes using provided transformers."""
+        if ax is None:
+            return _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+
+        def _remove_existing():
+            artists = getattr(ax, '_smk_graticule_artists', None)
+            if isinstance(artists, dict):
+                for key in ('lines', 'texts'):
+                    try:
+                        group = artists.get(key, [])
+                        for art in group:
+                            try: art.remove()
+                            except: pass
+                    except: pass
+            ax._smk_graticule_artists = {'lines': [], 'texts': []}
+
+        def _disconnect():
+            cids = getattr(ax, '_smk_graticule_cids', [])
+            for cid in cids:
+                try: ax.callbacks.disconnect(cid)
+                except: pass
+            ax._smk_graticule_cids = []
+            ax._smk_graticule_callback = None
+
+        try: _remove_existing()
+        except: pass
+        try: _disconnect()
+        except: pass
+
+        artists = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+        if not isinstance(artists, dict):
+            artists = {'lines': [], 'texts': []}
+        ax._smk_graticule_artists = artists
+
+        def _on_limits(_axis):
+            if getattr(ax, '_smk_drawing_graticule', False): return
+            
+            # Use a timer to debounce the redraw. This prevents infinite recursion
+            # when scale transitions (Linear -> Log) trigger rapid-fire limit changes.
+            def _debounced_redraw():
+                if getattr(ax, '_smk_drawing_graticule', False): return
+                try:
+                    xlim = ax.get_xlim()
+                    ylim = ax.get_ylim()
+                    if not (np.isfinite(xlim).all() and np.isfinite(ylim).all()):
+                         return
+                except: return
+                
+                ax._smk_drawing_graticule = True
+                try:
+                    _remove_existing()
+                    refreshed = _draw_graticule_fn(ax, tf_fwd, tf_inv, lon_step, lat_step, with_labels)
+                    if not isinstance(refreshed, dict):
+                        refreshed = {'lines': [], 'texts': []}
+                    ax._smk_graticule_artists = refreshed
+                    try: ax.figure.canvas.draw_idle()
+                    except: pass
+                except Exception as e:
+                    logging.debug(f"Debounced redraw failed: {e}")
+                finally:
+                    ax._smk_drawing_graticule = False
+
+            # Delay by 20ms to allow Matplotlib to finish its coordinate state change
+            QTimer.singleShot(20, _debounced_redraw)
+
+        try:
+            cid1 = ax.callbacks.connect('xlim_changed', _on_limits)
+            cid2 = ax.callbacks.connect('ylim_changed', _on_limits)
+            ax._smk_graticule_cids = [cid1, cid2]
+            ax._smk_graticule_callback = _on_limits
+        except: pass
+        return artists
 
     def preview_data(self):
         """Show a table preview of the current data."""
@@ -4097,7 +4636,13 @@ class TimeSeriesPlotWindow(QDialog):
         # Convert times to datetime if string
         try:
             if times and isinstance(times[0], str):
-                times = [pd.to_datetime(t) for t in times]
+                try:
+                    # Attempt detailed SMOKE format parsing first: YYYYDDD_HHMMSS
+                    times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
+                    # Check if parsing resulted in valid dates (not filtered out or all NaT if pandas failed silently logic)
+                except:
+                    # Fallback to auto-detection
+                    times = [pd.to_datetime(t) for t in times]
         except: pass
 
         if isinstance(vals, dict):

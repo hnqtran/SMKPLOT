@@ -27,15 +27,16 @@ key_cols = ['country_cd','tribal_code','region_cd','facility_id','unit_id','rel_
 # Define constant column name lists for remapping (moved from data_processing.py)
 COUNTRY_COLS = ['country_cd', 'country', 'country_id']
 TRIBAL_COLS = ['tribal_code', 'tribal_name', 'tribe_id']
-REGION_COLS = ['region_cd', 'regioncd', 'region', 'county_id', 'fips']
-FACILITY_COLS = ['facility_id', 'facility']
-UNIT_COLS = ['unit_id']
-REL_COLS = ['rel_point_id', 'release_point_id', 'point_id']
-EMIS_COLS = ['ann_value', 'emission']
-SCC_COLS = ['scc']
-POL_COLS = ['poll', 'pollutant']
-LAT_COLS = ['latitude', 'lat']
-LON_COLS = ['longitude', 'lon']
+REGION_COLS = ['region_cd', 'regioncd', 'region', 'county_id', 'fips', 'state_county_fips']
+FACILITY_COLS = ['facility_id', 'facility', 'facility_name', 'oris']
+UNIT_COLS = ['unit_id', 'unit_name']
+REL_COLS = ['rel_point_id', 'release_point_id', 'point_id', 'stack_id']
+EMIS_COLS = ['ann_value', 'emission', 'emissions', 'value']
+SCC_COLS = ['scc', 'scc_code', 'scc code', 'source_classification_code', 'source classification code']
+DESC_COLS = ['scc description', 'scc_description', 'scc_desc', 'scc_description_name']
+POL_COLS = ['poll', 'pollutant', 'poll_name', 'pollutant_name', 'poll_id']
+LAT_COLS = ['latitude', 'lat', 'y_coord']
+LON_COLS = ['longitude', 'lon', 'long', 'x_coord']
 
 # Define country code mappings following ISO 3166-1 alpha-2 codes for Northern Hemisphere countries
 COUNTRY_CODE_MAPPINGS = {
