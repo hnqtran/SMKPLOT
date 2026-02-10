@@ -475,6 +475,8 @@ def _draw_graticule(ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, 
             
         # Determine appropriate step size if not fixed
         # Logic: aim for ~4-8 lines in the view
+        lon_span = lons.max() - lons.min()
+        lat_span = lats.max() - lats.min()
         
         def _nice_step(span):
             if span <= 0: return 1.0
