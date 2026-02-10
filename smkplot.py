@@ -16,11 +16,12 @@ import sys
 # Set PROJ data paths to fix pyogrio/pyproj issues in virtual environments and HPC clusters
 # This MUST happen before any third-party imports (geopandas, pyproj, etc.)
 def _setup_proj_env():
+    # Only force set PROJ variables if in a bundle or if specific issues are detected.
+    # On many HPC clusters, setting these manually causes version conflicts (PROJ 8 vs 9, etc)
     try:
         # Check if we are inside a PyInstaller bundle
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass:
-            # PyInstaller bundles projection data in these locations
             for candidate in [
                 os.path.join(meipass, 'pyproj', 'proj_dir', 'share', 'proj'),
                 os.path.join(meipass, 'proj_data'),
@@ -30,20 +31,8 @@ def _setup_proj_env():
                     os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = candidate
                     return
 
-        # Not in a bundle, or bundle check failed. Try to find via site-packages
-        # We search path without importing if possible, but importing 'pyproj' is the most reliable
-        import pyproj
-        import pyproj.datadir
-        _proj_data = pyproj.datadir.get_data_dir()
-        if _proj_data and os.path.isdir(_proj_data):
-            os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = _proj_data
-        else:
-            from pathlib import Path
-            _base = Path(pyproj.__file__).resolve().parent
-            for _path in [_base / 'proj_dir' / 'share' / 'proj', _base / 'data']:
-                if _path.is_dir():
-                    os.environ['PROJ_LIB'] = os.environ['PROJ_DATA'] = str(_path)
-                    break
+        # On HPC, it's often safer to let the libraries find their own data
+        # unless something is clearly broken.
     except Exception:
         pass
 
@@ -328,14 +317,16 @@ def main():
     if requested_mode == 'auto':
         # Priority 1: Native PySide6 (gui.py)
         try:
-            import PySide6
+            try: import PySide6
+            except ImportError: import PyQt5
             import gui
             target_impl = 'native'
-            logging.info("Auto-selected: Native PySide6 GUI (gui.py)")
+            logging.info("Auto-selected: Native Qt GUI (gui.py)")
         except ImportError:
-            # Priority 2: Shimmed Qt (gui_qt.py) - also uses PySide6 but with Shim
+            # Priority 2: Shimmed Qt (gui_qt.py) 
             try:
-                import PySide6
+                try: import PySide6
+                except ImportError: import PyQt5
                 import gui_qt
                 target_impl = 'qt_shim'
                 logging.info("Auto-selected: Shimmed Qt GUI (gui_qt.py)")

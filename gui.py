@@ -328,10 +328,12 @@ class Worker(QRunnable):
 
 class TableWindow(QMainWindow):
     """Modern window to display a DataFrame in a searchable, sortable table."""
-    def __init__(self, df, title="Data Preview", parent=None):
+    def __init__(self, df=None, title="Data Preview", parent=None, modes=None):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(1100, 700)
+        self.modes = modes or {}
+        self.current_df = df
         
         # UI Setup
         central = QWidget()
@@ -341,8 +343,17 @@ class TableWindow(QMainWindow):
         
         # Header Area
         header_layout = QHBoxLayout()
-        info = f"Showing {min(len(df), 2000):,} of {len(df):,} rows | {len(df.columns)} Columns"
-        self.info_lbl = QLabel(info)
+        
+        # View Selector (if modes available)
+        if self.modes:
+            header_layout.addWidget(QLabel("View:"))
+            self.cmb_view = QComboBox()
+            self.cmb_view.addItems(list(self.modes.keys()))
+            self.cmb_view.currentTextChanged.connect(self._on_view_changed)
+            header_layout.addWidget(self.cmb_view)
+            header_layout.addSpacing(20)
+            
+        self.info_lbl = QLabel("")
         self.info_lbl.setStyleSheet("font-weight: bold; color: #4b5563;")
         header_layout.addWidget(self.info_lbl)
         
@@ -358,25 +369,10 @@ class TableWindow(QMainWindow):
         layout.addLayout(header_layout)
         
         # Table Setup
-        df_show = df.head(2000) # Increased limit for modern systems
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setRowCount(len(df_show))
-        self.table.setColumnCount(len(df_show.columns))
-        self.table.setHorizontalHeaderLabels([str(c) for c in df_show.columns])
-        
-        # Populate
-        self._all_items = []
-        for i, row in enumerate(df_show.itertuples(index=False)):
-            row_items = []
-            for j, val in enumerate(row):
-                item = QTableWidgetItem(str(val))
-                self.table.setItem(i, j, item)
-                row_items.append(item)
-            self._all_items.append(row_items)
-        
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setMinimumSectionSize(80)
@@ -391,6 +387,7 @@ class TableWindow(QMainWindow):
         # Footer
         footer_layout = QHBoxLayout()
         btn_copy = QPushButton("Copy Selected")
+        btn_copy.setShortcut("Ctrl+C") # Keyboard shortcut
         btn_copy.clicked.connect(self._copy_selection)
         footer_layout.addWidget(btn_copy)
         
@@ -398,10 +395,66 @@ class TableWindow(QMainWindow):
         
         btn_export = QPushButton("Export to CSV")
         btn_export.setObjectName("primaryBtn")
-        btn_export.clicked.connect(lambda: self.export_csv(df))
+        btn_export.clicked.connect(self.export_current_csv)
         footer_layout.addWidget(btn_export)
         
         layout.addLayout(footer_layout)
+        
+        # Initial Populate
+        if self.modes:
+            # Trigger first view
+            self.cmb_view.setCurrentIndex(0)
+            self._on_view_changed(self.cmb_view.currentText())
+        elif self.current_df is not None:
+            self._populate_table(self.current_df)
+
+    def _populate_table(self, df):
+        self.current_df = df
+        self.table.setSortingEnabled(False) # Disable during populate
+        self.table.clear()
+        
+        if df is None: 
+            self.table.setRowCount(0); self.table.setColumnCount(0)
+            self.info_lbl.setText("No data available")
+            return
+
+        df_show = df.head(2000) 
+        self.table.setRowCount(len(df_show))
+        self.table.setColumnCount(len(df_show.columns))
+        self.table.setHorizontalHeaderLabels([str(c) for c in df_show.columns])
+        
+        self.info_lbl.setText(f"Showing {len(df_show):,} of {len(df):,} rows | {len(df.columns)} Columns")
+        
+        self._all_items = []
+        for i, row in enumerate(df_show.itertuples(index=False)):
+            row_items = []
+            for j, val in enumerate(row):
+                item = QTableWidgetItem(str(val))
+                self.table.setItem(i, j, item)
+                row_items.append(item)
+            self._all_items.append(row_items)
+            
+        self.table.setSortingEnabled(True)
+
+    def _on_view_changed(self, view_name):
+        if view_name not in self.modes: return
+        data = self.modes[view_name]
+        
+        # Resolve lazy loading (callable)
+        if callable(data):
+            try:
+                df = data()
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to load view: {e}")
+                return
+        else:
+            df = data
+            
+        self._populate_table(df)
+
+    def export_current_csv(self):
+        if self.current_df is not None:
+             self.export_csv(self.current_df)
 
     def _filter_table(self, text):
         text = text.lower()
@@ -931,7 +984,17 @@ class NativeEmissionGUI(QMainWindow):
             QProgressBar::chunk { background-color: #3b82f6; border-radius: 8px; }
             
             /* Status Bar */
-            QStatusBar { background-color: #ffffff; border-top: 1px solid #e5e7eb; color: #4b5563; }
+            QStatusBar { 
+                background-color: #ffffff; 
+                border-top: 1px solid #e2e8f0; 
+                color: #475569; 
+                min-height: 28px;
+            }
+            QStatusBar::item { border: none; }
+            QLabel#statusIcon { color: #10b981; font-size: 12px; font-weight: bold; margin-left: 8px; }
+            QLabel#statusMsg { font-weight: 500; margin-left: 4px; color: #1e293b; }
+            QLabel#statusStat { color: #64748b; font-size: 10px; padding: 0 12px; border-left: 1px solid #f1f5f9; font-weight: 500; }
+            QLabel#statusStat:hover { color: #3b82f6; }
         """
         self.setStyleSheet(style)
         if QApplication.instance():
@@ -1015,15 +1078,11 @@ class NativeEmissionGUI(QMainWindow):
         
         footer_layout.addWidget(self.btn_main_plot, 2)
 
-        btn_exp_all = QPushButton("Quick CSV")
-        btn_exp_all.setToolTip("Export plot data to CSV immediately")
-        btn_exp_all.clicked.connect(self.export_data)
-        footer_layout.addWidget(btn_exp_all, 1)
-        
-        btn_export_tool = QPushButton("Export Tool")
-        btn_export_tool.setMinimumHeight(40)
-        btn_export_tool.clicked.connect(self.export_data)
-        footer_layout.addWidget(btn_export_tool, 1)
+        btn_export = QPushButton("Export Configuration")
+        btn_export.setToolTip("Save current settings to a YAML configuration file")
+        btn_export.setMinimumHeight(45)
+        btn_export.clicked.connect(self.export_configuration)
+        footer_layout.addWidget(btn_export, 1)
         
         left_layout.addWidget(self.footer_frame)
         
@@ -1062,11 +1121,8 @@ class NativeEmissionGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False); self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(3)
-        self.status_label = QLabel("Ready")
-        
         log_layout.addWidget(self.log_text)
         log_layout.addWidget(self.progress_bar)
-        log_layout.addWidget(self.status_label)
         
         right_splitter.addWidget(log_group)
         right_splitter.setStretchFactor(0, 5)
@@ -1079,135 +1135,242 @@ class NativeEmissionGUI(QMainWindow):
         
         main_layout.addWidget(self.main_splitter)
 
+        # --- Modern Status Bar Setup ---
+        self._setup_modern_status_bar()
+
+    def _setup_modern_status_bar(self):
+        """Create a segmented, modern status bar with telemetry."""
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
+        
+        # Left Side: Icon + Message
+        self.status_icon = QLabel("●")
+        self.status_icon.setObjectName("statusIcon")
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("statusMsg")
+        
+        sb.addWidget(self.status_icon)
+        sb.addWidget(self.status_label)
+        
+        # Permanent Widgets (Right Alignment)
+        self.lbl_grid_info = QLabel("Grid: --")
+        self.lbl_grid_info.setObjectName("statusStat")
+        
+        self.lbl_threads = QLabel("Threads: 1")
+        self.lbl_threads.setObjectName("statusStat")
+        
+        self.lbl_mem = QLabel("RAM: --")
+        self.lbl_mem.setObjectName("statusStat")
+        
+        self.lbl_version = QLabel(f"SMKPLOT v2.0")
+        self.lbl_version.setObjectName("statusStat")
+        
+        sb.addPermanentWidget(self.lbl_grid_info)
+        sb.addPermanentWidget(self.lbl_threads)
+        sb.addPermanentWidget(self.lbl_mem)
+        sb.addPermanentWidget(self.lbl_version)
+        
+        # Background Timer for Stats
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._update_sb_telemetry)
+        self._stats_timer.start(3000) # Every 3s
+
+    def _update_sb_telemetry(self):
+        """Refresh system stats in the status bar."""
+        try:
+            # Active Threads
+            tc = threading.active_count()
+            self.lbl_threads.setText(f"Threads: {tc}")
+            
+            # Memory (Estimate if psutil missing)
+            import os
+            try:
+                import psutil
+                mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+                self.lbl_mem.setText(f"RAM: {mem:.0f} MB")
+            except ImportError:
+                # Fallback: very basic memory estimation for Linux
+                try:
+                    with open('/proc/self/status') as f:
+                        for line in f:
+                            if line.startswith('VmRSS:'):
+                                rss = int(line.split()[1]) / 1024
+                                self.lbl_mem.setText(f"RAM: {rss:.0f} MB")
+                                break
+                except:
+                    self.lbl_mem.setText("RAM: N/A")
+        except Exception:
+            pass
+
+    def _set_status_busy(self, is_busy=True, msg=None):
+        """Update status bar appearance based on system state."""
+        if is_busy:
+            self.status_icon.setText("○")
+            self.status_icon.setStyleSheet("color: #3b82f6;") # Blue
+            if msg: self.status_label.setText(msg)
+        else:
+            self.status_icon.setText("●")
+            self.status_icon.setStyleSheet("color: #10b981;") # Green
+            if msg: self.status_label.setText(msg)
+        QApplication.processEvents()
+
     def _init_inputs_section(self, parent_layout=None):
         group = QGroupBox("1. Input Data")
+        
+        # Main vertical layout for the group
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(8, 14, 8, 8)
-        layout.setSpacing(4)
-        form = QFormLayout()
-        form.setVerticalSpacing(4)
-        form.setLabelAlignment(Qt.AlignRight)
+        layout.setContentsMargins(10, 15, 10, 10)
+        layout.setSpacing(8)
+
+        # --- A. Primary File Input ---
+        file_box = QWidget()
+        l_file = QVBoxLayout(file_box) 
+        l_file.setContentsMargins(0, 0, 0, 0); l_file.setSpacing(4)
         
-        # Emissions
         self.txt_input = QLineEdit()
-        self.txt_input.setPlaceholderText("Paste emissions file path(s) here...")
+        self.txt_input.setPlaceholderText("Path to Emissions File (CSV, NetCDF, Excel)...")
+        self.txt_input.setToolTip("Drag & Drop supported")
         self.txt_input.editingFinished.connect(self._on_input_path_edit)
-        form.addRow("Emissions:", self.txt_input)
         
-        btns = QHBoxLayout()
-        btns.setSpacing(4)
-        btn_load = QPushButton("Add File(s)")
+        btn_browse_input = QPushButton("Browse...")
+        btn_browse_input.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        btn_browse_input.clicked.connect(self.select_input_file)
+        
+        row_input = QHBoxLayout()
+        row_input.addWidget(self.txt_input)
+        row_input.addWidget(btn_browse_input)
+        
+        l_file.addLayout(row_input)
+        
+        # Tools Row (Load, Preview, Meta)
+        row_tools = QHBoxLayout()
+        btn_load = QPushButton("Load Data")
         btn_load.setObjectName("primaryBtn")
-        btn_load.clicked.connect(self.select_input_file)
-        btns.addWidget(btn_load, 2)
+        btn_load.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        btn_load.clicked.connect(lambda: self.load_input_file(self.txt_input.text()))
         
-        btn_preview = QPushButton("Preview")
+        btn_preview = QPushButton("View Table")
+        btn_preview.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         btn_preview.clicked.connect(self.preview_data)
-        btns.addWidget(btn_preview, 1)
         
-        btn_meta = QPushButton("Meta")
+        btn_meta = QPushButton("Metadata")
+        btn_meta.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
         btn_meta.clicked.connect(self.show_metadata)
-        btns.addWidget(btn_meta, 1)
-
-        btn_stats = QPushButton("Stats")
-        btn_stats.clicked.connect(self.show_detailed_stats)
-        btns.addWidget(btn_stats, 1)
-
-        layout.addLayout(form)
-        layout.addLayout(btns)
         
-        # Settings 
-        settings_form = QFormLayout()
-        settings_form.setLabelAlignment(Qt.AlignRight)
+        row_tools.addWidget(btn_load, 2)
+        row_tools.addWidget(btn_preview, 1)
+        row_tools.addWidget(btn_meta, 1)
+        l_file.addLayout(row_tools)
         
+        layout.addWidget(file_box)
+        
+        # --- B. configuration Form (Grid, Counties, Parsing) ---
+        form_frame = QFrame()
+        form_frame.setStyleSheet("QFrame { background: #f8fafc; border-radius: 4px; border: 1px solid #e2e8f0; }")
+        l_form = QGridLayout(form_frame)
+        l_form.setContentsMargins(8, 8, 8, 8)
+        l_form.setVerticalSpacing(6)
+        l_form.setHorizontalSpacing(10)
+        
+        # Row 1: Delimiter & Skip
+        l_form.addWidget(QLabel("Delimiter:"), 0, 0)
         self.cmb_delim = QComboBox()
         self.cmb_delim.addItems(['auto', 'comma', 'semicolon', 'tab', 'pipe', 'space', 'other'])
         self.cmb_delim.currentTextChanged.connect(self._on_delim_toggle)
+        self.txt_custom_delim = QLineEdit(); self.txt_custom_delim.setPlaceholderText("Char"); self.txt_custom_delim.setVisible(False); self.txt_custom_delim.setFixedWidth(40)
+        d_box = QHBoxLayout(); d_box.setContentsMargins(0,0,0,0)
+        d_box.addWidget(self.cmb_delim); d_box.addWidget(self.txt_custom_delim)
+        l_form.addLayout(d_box, 0, 1)
         
-        delim_layout = QHBoxLayout()
-        delim_layout.addWidget(self.cmb_delim)
-        self.txt_custom_delim = QLineEdit()
-        self.txt_custom_delim.setPlaceholderText("Other...")
-        self.txt_custom_delim.setFixedWidth(50)
-        self.txt_custom_delim.setVisible(False)
-        delim_layout.addWidget(self.txt_custom_delim)
-        settings_form.addRow("Delim:", delim_layout)
-        
-        # Counties
-        self.txt_counties = QLineEdit()
-        self.txt_counties.setPlaceholderText("Standard or online counties...")
-        self.txt_counties.editingFinished.connect(self._on_counties_path_edit)
-        settings_form.addRow("Counties:", self.txt_counties)
-        
-        cnt_btns = QHBoxLayout()
-        btn_counties = QPushButton("Browse Shp")
-        btn_counties.clicked.connect(self.select_county_file)
-        cnt_btns.addWidget(btn_counties)
-        
-        self.cmb_online_year = QComboBox()
-        self.cmb_online_year.addItems(['2020', '2023'])
-        cnt_btns.addWidget(QLabel("Yr:"))
-        cnt_btns.addWidget(self.cmb_online_year)
-        btn_online = QPushButton("Fetch")
-        btn_online.setObjectName("primaryBtn")
-        btn_online.clicked.connect(self.use_online_counties)
-        cnt_btns.addWidget(btn_online)
-        settings_form.addRow("", cnt_btns)
-        
-        # GRIDDESC
+        l_form.addWidget(QLabel("Skip Rows:"), 0, 2)
+        self.spin_skip = QSpinBox(); self.spin_skip.setRange(0, 100)
+        l_form.addWidget(self.spin_skip, 0, 3)
+
+        # Row 2: GRIDDESC & Selection
+        l_form.addWidget(QLabel("GRIDDESC:"), 1, 0)
         self.txt_griddesc = QLineEdit()
-        self.txt_griddesc.setPlaceholderText("GRIDDESC path...")
+        self.txt_griddesc.setPlaceholderText("Path to GRIDDESC")
         self.txt_griddesc.editingFinished.connect(self._on_griddesc_path_edit)
-        settings_form.addRow("GRIDDESC:", self.txt_griddesc)
-        
-        grid_row = QHBoxLayout()
-        btn_griddesc = QPushButton("Browse")
-        btn_griddesc.clicked.connect(self.select_griddesc_file)
-        grid_row.addWidget(btn_griddesc)
-        
+        btn_gd = QPushButton("..."); btn_gd.setFixedWidth(30); btn_gd.clicked.connect(self.select_griddesc_file)
+        g_box = QHBoxLayout(); g_box.setContentsMargins(0,0,0,0); g_box.setSpacing(2)
+        g_box.addWidget(self.txt_griddesc); g_box.addWidget(btn_gd)
+        l_form.addLayout(g_box, 1, 1, 1, 3) # Span 3 cols
+
+        # Row 3: Grid Name Selection
+        l_form.addWidget(QLabel("Grid Name:"), 2, 0)
         self.cmb_gridname = QComboBox()
-        self.cmb_gridname.setMaxVisibleItems(8)
-        self.cmb_gridname.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.cmb_gridname.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.cmb_gridname.addItem("Select Grid")
         self.cmb_gridname.currentTextChanged.connect(self._grid_name_changed)
-        grid_row.addWidget(self.cmb_gridname, 1)
-        settings_form.addRow("", grid_row)
+        l_form.addWidget(self.cmb_gridname, 2, 1, 1, 3)
+
+        # Row 4: County Shapefile
+        l_form.addWidget(QLabel("Counties:"), 3, 0)
+        self.txt_counties = QLineEdit()
+        self.txt_counties.setPlaceholderText("Shp Path / Online Year")
+        self.txt_counties.editingFinished.connect(self._on_counties_path_edit)
+        btn_c_browse = QPushButton("..."); btn_c_browse.setFixedWidth(30); btn_c_browse.clicked.connect(self.select_county_file)
+        c_box = QHBoxLayout(); c_box.setContentsMargins(0,0,0,0); c_box.setSpacing(2)
+        c_box.addWidget(self.txt_counties); c_box.addWidget(btn_c_browse)
+        l_form.addLayout(c_box, 3, 1, 1, 3)
         
-        # NetCDF Controls
+        # Row 5: Online Counties (Fetch)
+        l_form.addWidget(QLabel("Online Map:"), 4, 0)
+        self.cmb_online_year = QComboBox()
+        self.cmb_online_year.addItems(['2020', '2023'])
+        btn_online = QPushButton("Fetch")
+        btn_online.setToolTip("Download US Counties shapefile from Census.gov")
+        btn_online.clicked.connect(self.use_online_counties)
+        
+        o_box = QHBoxLayout(); o_box.setContentsMargins(0,0,0,0)
+        o_box.addWidget(self.cmb_online_year)
+        o_box.addWidget(btn_online)
+        o_box.addStretch()
+        l_form.addLayout(o_box, 4, 1, 1, 3)
+        
+        layout.addWidget(form_frame)
+        
+        # --- C. NetCDF Options (Hidden by default) ---
         self.ncf_frame = QFrame()
-        ncf_lyt = QHBoxLayout(self.ncf_frame)
-        ncf_lyt.setContentsMargins(0,0,0,0)
-        self.cmb_ncf_layer = QComboBox()
-        self.cmb_ncf_layer.setMaxVisibleItems(8)
-        self.cmb_ncf_layer.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.cmb_ncf_layer.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.cmb_ncf_layer.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
-        self.cmb_ncf_time = QComboBox()
-        self.cmb_ncf_time.setMaxVisibleItems(8)
-        self.cmb_ncf_time.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.cmb_ncf_time.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        self.cmb_ncf_time.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
-        ncf_lyt.addWidget(QLabel("Lay:"))
-        ncf_lyt.addWidget(self.cmb_ncf_layer)
-        ncf_lyt.addWidget(QLabel("TS:"))
-        ncf_lyt.addWidget(self.cmb_ncf_time)
         self.ncf_frame.setVisible(False)
-        settings_form.addRow("NCF Dims:", self.ncf_frame)
+        self.ncf_frame.setStyleSheet("QFrame { background: #eff6ff; border: 1px dashed #bfdbfe; border-radius: 4px; }")
+        l_ncf = QHBoxLayout(self.ncf_frame)
+        l_ncf.setContentsMargins(8, 4, 8, 4)
         
+        self.cmb_ncf_layer = QComboBox()
+        self.cmb_ncf_time = QComboBox()
+        # Connect signals
+        self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        
+        l_ncf.addWidget(QLabel("<b>NetCDF:</b>"))
+        l_ncf.addWidget(QLabel("Layer:"))
+        l_ncf.addWidget(self.cmb_ncf_layer, 1)
+        l_ncf.addWidget(QLabel("TimeStep:"))
+        l_ncf.addWidget(self.cmb_ncf_time, 1)
+        
+        layout.addWidget(self.ncf_frame)
+
+        # Parse Options (Skip, Comment)
         extra_lyt = QHBoxLayout()
         self.spin_skip = QSpinBox()
         extra_lyt.addWidget(QLabel("Skip:"))
         extra_lyt.addWidget(self.spin_skip)
+        
         self.txt_comment = QLineEdit("#")
         self.txt_comment.setFixedWidth(30)
         extra_lyt.addWidget(QLabel("Com:"))
         extra_lyt.addWidget(self.txt_comment)
-        settings_form.addRow("Parse Opts:", extra_lyt)
         
-        layout.addLayout(settings_form)
+        parse_box = QWidget() # wrapper to add border/margin if needed, currently just plain
+        p_layout = QVBoxLayout(parse_box); p_layout.setContentsMargins(0,0,0,0)
+        p_row = QHBoxLayout()
+        p_row.addWidget(QLabel("Additional Options:")) 
+        p_row.addLayout(extra_lyt)
+        p_row.addStretch()
+        p_layout.addLayout(p_row)
+        
+        layout.addWidget(parse_box)
+
         if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
 
@@ -1216,27 +1379,20 @@ class NativeEmissionGUI(QMainWindow):
         layout = QFormLayout(group)
         layout.setContentsMargins(8, 14, 8, 8)
         layout.setVerticalSpacing(4)
-        layout.setLabelAlignment(Qt.AlignRight)
         
-        pol_layout = QHBoxLayout()
-        pol_layout.setSpacing(4)
         self.cmb_pollutant = QComboBox()
         self.cmb_pollutant.setMaxVisibleItems(8)
-        # Enable smooth pixel-based scrolling for long lists
         self.cmb_pollutant.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.cmb_pollutant.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.cmb_pollutant.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.cmb_pollutant.view().setMinimumWidth(450)
         self.cmb_pollutant.currentIndexChanged.connect(self._pollutant_changed)
-        pol_layout.addWidget(self.cmb_pollutant, 3)
         
-        self.txt_pol_search = QLineEdit()
-        self.txt_pol_search.setClearButtonEnabled(True)
-        self.txt_pol_search.setPlaceholderText("Search...")
-        self.txt_pol_search.setMinimumWidth(80)
-        self.txt_pol_search.textChanged.connect(self._filter_pollutant_list)
-        pol_layout.addWidget(self.txt_pol_search, 1)
+        pol_layout = QHBoxLayout()
+        pol_layout.addWidget(self.cmb_pollutant, 3)
         layout.addRow("Pollutant:", pol_layout)
+        
+        if parent_layout: parent_layout.addWidget(group)
+        else: self.control_layout.addWidget(group)
         
         self.lbl_units = QLabel("Unit: -")
         self.lbl_units.setStyleSheet("color: #2563eb; font-weight: bold; font-size: 10px;")
@@ -1818,6 +1974,7 @@ class NativeEmissionGUI(QMainWindow):
     @Slot()
     def use_online_counties(self):
         year = self.cmb_online_year.currentText()
+        if not year: year = "2020"
         url = f"https://www2.census.gov/geo/tiger/GENZ{year}/shp/cb_{year}_us_county_500k.zip"
         self.notify_signal.emit("INFO", f"Fetching online counties for {year}...")
         self.counties_path = url
@@ -2234,13 +2391,12 @@ class NativeEmissionGUI(QMainWindow):
 
     @Slot()
     def _stop_progress(self):
-        """Hide progress bar and restore UI."""
-        sys.stdout.write(">>> GUI_FLOW: Entering _stop_progress <<<\n")
-        sys.stdout.flush()
-        logging.warning("GUI_DEBUG: [_stop_progress] Re-enabling button.")
+        """Helper to re-enable UI after plot or load."""
         self.progress_bar.setVisible(False)
-        self.status_label.setText("Ready")
+        self.progress_bar.setRange(0, 1)
         self.btn_main_plot.setEnabled(True)
+        self.btn_main_plot.setText("GENERATE PLOT")
+        self._set_status_busy(False)
 
     def _ensure_ff10_grid_mapping(self, *, notify_success: bool = True) -> None:
         """Populate GRID_RC for FF10 point datasets once grid geometry is available."""
@@ -2396,12 +2552,20 @@ class NativeEmissionGUI(QMainWindow):
         # Trigger manual update to sync units label
         self._pollutant_changed()
 
-        # Update metadata summary
-        if hasattr(self.emissions_df, 'attrs'):
-            self._last_attrs_summary = "\n".join([f"{k}: {v}" for k, v in self.emissions_df.attrs.items()])
-        
+        # Update Grid Info in status bar
+        grid_desc = "--"
+        if hasattr(self, 'emissions_df') and hasattr(self.emissions_df, 'attrs'):
+            info = self.emissions_df.attrs.get('_smk_grid_info', {})
+            name = info.get('grid_name')
+            if name:
+                grid_desc = f"{name} ({info.get('ncols')}x{info.get('nrows')})"
+            elif self.grid_gdf is not None:
+                grid_desc = f"Custom ({len(self.grid_gdf)} cells)"
+        if hasattr(self, 'lbl_grid_info'):
+            self.lbl_grid_info.setText(f"Grid: {grid_desc}")
+
         # Success status
-        self.status_label.setText(f"Loaded {len(self.emissions_df):,} rows, {len(self.pollutants)} pollutants.")
+        self._set_status_busy(False, f"Loaded {len(self.emissions_df):,} rows, {len(self.pollutants)} pollutants.")
         
         self.ncf_frame.setVisible(is_ncf)
         self.plot_controls_frame.setVisible(is_ncf)
@@ -4513,35 +4677,69 @@ class NativeEmissionGUI(QMainWindow):
         self._pop_wins.append(win)
         win.show()
 
-    def export_data(self):
-        """Export current data to file."""
-        df = self.raw_df if self.raw_df is not None else self.emissions_df
-        if df is None:
-             QMessageBox.warning(self, "No Data", "No data to export.")
-             return
-
-        path, _ = QFileDialog.getSaveFileName(self, "Export Data", "", "CSV Files (*.csv);;GeoPackage (*.gpkg)")
-        if path:
-            try:
-                self.status_label.setText(f"Exporting to {path}...")
-                if path.endswith('.gpkg'):
-                    # Need geometry
-                    if hasattr(df, 'geometry'):
-                        gpd.GeoDataFrame(df).to_file(path, driver="GPKG")
-                    elif self.counties_gdf is not None:
-                         # Try to join? Complex. Just warn.
-                         QMessageBox.warning(self, "Geometry Missing", "Data has no geometry for GPKG. Saving as CSV instead.")
-                         path = path.replace('.gpkg', '.csv')
-                         df.to_csv(path, index=False)
-                    else:
-                        QMessageBox.warning(self, "Error", "Cannot export GPKG without geometry.")
-                        return
-                else:
-                    df.to_csv(path, index=False)
-                self.status_label.setText(f"Exported to {path}")
-                self.notify_signal.emit("INFO", f"Data exported to {path}")
-            except Exception as e:
-                self.notify_signal.emit("ERROR", f"Export failed: {e}")
+    def export_configuration(self):
+        """Export current GUI settings to a YAML configuration file."""
+        import yaml
+        from datetime import datetime
+        
+        path, _ = QFileDialog.getSaveFileName(self, "Export Configuration", "", "YAML Config (*.yaml)")
+        if not path: return
+        
+        try:
+            # Gather settings
+            config = {
+                'timestamp_utc': datetime.utcnow().isoformat(),
+                'arguments': {
+                    'filepath': self.txt_input.text() or None,
+                    'sector': 'exported_session', # Default placeholder
+                    
+                    # File Parsing
+                    'delim': self.cmb_delim.currentText().lower(),
+                    'skip_rows': self.spin_skip.value(),
+                    
+                    # Paths
+                    'griddesc': self.txt_griddesc.text() or None,
+                    'counties_shp': self.txt_counties.text() or None,
+                    
+                    # Filtering
+                    'filter_col': self.cmb_filter_col.currentText() if self.cmb_filter_col.currentText() else None,
+                    'filter_val': self.txt_filter_val.text() if self.txt_filter_val.text() else None,
+                    #'filter_start': None, # TODO: Add if range implemented
+                    #'filter_end': None,   # TODO: Add if range implemented
+                    'filter_shapefile': self.txt_filter_shp.text() if hasattr(self, 'txt_filter_shp') and self.txt_filter_shp.text() else None,
+                    'filter_shapefile_opt': self.cmb_filter_op.currentText().lower() if hasattr(self, 'cmb_filter_op') else None,
+                    
+                    # Plotting
+                    'pollutant': self.cmb_pollutant.currentText() if self.cmb_pollutant.count() > 0 else None,
+                    'plot_title': self.txt_title.text() if hasattr(self, 'txt_title') else None,
+                    'vmin': float(self.txt_rmin.text()) if self.txt_rmin.text() else None,
+                    'vmax': float(self.txt_rmax.text()) if self.txt_rmax.text() else None,
+                    'cmap': self.cmb_cmap.currentText() + ('_r' if self.chk_rev_cmap.isChecked() else ''),
+                    'bins': [float(x.strip()) for x in self.txt_bins.text().split(',')] if self.txt_bins.text().strip() else None,
+                    
+                    # Boolean Flags
+                    'log_scale': self.chk_log.isChecked(),
+                    'show_grid': self.chk_graticule.isChecked(),
+                    'zoom_to_data': self.chk_zoom.isChecked(),
+                    'fill_nan': self.chk_nan0.isChecked() if hasattr(self, 'chk_nan0') else False,
+                }
+            }
+            
+            # Remove None values to keep it clean
+            args = config['arguments']
+            config['arguments'] = {k: v for k, v in args.items() if v is not None}
+            
+            with open(path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                
+            self.notify_signal.emit("INFO", f"Configuration saved to {path}")
+            QMessageBox.information(self, "Success", f"Configuration saved to:\n{path}")
+            
+        except Exception as e:
+            msg = f"Could not save configuration:\n{e}"
+            QMessageBox.critical(self, "Export Failed", msg)
+            logging.error(f"Config export failed: {e}")
+            self.notify_signal.emit("ERROR", f"Config export failed: {e}")
 
     def _get_transformers(self, crs):
         """Get transformers for graticule."""
@@ -4629,40 +4827,182 @@ class NativeEmissionGUI(QMainWindow):
         return artists
 
     def preview_data(self):
-        """Show a table preview of the current data."""
+        """Show a table preview of the current data with integrated view switching."""
         if self.emissions_df is None:
             QMessageBox.warning(self, "No Data", "Please load data first.")
             return
-            
-        # Choice: Raw or Plotted
-        # The original code had 'if self._merged_gdf is not None:' here.
-        # The instruction provided an 'elif plot_kwargs.get('legend'):' which is syntactically incorrect
-        # in this context and refers to a variable not available in this method.
-        # Assuming the intent was to modify the condition for showing the choice dialog,
-        # but without 'plot_kwargs' or a clear replacement, the original logic is kept
-        # for _merged_gdf, as it's the most sensible interpretation given the context.
-        # If the intent was to remove the choice dialog entirely or change its condition
-        # based on an external 'plot_kwargs', more context would be needed.
+
+        # Prepare modes (Lazy loading via lambdas where appropriate)
+        modes = {
+            "Raw Data (Full File)": self.emissions_df,
+        }
+        
         if self._merged_gdf is not None:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Preview Data")
-            msg.setText("Which data would you like to preview?")
-            btn_plot = msg.addButton("Plotted (Filtered/Joined)", QMessageBox.ActionRole)
-            btn_raw = msg.addButton("Raw (Full File)", QMessageBox.ActionRole)
-            msg.addButton(QMessageBox.Cancel)
-            msg.exec()
-            
-            if msg.clickedButton() == btn_plot:
-                df, title = self._merged_gdf, "Plotted Data Preview"
-            elif msg.clickedButton() == btn_raw:
-                df, title = self.emissions_df, "Raw Data Preview"
-            else:
-                return
-        else:
-            df, title = self.emissions_df, "Raw Data Preview"
-            
-        self.preview_win = TableWindow(df, title=title, parent=self)
+             modes["Plotted Data (Filtered)"] = self._merged_gdf
+             
+        # Add Summaries (computed on demand)
+        # Note: We pass the bound method or lambda
+        modes["Summary by State"] = lambda: self._summarize_by_geo(self.emissions_df, 'state')
+        modes["Summary by County"] = lambda: self._summarize_by_geo(self.emissions_df, 'county')
+        modes["Summary by SCC (Top 2000)"] = lambda: self._summarize_by_scc(self.emissions_df)
+        modes["Summary by Grid Cell"] = lambda: self._summarize_by_grid(self.emissions_df)
+
+        self.preview_win = TableWindow(title="Data Preview", parent=self, modes=modes)
         self.preview_win.show()
+
+    def _summarize_by_grid(self, df):
+        """Aggregate emissions by Grid Cell (ROW, COL)."""
+        pols = self.pollutants
+        cols = []
+        if 'ROW' in df.columns and 'COL' in df.columns:
+            cols = ['ROW', 'COL']
+        elif 'GRID_RC' in df.columns:
+            cols = ['GRID_RC']
+            
+        if not cols:
+             # Fallback for NetCDF or unknown structure
+             if hasattr(df, 'attrs') and df.attrs.get('source_type') == 'gridded_netcdf':
+                  # Already gridded, maybe summarize by layer?
+                  return df.head(5000)
+             raise ValueError("No grid (ROW/COL) columns found.")
+             
+        g = df.groupby(cols)[pols].sum().reset_index()
+        return g.sort_values(pols[0], ascending=False).head(5000)
+
+    def _summarize_by_scc(self, df):
+        """Aggregate emissions by SCC."""
+        # Find SCC column (case-insensitive)
+        col = next((c for c in df.columns if c.upper() == 'SCC'), None)
+        if not col:
+            raise ValueError("No SCC column found.")
+            
+        pols = self.pollutants
+        if not pols: return df
+        
+        # Group
+        g = df.groupby(col)[pols].sum().reset_index()
+        # Add descriptions if lookup available
+        # (Assuming simple aggregation for now)
+        return g.sort_values(pols[0], ascending=False).head(2000)
+
+    def _summarize_by_geo(self, df, mode):
+        """Aggregate by State/County (Replicating gui_qt logic)."""
+        pols = self.pollutants
+        raw = df.copy()
+        lower_map = {c.lower(): c for c in raw.columns}
+        mode_l = (mode or '').strip().lower()
+        
+        group_cols = []
+        add_cols = {} # Extra columns to add to result
+        
+        # --- COUNTY MODE ---
+        if mode_l == 'county':
+            key = None
+            if 'fips' in lower_map: key = lower_map['fips']
+            elif 'region_cd' in lower_map: key = lower_map['region_cd']
+            
+            if not key:
+                raise ValueError("Cannot summarize by county: Missing FIPS/region_cd column.")
+                
+            group_cols = [key]
+            
+            # Derive STATEFP and names when possible (like gui_qt)
+            try:
+                fips_series = raw[key].astype(str).str.zfill(6)
+                add_cols['COUNTRY_ID'] = fips_series.str[0]
+                add_cols['STATEFP'] = fips_series.str[1:3]
+                add_cols['STATE_NAME'] = add_cols['STATEFP'].map(US_STATE_FIPS_TO_NAME)
+            except Exception: pass
+            
+            # If COUNTY or COUNTY_NAME column exists in input, carry it (like gui_qt)
+            try:
+                county_name_col = lower_map.get('county name') or lower_map.get('county') or lower_map.get('county_name')
+                if county_name_col and county_name_col in raw.columns:
+                     # Take most frequent name per FIPS to avoid duplicates
+                     tmp_cn = raw[[key, county_name_col]].copy()
+                     name_map = tmp_cn.dropna(subset=[county_name_col]).drop_duplicates(subset=[key]).set_index(key)[county_name_col]
+                     add_cols['COUNTY_NAME'] = raw[key].map(name_map)
+            except Exception: pass
+
+        # --- STATE MODE ---
+        elif mode_l == 'state':
+            fips_col = None
+            if 'fips' in lower_map: fips_col = lower_map['fips']
+            elif 'region_cd' in lower_map: fips_col = lower_map['region_cd']
+            
+            if not fips_col:
+                # Try state code directly
+                if 'state_cd' in lower_map:
+                    group_cols = [lower_map['state_cd']]
+                else:
+                    raise ValueError("Cannot summarize by state: FIPS/region_cd/state_cd not available.")
+            else:
+                # Derive STATEFP from FIPS (gui_qt logic)
+                # FIPS is typically 6 chars (C+SS+CCC). We want SS.
+                raw['STATEFP'] = raw[fips_col].astype(str).str.strip().str.zfill(6).str[1:3]
+                group_cols = ['STATEFP']
+                
+            # Add Name
+            try:
+                col_to_map = group_cols[0]
+                # If grouping by STATEFP, map it. If state_cd, assume it might be state code
+                raw['STATE_NAME'] = raw[col_to_map].map(US_STATE_FIPS_TO_NAME)
+                add_cols['STATE_NAME'] = raw['STATE_NAME']
+            except Exception: pass
+            
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # Perform Aggregation
+        if not group_cols: return df
+        
+        g = raw.groupby(group_cols)[pols].sum().reset_index()
+        
+        # Attach enriched columns
+        # We need to map back the enriched data to the grouped result
+        # For STATEFP/Name, since we grouped BY it (in state mode), it's already there or easy to map
+        # For County mode, we grouped by FIPS, so we map back attributes based on FIPS
+        
+        try:
+            if mode_l == 'state':
+                 # If we grouped by STATEFP, add STATE_NAME
+                 if 'STATE_NAME' in add_cols and 'STATE_NAME' not in g.columns:
+                      # Re-map using the group key
+                      key_col = group_cols[0]
+                      g['STATE_NAME'] = g[key_col].map(US_STATE_FIPS_TO_NAME)
+                      
+            elif mode_l == 'county':
+                 # We grouped by FIPS (key).
+                 # We need to reconstruct the attributes for each FIPS in g
+                 key_col = group_cols[0]
+                 
+                 # Helper to get first valid value from original derived cols
+                 # Actually, simpler: just re-derive from the grouped key since it's 1:1
+                 f_series = g[key_col].astype(str).str.zfill(6)
+                 
+                 if 'STATE_NAME' in add_cols:
+                      statefp = f_series.str[1:3]
+                      g['STATE_NAME'] = statefp.map(US_STATE_FIPS_TO_NAME)
+                      
+                 if 'COUNTY_NAME' in add_cols:
+                      # We need the map we built earlier
+                      # Re-build map from raw data as we did before
+                      county_name_col = lower_map.get('county name') or lower_map.get('county') or lower_map.get('county_name')
+                      if county_name_col:
+                           tmp_cn = raw[[key_col, county_name_col]].copy()
+                           name_map = tmp_cn.dropna(subset=[county_name_col]).drop_duplicates(subset=[key_col]).set_index(key_col)[county_name_col]
+                           g['COUNTY_NAME'] = g[key_col].map(name_map)
+
+        except Exception as e:
+            logging.warning(f"Failed to attach enriched summaries: {e}")
+            
+        # Reorder for niceness
+        cols_out = group_cols + [c for c in ['STATE_NAME', 'COUNTY_NAME'] if c in g.columns] + pols
+        # Filter to only existing cols
+        cols_out = [c for c in cols_out if c in g.columns]
+        g = g[cols_out]
+        
+        return g.sort_values(pols[0], ascending=False)
 
     def browse_filter_shpfile(self):
         """Select filter shapefile."""
