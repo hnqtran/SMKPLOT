@@ -184,7 +184,7 @@ def parse_args():
     ap.add_argument('--zoom-to-data', action='store_true', help='In batch mode, limit map extent to data (non-zero pollutant cells) with small padding.')
     ap.add_argument('--zoom-pad', type=float, default=0.02, help='Padding fraction to apply around data extent when using --zoom-to-data (default 0.02 = 2%%).')
     ap.add_argument('--bins', help='Custom colorbar ticks (comma or space separated). Plots remain continuous (linear/log).') # Custom bins for colorbar ticks (batch mode)
-    ap.add_argument('--cmap', default='viridis', help='Matplotlib colormap name (e.g., viridis, plasma, turbo, Reds).')
+    ap.add_argument('--cmap', default='jet', help='Matplotlib colormap name (e.g., viridis, plasma, turbo, Reds).')
     ap.add_argument('--workers', type=int, default=0, help='Number of parallel workers for batch plotting (0=auto).')
     ap.add_argument('--outdir', default='outputs', help='Output directory for batch mode (default to outputs).')
     ap.add_argument('--log-scale', action='store_true', help='Use log scale for color mapping in batch mode.')

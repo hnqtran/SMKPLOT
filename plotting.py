@@ -308,6 +308,14 @@ def create_map_plot(
                     collection = None
 
         if collection is None:
+            # PERFORMANCE OPTIMIZATION:
+            # For very large vector datasets, rasterize the main data layer.
+            # This keeps the UI responsive during pan/zoom and reduces complexity
+            # while keeping overlays (counties, etc.) as sharp vectors.
+            if len(gdf) > 20000:
+                plot_kwargs['rasterized'] = True
+                logging.info(f"Auto-rasterizing large dataset ({len(gdf)} features) for performance.")
+                
             # Fallback to standard GeoPandas (Vector) plot
             gdf.plot(**plot_kwargs)
             if ax.collections:
@@ -481,9 +489,6 @@ def _draw_graticule(ax, tf_fwd: pyproj.Transformer, tf_inv: pyproj.Transformer, 
             else: step = 5.0 * power
             return max(step, 1e-5) # Safety floor
 
-        lon_span = lons.max() - lons.min()
-        lat_span = lats.max() - lats.min()
-        
         # Use provided step unless it's too sparse for the current view (zoom handling)
         actual_lon_step = lon_step
         if actual_lon_step is None or (lon_step > lon_span and lon_span > 0):

@@ -62,7 +62,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView
 )
 from PySide6.QtCore import (
-    Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings
+    Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings,
+    QRunnable, QThreadPool
 )
 from PySide6.QtGui import (
     QAction, QIcon, QFont, QIntValidator, QDoubleValidator, 
@@ -100,40 +101,110 @@ try:
     from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
     from ncf_processing import get_ncf_dims, create_ncf_domain_gdf, read_ncf_grid_params
 
-    # --- Robust Monkey-patch for Graticule Recursion Guard ---
+    # --- Robust Monkey-patch: Fixed Graticule Logic (Zoom Support) ---
     import plotting
-    _orig_draw_graticule = plotting._draw_graticule
+    
+    def _fixed_draw_graticule(ax, tf_fwd, tf_inv, lon_step=None, lat_step=None, with_labels=True):
+        """Native gui.py implementation of graticule drawing to fix zoom issues."""
+        artists = {'lines': [], 'texts': []}
+        if ax is None or tf_fwd is None or tf_inv is None:
+            return artists
 
-    def _guarded_draw_graticule(*args, **kwargs):
-        ax = args[0] if args else kwargs.get('ax')
-        if ax is None: return _orig_draw_graticule(*args, **kwargs)
-        if getattr(ax, '_smk_drawing_graticule', False): return {'lines': [], 'texts': []}
-        
-        # Additional safety check for finite bounds
+        # Use internal flags for separate operation phases if needed, 
+        # but don't block entry if caller managed the guard.
         try:
-            xlim = ax.get_xlim()
-            ylim = ax.get_ylim()
-            if not (np.isfinite(xlim).all() and np.isfinite(ylim).all()):
-                return {'lines': [], 'texts': []}
-        except Exception: 
-            return {'lines': [], 'texts': []}
+            x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+            if not (np.isfinite([x0, x1, y0, y1]).all()): return artists
+            
+            # Detect Lat/Lon span to determine nice steps
+            sx = np.array([x0, x1, x1, x0, 0.5*(x0+x1)])
+            sy = np.array([y0, y0, y1, y1, 0.5*(y0+y1)])
+            sample_lons, sample_lats = tf_inv.transform(sx, sy)
+            valid = (np.abs(sample_lons) < 181.01) & (np.abs(sample_lats) < 91.01)
+            if not valid.any(): return artists
+            
+            lons, lats = sample_lons[valid], sample_lats[valid]
+            lon_span, lat_span = lons.max() - lons.min(), lats.max() - lats.min()
+            
+            def _nice_step(span):
+                if span <= 0: return 1.0
+                target = span / 5.0
+                power = 10 ** np.floor(np.log10(target))
+                base = target / power
+                if base < 1.5: step = 1.0 * power
+                elif base < 3.5: step = 2.0 * power
+                else: step = 5.0 * power
+                return max(step, 1e-6)
 
-        ax._smk_drawing_graticule = True
-        try:
-            # Force autoscale off during graticule drawing to prevent zoom loops
+            actual_lon_step = lon_step or _nice_step(lon_span)
+            actual_lat_step = lat_step or _nice_step(lat_span)
+            
+            # Use relative buffer: extend half-step beyond view to ensure crossing
+            buf_lon = actual_lon_step * 0.5
+            buf_lat = actual_lat_step * 0.5
+            
+            lon_min, lon_max = lons.min() - buf_lon, lons.max() + buf_lon
+            lat_min, lat_max = lats.min() - buf_lat, lats.max() + buf_lat
+            
+            # Use high density sampling for line continuity
+            lats_samp = np.linspace(max(-90, lat_min), min(90, lat_max), 505)
+            lons_samp = np.linspace(max(-180, lon_min), min(180, lon_max), 505)
+            
             old_autoscale = ax.get_autoscale_on()
             ax.set_autoscale_on(False)
-            res = _orig_draw_graticule(*args, **kwargs)
-            # Ensure we return a dict even if original returned None/empty
-            if not isinstance(res, dict):
-                 res = {'lines': [], 'texts': []}
-            ax.set_autoscale_on(old_autoscale)
-            return res
-        finally:
-            ax._smk_drawing_graticule = False
+            
+            # Helper for degree labels
+            def _fmt(v, step):
+                p = 0 if step >= 1 else (1 if step >= 0.1 else (2 if step >= 0.01 else 3))
+                val = abs(v)
+                s = f"{val:.{p}f}".rstrip('0').rstrip('.') if p > 0 else f"{int(round(val))}"
+                return f"{s}\u00b0"
 
-    plotting._draw_graticule = _guarded_draw_graticule
-    _draw_graticule_fn = _guarded_draw_graticule
+            # 1. Longitude Lines
+            l_start = np.floor(lon_min / actual_lon_step) * actual_lon_step
+            for lon in np.arange(l_start, lon_max + actual_lon_step, actual_lon_step):
+                if lon < -180.001 or lon > 180.001: continue
+                xs, ys = tf_fwd.transform(np.full_like(lats_samp, lon), lats_samp)
+                
+                # High zorder (20) to stay above everything
+                lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.5, zorder=20)
+                artists['lines'].extend(lines)
+                
+                if with_labels:
+                    mask = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+                    if mask.any():
+                        idx = np.argmin(np.abs(ys[mask] - y0))
+                        lbl = _fmt(lon, actual_lon_step) + ('W' if lon < 0 else 'E' if lon > 0 else '')
+                        t = ax.text(xs[mask][idx], y0 + 0.005*(y1-y0), lbl, 
+                                    fontsize=7, color='#666666', ha='center', va='bottom', zorder=21)
+                        t.set_clip_on(True)
+                        artists['texts'].append(t)
+
+            # 2. Latitude Lines
+            l_start = np.floor(lat_min / actual_lat_step) * actual_lat_step
+            for lat in np.arange(l_start, lat_max + actual_lat_step, actual_lat_step):
+                if lat < -90.001 or lat > 90.001: continue
+                xs, ys = tf_fwd.transform(lons_samp, np.full_like(lons_samp, lat))
+                lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.5, zorder=20)
+                artists['lines'].extend(lines)
+                
+                if with_labels:
+                    mask = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+                    if mask.any():
+                        idx = np.argmin(np.abs(xs[mask] - x0))
+                        lbl = _fmt(lat, actual_lat_step) + ('S' if lat < 0 else 'N' if lat > 0 else '')
+                        t = ax.text(x0 + 0.005*(x1-x0), ys[mask][idx], lbl, 
+                                    fontsize=7, color='#666666', ha='left', va='center', zorder=21)
+                        t.set_clip_on(True)
+                        artists['texts'].append(t)
+            
+            ax.set_autoscale_on(old_autoscale)
+        except Exception as e:
+            logging.debug(f"Graticule Draw Error: {e}")
+        return artists
+
+    plotting._draw_graticule = _fixed_draw_graticule
+    _draw_graticule_fn = _fixed_draw_graticule
 
     _orig_create_map_plot = plotting.create_map_plot
     def _guarded_create_map_plot(*args, **kwargs):
@@ -194,6 +265,36 @@ class LogHandler(logging.Handler):
             pass # Avoid crash if UI deleted during logging
         except Exception:
             pass
+
+class WorkerSignals(QObject):
+    """Signals for background workers."""
+    finished = Signal()
+    error = Signal(tuple)
+    result = Signal(object)
+    progress = Signal(int)
+
+class Worker(QRunnable):
+    """Generic worker for running functions in background threads."""
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            # Pass the progress signal emitter as the progress_callback
+            result = self.fn(*self.args, **self.kwargs, progress_callback=self.signals.progress.emit)
+        except:
+            traceback.print_exc()
+            exctype, value = sys.exc_info()[:2]
+            self.signals.error.emit((exctype, value, traceback.format_exc()))
+        else:
+            self.signals.result.emit(result)
+        finally:
+            self.signals.finished.emit()
 
 class TableWindow(QMainWindow):
     """Modern window to display a DataFrame in a searchable, sortable table."""
@@ -591,6 +692,10 @@ class NativeEmissionGUI(QMainWindow):
         self._anim_timer = QTimer()
         self._anim_timer.timeout.connect(lambda: self._step_time(1))
         
+        # --- Thread Pool ---
+        self.threadpool = QThreadPool()
+        logging.info(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
+        
         # Add a debouncer for plot title/stats updates to maintain responsiveness
         self._title_timer = QTimer()
         self._title_timer.setSingleShot(True)
@@ -962,6 +1067,7 @@ class NativeEmissionGUI(QMainWindow):
         btns = QHBoxLayout()
         btns.setSpacing(4)
         btn_load = QPushButton("Add File(s)")
+        btn_load.setObjectName("primaryBtn")
         btn_load.clicked.connect(self.select_input_file)
         btns.addWidget(btn_load, 2)
         
@@ -1013,6 +1119,7 @@ class NativeEmissionGUI(QMainWindow):
         cnt_btns.addWidget(QLabel("Yr:"))
         cnt_btns.addWidget(self.cmb_online_year)
         btn_online = QPushButton("Fetch")
+        btn_online.setObjectName("primaryBtn")
         btn_online.clicked.connect(self.use_online_counties)
         cnt_btns.addWidget(btn_online)
         settings_form.addRow("", cnt_btns)
@@ -1423,6 +1530,8 @@ class NativeEmissionGUI(QMainWindow):
                     )
                     if reply == QMessageBox.Yes:
                         self.select_griddesc_file()
+                elif "Missing Join Column" in message:
+                    QMessageBox.warning(self, "Warning", message)
             # --------------------------------
 
         else:
@@ -1474,6 +1583,10 @@ class NativeEmissionGUI(QMainWindow):
             
         if self.counties_path:
              self._load_shapes()
+        else:
+             # Auto-load online counties if none specified (ensures we always have a base map)
+             # We use a short delay to ensure UI components (like cmb_online_year) are fully ready
+             QTimer.singleShot(500, self.use_online_counties)
         
         # 3. Load extra shapefiles if in config
         cli = getattr(self, '_json_arguments', {})
@@ -1536,7 +1649,6 @@ class NativeEmissionGUI(QMainWindow):
                  self.txt_bins.setText(str(bins_val))
              
         # COLORMAP (Support both cmap and colormap)
-        # Default to 'jet' if not specified
         cmap_val = cli.get('cmap') or cli.get('colormap') or 'jet'
         if cmap_val:
              cmap = str(cmap_val)
@@ -1601,11 +1713,31 @@ class NativeEmissionGUI(QMainWindow):
         else:
             self.txt_input.setText("; ".join(file_paths))
             
+        # Capture UI State (MUST be done on Main Thread)
+        delim_type = self.cmb_delim.currentText()
+        delim = None
+        if delim_type == 'comma': delim = ','
+        elif delim_type == 'semicolon': delim = ';'
+        elif delim_type == 'tab': delim = '\t'
+        elif delim_type == 'pipe': delim = '|'
+        elif delim_type == 'space': delim = ' '
+        elif delim_type == 'other': delim = self.txt_custom_delim.text()
+        
+        skip = self.spin_skip.value()
+        comment = self.txt_comment.text()
+        
+        # NetCDF Check
+        is_nc = is_netcdf_file(file_paths[0])
+        ncf_params = self._get_ncf_params() if is_nc else {}
+
         # Start Worker Thread
         self._start_progress("Loading data...")
         
-        # Use partial to pass args to thread
-        threading.Thread(target=self._load_worker, args=(file_paths,), daemon=True).start()
+        # Prepare background task
+        worker = Worker(self._task_load_input, file_paths, delim, skip, comment, ncf_params)
+        worker.signals.result.connect(self._on_input_load_finished)
+        worker.signals.error.connect(self._on_worker_error)
+        self.threadpool.start(worker)
 
     @Slot()
     def _on_delim_toggle(self, text):
@@ -1618,8 +1750,12 @@ class NativeEmissionGUI(QMainWindow):
             self.counties_path = f
             self.txt_counties.setText(f)
             self._start_progress(f"Loading shapefile...")
-            # Load in background
-            threading.Thread(target=self._load_counties_worker, args=(f,), daemon=True).start()
+            
+            # Load in background using QThreadPool
+            worker = Worker(self._task_load_counties, f)
+            worker.signals.result.connect(self._on_counties_loaded)
+            worker.signals.error.connect(self._on_worker_error)
+            self.threadpool.start(worker)
 
     @Slot()
     def _on_input_path_edit(self):
@@ -1635,7 +1771,12 @@ class NativeEmissionGUI(QMainWindow):
         if not path: return
         if path != getattr(self, 'counties_path', None):
             self.counties_path = path
-            threading.Thread(target=self._load_counties_worker, args=(path,), daemon=True).start()
+            # Trigger reload via worker
+            self._start_progress(f"Loading shapefile...")
+            worker = Worker(self._task_load_counties, path)
+            worker.signals.result.connect(self._on_counties_loaded)
+            worker.signals.error.connect(self._on_worker_error)
+            self.threadpool.start(worker)
 
     @Slot()
     def _on_griddesc_path_edit(self):
@@ -1651,7 +1792,12 @@ class NativeEmissionGUI(QMainWindow):
         self.notify_signal.emit("INFO", f"Fetching online counties for {year}...")
         self.counties_path = url
         self.txt_counties.setText(url)
-        threading.Thread(target=self._load_counties_worker, args=(url,), daemon=True).start()
+        
+        self._start_progress(f"Downloading shapefile...")
+        worker = Worker(self._task_load_counties, url)
+        worker.signals.result.connect(self._on_counties_loaded)
+        worker.signals.error.connect(self._on_worker_error)
+        self.threadpool.start(worker)
 
     @Slot()
     def _on_overlay_path_edit(self):
@@ -1861,28 +2007,11 @@ class NativeEmissionGUI(QMainWindow):
         
         return params
 
-    def _load_worker(self, paths):
-        """Background worker for file loading."""
+    def _task_load_input(self, paths, delim, skip, comment, ncf_params, progress_callback):
+        """Worker task: Load input file(s) and calculate stats."""
+        # This runs in a background thread. NO UI ACCESS ALLOWED.
         try:
-            # Determine params
-            delim_type = self.cmb_delim.currentText()
-            delim = None
-            if delim_type == 'comma': delim = ','
-            elif delim_type == 'semicolon': delim = ';'
-            elif delim_type == 'tab': delim = '\t'
-            elif delim_type == 'pipe': delim = '|'
-            elif delim_type == 'space': delim = ' '
-            elif delim_type == 'other': delim = self.txt_custom_delim.text()
-            
-            skip = self.spin_skip.value()
-            comment = self.txt_comment.text()
-            
-            # Use read_inputfile from data_processing
-            # Combine paths if multiple
-            if len(paths) > 1:
-                fpath = paths
-            else:
-                fpath = paths[0]
+            fpath = paths if len(paths) > 1 else paths[0]
             
             # --- NetCDF Check ---
             is_nc = False
@@ -1890,35 +2019,21 @@ class NativeEmissionGUI(QMainWindow):
             if is_netcdf_file(first_file):
                 is_nc = True
                 
-            ncf_params = self._get_ncf_params() if is_nc else {}
-            logging.info(f"DEBUG: _load_worker NCF Params: {ncf_params}")
-                
-            # Safely call read_inputfile
-            # Note: We need a thread-safe notifier
+            # Helper for notifications (Signal emission is thread-safe in PySide6)
             def worker_notify(lvl, msg):
-                try:
-                    self.notify_signal.emit(lvl, msg)
-                except RuntimeError:
-                    pass
+                self.notify_signal.emit(lvl, msg)
 
-            # Define localized read function to ensure consistency during stat re-calc
-            # We must define it here to capture the correct delim/skip/comment context
-            def _local_read(p, d=delim, s=skip, c=comment, np=ncf_params):
-                return read_inputfile(
-                    p, delim=d, skiprows=s, comment=c,
-                    notify=lambda *_: None, lazy=True, workers=1, ncf_params=np
-                )
-
-            # Fix for RuntimeError at data_processing.py:803
-            # Bypass library's parallel list-loading by looping manually in GUI thread
+            grid_gdf = None
+            df = None
+            raw = None
+            
             if isinstance(fpath, list) and len(fpath) > 1:
-                 worker_notify("INFO", f"Sequential load of {len(fpath)} files initiated in GUI...")
+                 worker_notify("INFO", f"Sequential load of {len(fpath)} files initiated...")
                  from data_processing import _normalize_input_result
                  dfs = []
                  raw_dfs = []
                  for p in fpath:
                      try:
-                         # Still pass workers=1 to be safe if a #LIST file is inside the list
                          d, r = read_inputfile(
                              p, delim=delim, skiprows=skip, comment=comment,
                              notify=worker_notify, lazy=True, return_raw=True,
@@ -1934,7 +2049,6 @@ class NativeEmissionGUI(QMainWindow):
                  else:
                      df = pd.concat(dfs, ignore_index=True)
                      raw = pd.concat(raw_dfs, ignore_index=True) if raw_dfs else None
-                     # Preserve first file's attributes if possible
                      if hasattr(df, 'attrs') and dfs[0].attrs:
                          df.attrs.update(dfs[0].attrs)
                      df, raw = _normalize_input_result((df, raw))
@@ -1968,19 +2082,16 @@ class NativeEmissionGUI(QMainWindow):
                     if is_nc_flag or is_gridded_flag:
                         df._smk_is_native = True
                         df.attrs['_smk_is_native'] = True
-                except Exception:
-                    pass
+                except Exception: pass
 
-                # Re-calculate lost stats for UI (since processor was reverted)
+                # Re-calculate lost stats for UI
                 try:
                     summaries = []
                     file_list = fpath if isinstance(fpath, list) else [fpath]
                     
-                    # Optimization: Vectorized summary for all pollutants at once
                     if isinstance(df, pd.DataFrame):
                         pols = detect_pollutants(df)
                         if pols:
-                            worker_notify("INFO", f"Calculating stats for {len(pols)} variables...")
                             sums = df[pols].sum()
                             maxs = df[pols].max()
                             means = df[pols].mean()
@@ -1990,12 +2101,10 @@ class NativeEmissionGUI(QMainWindow):
                             for p in pols:
                                 try:
                                     p_stats[p] = {
-                                        'sum': float(sums[p]),
-                                        'max': float(maxs[p]),
-                                        'mean': float(means[p]),
-                                        'count': int(counts[p])
+                                        'sum': float(sums[p]), 'max': float(maxs[p]),
+                                        'mean': float(means[p]), 'count': int(counts[p])
                                     }
-                                except Exception: pass
+                                except: pass
                             summaries.append({'source': file_list[0], 'pollutants': p_stats})
                         else:
                             summaries.append({'source': file_list[0], 'pollutants': {}})
@@ -2004,42 +2113,77 @@ class NativeEmissionGUI(QMainWindow):
                 except Exception as e:
                     logging.warning(f"Stat re-calc failed: {e}")
 
-                self.emissions_df = df
-                self.raw_df = raw
-                
-                # Re-verify is_nc from loaded attributes (handle config files resolving to NCF)
-                if not is_nc:
-                    attrs = getattr(df, 'attrs', {})
-                    if attrs.get('is_netcdf') or attrs.get('format') == 'netcdf':
-                        is_nc = True
-                    elif attrs.get('source_path') and is_netcdf_file(attrs.get('source_path')):
-                        is_nc = True
-                
-                # Identify pollutants
-                worker_notify("INFO", "Detecting pollutants...")
+                # Pollutants
                 cols = detect_pollutants(df)
-                worker_notify("INFO", f"Pollutants detected: {len(cols)}")
-
-                # --- Auto-Grid for NetCDF ---
+                
+                # Auto-Grid for NetCDF
                 if is_nc:
                     try:
                         worker_notify("INFO", "Generating grid from NetCDF attributes...")
-                        self.grid_gdf = create_ncf_domain_gdf(first_file if isinstance(first_file, str) else first_file[0])
-                        if self.grid_gdf is not None and not self.grid_gdf.empty:
-                            worker_notify("INFO", "Grid geometry loaded from NetCDF.")
+                        grid_gdf = create_ncf_domain_gdf(first_file if isinstance(first_file, str) else first_file[0])
                     except Exception as ge:
                         worker_notify("WARNING", f"Auto-grid from NetCDF failed: {ge}")
-                
-                # Update UI in main thread
-                worker_notify("INFO", "Triggering UI update...")
-                self.data_loaded_signal.emit(cols, is_nc)
-                
+
+                return {
+                    'df': df,
+                    'raw': raw,
+                    'is_nc': is_nc,
+                    'pols': cols,
+                    'grid_gdf': grid_gdf
+                }
+            return None
+
         except Exception as e:
-            self.notify_signal.emit("ERROR", f"Load failed: {e}")
             traceback.print_exc()
-        finally:
-            worker_notify("INFO", "Worker finished.")
-            self.stop_progress_signal.emit()
+            raise e
+
+    @Slot(object)
+    def _on_input_load_finished(self, res):
+        """Main thread: Update dataframes and UI."""
+        if res is None: 
+             self.stop_progress_signal.emit()
+             return
+        
+        self.emissions_df = res['df']
+        self.raw_df = res['raw']
+        
+        # Merge-in NetCDF Grid if generated
+        if res.get('grid_gdf') is not None:
+             self.grid_gdf = res['grid_gdf']
+             self.notify_signal.emit("INFO", "Grid geometry loaded from NetCDF.")
+
+        # Re-verify is_nc from loaded attributes if needed
+        is_nc = res['is_nc']
+        if not is_nc and self.emissions_df is not None:
+             attrs = getattr(self.emissions_df, 'attrs', {})
+             if attrs.get('is_netcdf') or attrs.get('format') == 'netcdf':
+                 is_nc = True
+
+        self.data_loaded_signal.emit(res['pols'], is_nc)
+        self.notify_signal.emit("INFO", "Data load complete.")
+        self.stop_progress_signal.emit()
+
+    @Slot(tuple)
+    def _on_worker_error(self, err):
+        """Generic error handler for workers."""
+        self.stop_progress_signal.emit()
+        self.notify_signal.emit("ERROR", f"Task failed: {err[1]}")
+
+    def _task_load_counties(self, path, progress_callback):
+        """Worker task: Read shapefile."""
+        return read_shpfile(path, True)
+
+    @Slot(object)
+    def _on_counties_loaded(self, gdf):
+        """Main thread: Update counties GDF."""
+        if gdf is not None:
+             self.counties_gdf = gdf
+             self._invalidate_merge_cache()
+             self.notify_signal.emit("INFO", f"Loaded counties: {len(gdf)} features")
+        else:
+             self.notify_signal.emit("WARNING", "Counties file load returned no data.")
+        
+        self.stop_progress_signal.emit()
 
     def _invalidate_merge_cache(self):
         """Clear the cached merged dataframes."""
@@ -2473,8 +2617,9 @@ class NativeEmissionGUI(QMainWindow):
 
     def _step_time(self, delta):
         # We need to distinguish if we are fresh or in an aggregate view
+        # Capturing these BEFORE _ensure_time_data possibly resets them
         is_fresh = self._t_data_cache is None
-        is_agg = self._is_showing_agg
+        is_agg = self._is_showing_agg or (self._t_idx < 0)
         
         if not self._ensure_time_data(): return
         cache = self._t_data_cache
@@ -2484,8 +2629,7 @@ class NativeEmissionGUI(QMainWindow):
             self.notify_signal.emit("INFO", "Animation: Only 1 time step available.")
             return
 
-        # If we just loaded (fresh) or were showing an aggregate,
-        # 'Next' should go to the first step (0), 'Prev' to the last (n-1).
+        # If we were showing an aggregate, 'Next' starts at 0, 'Prev' at end.
         if is_fresh or is_agg:
             if delta > 0: self._t_idx = 0
             else: self._t_idx = n_steps - 1
@@ -2632,10 +2776,20 @@ class NativeEmissionGUI(QMainWindow):
                   
                   # 5. Update Status Labels
                   n_steps = len(self._t_data_cache['times']) if self._t_data_cache else 1
-                  if "Sum" in str(time_lbl) or "Mean" in str(time_lbl):
-                      self.lbl_anim_status.setText(str(time_lbl))
+                  status_txt = str(time_lbl)
+                  
+                  if hasattr(self, 'lbl_anim_status') and self.lbl_anim_status:
+                      self.lbl_anim_status.setText(status_txt)
+                  
+                  if hasattr(self, 'lbl_anim_time') and self.lbl_anim_time:
+                      self.lbl_anim_time.setText(f"Time: {status_txt}")
+                      
+                  if "Sum" in status_txt or "Mean" in status_txt:
+                      self.lbl_anim_status.setStyleSheet("color: #059669; font-weight: bold;")
                   else:
-                      self.lbl_anim_status.setText(f"{time_lbl} ({self._t_idx+1}/{n_steps})")
+                      self.lbl_anim_status.setStyleSheet("color: #2563eb; font-weight: bold;")
+                      if self._t_data_cache and not self._is_showing_agg:
+                          self.lbl_anim_status.setText(f"{status_txt} ({self._t_idx+1}/{n_steps})")
         except Exception as e:
             logging.error(f"Update view failed: {e}")
 
@@ -2732,27 +2886,41 @@ class NativeEmissionGUI(QMainWindow):
                                 try:
                                     sidx = getattr(gdf, 'sindex', None)
                                     if sidx and hasattr(gdf, 'geometry') and gdf.geometry is not None:
-                                        idxs = list(sidx.intersection(view_box.bounds))
-                                        if idxs:
-                                            valid_idxs = [i for i in idxs if 0 <= i < len(gdf)]
-                                            if valid_idxs:
+                                        # Query spatial index using view bounds
+                                        valid_idxs = list(sidx.intersection(view_box.bounds))
+                                        if valid_idxs:
+                                            # PERFORMANCE OPTIMIZATION:
+                                            # If we have many candidates (> 5000), skip the precise geometry check
+                                            # and assume the index (bbox) intersection is "good enough" for title stats.
+                                            if len(valid_idxs) > 5000:
+                                                final_ilocs = np.array(valid_idxs)
+                                            else:
+                                                # For smaller sets, do the precise check
                                                 sub_gdf = gdf.iloc[valid_idxs]
                                                 precise_mask = sub_gdf.geometry.intersects(view_box)
-                                                final_ilocs = np.array(valid_idxs)[precise_mask.values]
-                                                final_ilocs = final_ilocs[(final_ilocs >= 0) & (final_ilocs < len(vals))]
-                                                filtered = vals[final_ilocs] if len(final_ilocs) > 0 else np.array([])
+                                                if hasattr(precise_mask, 'values'):
+                                                    precise_mask = precise_mask.values
+                                                final_ilocs = np.array(valid_idxs)[precise_mask]
+                                            
+                                            # Safety filter for values alignment
+                                            final_ilocs = final_ilocs[(final_ilocs >= 0) & (final_ilocs < vals.size)]
+                                            if final_ilocs.size > 0:
+                                                filtered = vals[final_ilocs]
+                                            else:
+                                                filtered = np.array([])
                                         else:
                                             filtered = np.array([])
-                                    elif hasattr(gdf, 'geometry') and gdf.geometry is not None:
-                                        # Fallback: Brute force intersection
+                                    elif hasattr(gdf, 'geometry') and vals.size < 2000:
+                                        # Brute force only for small datasets to avoid freezing
                                         mask = gdf.geometry.intersects(view_box)
-                                        filtered = vals[mask.values] if mask.size == vals.size else vals
+                                        m_vals = mask.values if hasattr(mask, 'values') else np.array(mask)
+                                        filtered = vals[m_vals]
                                     else:
-                                        # Vector data without geometry set (uncommon) or skeleton
+                                        # Fallback/Safety
                                         filtered = vals
-                                except Exception:
+                                except Exception as e:
+                                    logging.debug(f"Title stats slice failed: {e}")
                                     filtered = vals
-
                 # Calculate Stats
                 filtered_arr = np.asanyarray(filtered)
                 clean = filtered_arr[~np.isnan(filtered_arr)] if filtered_arr.size > 0 else np.array([])
@@ -3160,15 +3328,20 @@ class NativeEmissionGUI(QMainWindow):
         
         # --- FF10/County Join Helper ---
         if geometry_tag == 'county' and merge_on == 'FIPS':
-            # Ensure emissions data has a FIPS column for the join
-            if 'FIPS' not in emis_for_merge.columns:
-                # Try region_cd (ff10 standard)
-                r_col = next((c for c in emis_for_merge.columns if c.lower() == 'region_cd'), None)
-                if r_col:
-                    emis_for_merge['FIPS'] = emis_for_merge[r_col].astype(str).str.zfill(6)
-                elif not any(c.lower() == 'fips' for c in emis_for_merge.columns):
-                     # If no explicit FIPS, maybe it's point data without fips yet?
-                     pass
+            # Robust FIPS normalization: US County shapefiles expect 5-digit GEOID (state+county).
+            # Emissions data often carries a 6-digit prefix (0 for US, 1 for CA, etc.) from FF10/Reports.
+            m_col = 'FIPS' if 'FIPS' in emis_for_merge.columns else next((c for c in emis_for_merge.columns if c.lower() == 'region_cd'), None)
+            
+            if m_col:
+                s_reg = emis_for_merge[m_col].astype(str).str.strip().str.zfill(5)
+                # Strip US country prefix (0 or 1) from 6-digit codes to match 5-digit shapefiles
+                emis_for_merge['FIPS'] = s_reg.apply(lambda x: x[1:] if len(x) == 6 and (x.startswith('0') or x.startswith('1')) else x)
+            
+            # Also ensure geometry side is normalized to 5 digits for reliable join
+            if base_gdf is not None and 'FIPS' in base_gdf.columns:
+                 base_gdf = base_gdf.copy()
+                 s_geom = base_gdf['FIPS'].astype(str).str.strip().str.zfill(5)
+                 base_gdf['FIPS'] = s_geom.apply(lambda x: x[1:] if len(x) == 6 and x.startswith('0') else x)
 
         # SCC Filtering & Re-aggregation
         if merge_on not in emis_for_merge.columns or use_scc_filter:
@@ -3342,8 +3515,8 @@ class NativeEmissionGUI(QMainWindow):
             # Calculate Zoom Bounds if requested
             if meta.get('zoom_to_data') and pollutant in merged_plot.columns:
                 try:
-                    # Filter for non-zero emissions to zoom into actual data
-                    non_zero = merged_plot[merged_plot[pollutant] > 0]
+                    # Filter for non-zero, non-null emissions to zoom into actual data
+                    non_zero = merged_plot[merged_plot[pollutant].notna() & (merged_plot[pollutant] > 0)]
                     if not non_zero.empty:
                         meta['zoom_gdf'] = non_zero
                     else:
@@ -3561,6 +3734,7 @@ class NativeEmissionGUI(QMainWindow):
                             minx, maxx = min(pts_x), max(pts_x)
                             miny, maxy = min(pts_y), max(pts_y)
                     else:
+                        # Fallback: maintain current view or calculate from data
                         minx, miny, maxx, maxy = ax.get_xlim()[0], ax.get_ylim()[0], ax.get_xlim()[1], ax.get_ylim()[1]
 
                     padx = (maxx - minx) * 0.05
@@ -3755,10 +3929,14 @@ class NativeEmissionGUI(QMainWindow):
 
             # 9. Sync Interaction Logic with gui_qt.py
             try:
-                # A. Base View for Home and Clamping
                 base_xlim = ax.get_xlim()
                 base_ylim = ax.get_ylim()
-                self._base_view = (base_xlim, base_ylim)
+                
+                # Only update the stored "Base View" if we are NOT in a zoomed-to-data mode.
+                # This ensures that when Zoom to Data is toggled off, we can accurately 
+                # restore the last known "Full" view rather than staying stuck in a zoomed state.
+                if not zoom_to_data:
+                    self._base_view = (base_xlim, base_ylim)
                 
                 # B. Home Button Override (Direct Logic)
                 def _home_override(*args, **kwargs):
@@ -3767,20 +3945,25 @@ class NativeEmissionGUI(QMainWindow):
                         ax.set_ylim(base_ylim)
                         self.canvas.draw_idle()
                         self._update_plot_title(ax, immediate=True)
+                        
+                        # Explicitly trigger graticule redraw if setup
+                        gr_cb = getattr(ax, '_smk_graticule_callback', None)
+                        if gr_cb:
+                            gr_cb(ax)
                     except: pass
                 
                 # Override the instance method
                 self.toolbar.home = _home_override
                 
-                # C. Reset Navigation Stack
-                if hasattr(self.toolbar, '_nav_stack'):
-                    self.toolbar._nav_stack.clear()
+                # C. Refresh Navigation Toolbar (Preserve stack if possible)
+                # We no longer clear the _nav_stack here to allow Back/Forward 
+                # to work across zoom/pan states. Home will always return to base.
                 
                 # IMPORTANT: In Qt, we must refresh the button states
-                if hasattr(self.toolbar, 'set_history_buttons'):
-                    self.toolbar.set_history_buttons()
-                elif hasattr(self.toolbar, 'update'):
+                if hasattr(self.toolbar, 'update'):
                     self.toolbar.update()
+                elif hasattr(self.toolbar, 'set_history_buttons'):
+                    self.toolbar.set_history_buttons()
 
                 # D. Axis Callbacks for Live Stats (Robust Update)
                 if hasattr(ax, '_smk_stats_cids'):
@@ -4404,8 +4587,8 @@ class NativeEmissionGUI(QMainWindow):
                 finally:
                     ax._smk_drawing_graticule = False
 
-            # Delay by 20ms to allow Matplotlib to finish its coordinate state change
-            QTimer.singleShot(20, _debounced_redraw)
+            # Increase delay to 50ms to ensure Matplotlib view state is committed
+            QTimer.singleShot(50, _debounced_redraw)
 
         try:
             cid1 = ax.callbacks.connect('xlim_changed', _on_limits)
