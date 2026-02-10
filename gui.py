@@ -50,35 +50,65 @@ if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
     logging.basicConfig(level=logging.INFO)
     sys.stderr.write("WARNING: No DISPLAY detected. Running in headless mode (qt-test). No window will be shown.\n")
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
-    QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
-    QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-    QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
-    QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView,
-    QDockWidget, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem,
-    QAbstractItemView
-)
-from PySide6.QtCore import (
-    Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings,
-    QRunnable, QThreadPool
-)
-from PySide6.QtGui import (
-    QAction, QIcon, QFont, QIntValidator, QDoubleValidator, 
-    QTextCursor, QColor
-)
+# --- Qt Compatibility Shim ---
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+    from PySide6.QtCore import Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings, QRunnable, QThreadPool
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+        QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
+        QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
+        QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
+        QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
+        QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView,
+        QDockWidget, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
+        QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem,
+        QAbstractItemView
+    )
+    from PySide6.QtGui import QAction, QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor, QColor
+    QT_BINDING = "PySide6"
+except ImportError:
+    from PyQt5 import QtWidgets, QtCore, QtGui
+    from PyQt5.QtCore import Qt, pyqtSignal as Signal, pyqtSlot as Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings
+    from PyQt5.QtCore import QRunnable, QThreadPool
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+        QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
+        QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
+        QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
+        QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
+        QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView,
+        QDockWidget, QToolBar, QDialog, QDialogButtonBox, QFormLayout,
+        QSpinBox, QDoubleSpinBox, QGroupBox, QTableWidget, QTableWidgetItem,
+        QAbstractItemView
+    )
+    from PyQt5.QtGui import QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor, QColor
+    try: from PyQt5.QtWidgets import QAction
+    except ImportError: from PyQt5.QtGui import QAction
+    QT_BINDING = "PyQt5"
 
 import pandas as pd
 import numpy as np
 import geopandas as gpd
 import pyproj
 import shapely
+# --- Matplotlib Backend Setup ---
 import matplotlib
-# matplotlib.use('qtagg') # Let MPL auto-detect
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+if QT_BINDING == "PySide6":
+    try:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    except ImportError:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+else:
+    # Use Qt5Agg backends for PyQt5
+    try:
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+    except ImportError:
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, BoundaryNorm

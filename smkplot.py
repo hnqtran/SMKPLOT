@@ -385,11 +385,15 @@ def main():
         if target_impl == 'native':
             logging.info("Launching Native Qt GUI (gui.py)...")
             try:
-                from PySide6.QtWidgets import QApplication
+                try:
+                    from PySide6.QtWidgets import QApplication
+                except ImportError:
+                    from PyQt5.QtWidgets import QApplication
                 from gui import NativeEmissionGUI
                 
                 app = QApplication.instance() or QApplication(sys.argv)
-                app.setStyle("Fusion")
+                try: app.setStyle("Fusion")
+                except: pass
                 
                 gui = NativeEmissionGUI(
                     inputfile_path=args.filepath,
@@ -413,8 +417,12 @@ def main():
         elif target_impl == 'qt_shim':
             logging.info("Launching Shimmed Qt GUI (gui_qt.py)...")
             try:
-                from PySide6.QtWidgets import QApplication
-                from PySide6.QtGui import QFont
+                try:
+                    from PySide6.QtWidgets import QApplication
+                    from PySide6.QtGui import QFont
+                except ImportError:
+                    from PyQt5.QtWidgets import QApplication
+                    from PyQt5.QtGui import QFont
                 from gui_qt import EmissionGUI as QtGUI, tk as qt_tk
                 
                 app = QApplication.instance() or QApplication(sys.argv)

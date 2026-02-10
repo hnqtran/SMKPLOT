@@ -6,13 +6,16 @@ pyproj
 shapely
 pyyaml
 joblib
-pyogrio
+# Use older pyogrio for Python 3.6 to avoid build issues
+pyogrio <= 0.2.0; python_version < "3.7"
+pyogrio; python_version >= "3.7"
 netCDF4
 fiona
 xarray
 dask[complete]
 toolz
 cytoolz
-PySide6
-PyQt5
+# PySide6 requires Python 3.7+, PyQt5 works on 3.6
+PySide6; python_version >= "3.7"
+PyQt5; python_version < "3.7"
 openpyxl

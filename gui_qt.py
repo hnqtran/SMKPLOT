@@ -62,19 +62,57 @@ if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
     os.environ['QT_QPA_PLATFORM'] = 'offscreen'
     logging.info("No display detected, setting Qt to offscreen mode")
 
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
-                               QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
-                               QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
-                               QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
-                               QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView)
-from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer, QSize
-from PySide6.QtGui import QAction, QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor
+# --- Qt Compatibility Shim ---
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+    from PySide6.QtCore import Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings, QRunnable, QThreadPool
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+        QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
+        QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
+        QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
+        QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
+        QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView
+    )
+    from PySide6.QtGui import QAction, QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor
+    QT_BINDING = "PySide6"
+except ImportError:
+    from PyQt5 import QtWidgets, QtCore, QtGui
+    from PyQt5.QtCore import Qt, pyqtSignal as Signal, pyqtSlot as Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings
+    from PyQt5.QtCore import QRunnable, QThreadPool
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+        QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, 
+        QFileDialog, QMessageBox, QProgressBar, QTabWidget, 
+        QSplitter, QFrame, QSizePolicy, QScrollArea, QGridLayout,
+        QMenu, QMenuBar, QStatusBar, QListWidget, QTextEdit,
+        QLayout, QTreeWidget, QTreeWidgetItem, QStyle, QListView
+    )
+    from PyQt5.QtGui import QIcon, QFont, QIntValidator, QDoubleValidator, QTextCursor
+    try: from PyQt5.QtWidgets import QAction
+    except ImportError: from PyQt5.QtGui import QAction
+    QT_BINDING = "PyQt5"
 
+# --- Matplotlib Backend Setup ---
 import matplotlib
-matplotlib.use('qtagg')
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvasQTAgg
-from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+if QT_BINDING == "PySide6":
+    try:
+        matplotlib.use('qtagg')
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvasQTAgg
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+    except (ImportError, ValueError):
+        matplotlib.use('Qt5Agg')
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+else:
+    # Use Qt5Agg for PyQt5
+    try:
+        matplotlib.use('Qt5Agg')
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvasQTAgg
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+    except (ImportError, ValueError):
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _FigureCanvasQTAgg
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 
 def _qt_align(sticky):
     if not sticky: return Qt.AlignCenter

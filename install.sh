@@ -39,7 +39,7 @@ echo "[2/3] Installing dependencies from $REQUIREMENTS..."
 PIP_EXEC="$SCRIPT_DIR/$VENV_DIR/bin/pip"
 PYTHON_EXEC="$SCRIPT_DIR/$VENV_DIR/bin/python"
 
-"$PIP_EXEC" install --upgrade pip > /dev/null
+"$PIP_EXEC" install --upgrade pip setuptools wheel > /dev/null
 if [ -f "$REQUIREMENTS" ]; then
     "$PIP_EXEC" install -r "$REQUIREMENTS"
     if [ $? -ne 0 ]; then
@@ -87,8 +87,14 @@ echo "Checking GUI capabilities..."
 
 # Check Qt (Preferred)
 "$PYTHON_EXEC" -c "import PySide6" &> /dev/null
-if [ $? -eq 0 ]; then
+PYSIDE_STATUS=$?
+"$PYTHON_EXEC" -c "import PyQt5" &> /dev/null
+PYQT_STATUS=$?
+
+if [ $PYSIDE_STATUS -eq 0 ]; then
     echo "SUCCESS: Qt GUI (PySide6) detected. Modern GUI is ready."
+elif [ $PYQT_STATUS -eq 0 ]; then
+    echo "SUCCESS: Qt GUI (PyQt5) detected. Compatibility GUI is ready."
 else
     # Fallback check for Tkinter
     "$PYTHON_EXEC" -c "import tkinter" &> /dev/null
