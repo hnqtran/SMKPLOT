@@ -1922,6 +1922,15 @@ def _load_shapefile(path: str, get_fips: bool, _signature: Tuple[str, Optional[i
             pass
 
     cols = ['FIPS', 'region_cd','geometry']
+    
+    # Try to keep Name columns if available
+    for c in gdf.columns:
+        if c.lower() in ['name', 'namelsad', 'county_name', 'county', 'state_name']:
+            cols.append(c)
+
+    # Deduplicate in case of overlap
+    cols = list(dict.fromkeys(cols))
+    
     result = gdf[cols].copy()
     _categorize_columns(result, ['FIPS', 'region_cd'])
     try:

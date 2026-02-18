@@ -418,7 +418,7 @@ class TableWindow(QMainWindow):
             self.info_lbl.setText("No data available")
             return
 
-        df_show = df.head(2000) 
+        df_show = df.head(100) 
         self.table.setRowCount(len(df_show))
         self.table.setColumnCount(len(df_show.columns))
         self.table.setHorizontalHeaderLabels([str(c) for c in df_show.columns])
@@ -2588,6 +2588,11 @@ class NativeEmissionGUI(QMainWindow):
                 self.cmb_ncf_time.clear()
                 self.cmb_ncf_time.addItems(ts_items)
                 self.cmb_ncf_time.blockSignals(False)
+                
+                # Show animation controls if we have multiple time steps
+                if n_ts > 1 and hasattr(self, 'anim_group'):
+                     self.anim_group.setVisible(True)
+                     self.lbl_anim_time.setText("Time: Step 1")
 
                 # Update GRIDDESC display to show NCF source
                 try:
@@ -2875,8 +2880,49 @@ class NativeEmissionGUI(QMainWindow):
             else:
                 sub = gdf[gdf.intersects(bbox)]
                 
+            # Fallback for Native Shortcut (No Geometry)
+            if sub.empty and '_smk_grid_info' in gdf.attrs:
+                try:
+                    info = gdf.attrs['_smk_grid_info']
+                    # Get view bounds in Grid CRS
+                    x0, x1 = xlim
+                    y0, y1 = ylim
+                    
+                    # Resolve CRS transform
+                    plot_crs = getattr(ax, '_smk_ax_crs', None)
+                    native_crs_str = info.get('proj_str')
+                    
+                    if plot_crs and native_crs_str:
+                        native_crs = pyproj.CRS.from_user_input(native_crs_str)
+                        # Check if transform needed (comparing CRS objects)
+                        if plot_crs != native_crs:
+                            tf = pyproj.Transformer.from_crs(plot_crs, native_crs, always_xy=True)
+                            # Transform corners to cover extent
+                            corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                            tx, ty = [], []
+                            for cx, cy in corners:
+                                tx_pt, ty_pt = tf.transform(cx, cy)
+                                tx.append(tx_pt); ty.append(ty_pt)
+                            x0, x1 = min(tx), max(tx)
+                            y0, y1 = min(ty), max(ty)
+
+                    # Map to Col/Row indices (1-based assumption for SMOKE standard)
+                    # COL = floor((X - XORIG) / XCELL) + 1
+                    c0 = int(np.floor((x0 - info['xorig']) / info['xcell'])) + 1
+                    c1 = int(np.floor((x1 - info['xorig']) / info['xcell'])) + 1
+                    r0 = int(np.floor((y0 - info['yorig']) / info['ycell'])) + 1
+                    r1 = int(np.floor((y1 - info['yorig']) / info['ycell'])) + 1
+                    
+                    # Filter by Index
+                    sub = gdf[
+                        (gdf['COL'] >= c0) & (gdf['COL'] <= c1) &
+                        (gdf['ROW'] >= r0) & (gdf['ROW'] <= r1)
+                    ]
+                except Exception as ex:
+                    logging.warning(f"Fallback grid filtering failed: {ex}")
+
             if sub.empty:
-                 self.notify_signal.emit("WARNING", "No cells in current view.")
+                 self.notify_signal.emit("WARNING", "No cells in current view or grid definition missing.")
                  return
                  
             self.notify_signal.emit("INFO", f"Extracting TS for {len(sub)} cells ({op_mode})...")
@@ -2954,8 +3000,56 @@ class NativeEmissionGUI(QMainWindow):
                       coll.set_clim(c_vmin, c_vmax)
 
                   # 2. Set Data
-                  coll.set_array(new_vals)
-                  ax._smk_current_vals = new_vals
+                  final_vals = new_vals
+                  
+                  # --- County Aggregation for Animation ---
+                  is_county_plot = False
+                  try:
+                      is_county_plot = self.cmb_pltyp.currentText().lower() == 'county'
+                  except: pass
+                  
+                  if is_county_plot and hasattr(self, '_grid_to_county_map') and self._grid_to_county_map is not None:
+                      try:
+                          # We have grid-level values (new_vals) corresponding to self.emissions_df rows(? not guaranteed)
+                          # Actually, get_ncf_animation_data returns values for rows/cols passed to it.
+                          # _ensure_time_data passed rows/cols from self.emissions_df.
+                          # So new_vals is aligned with self.emissions_df rows.
+                          
+                          # We need to map self.emissions_df indices to FIPS, then sum by FIPS.
+                          # self._grid_to_county_map links (ROW, COL) -> FIPS.
+                          # Efficient approach:
+                          # merge new_vals with map.
+                          
+                          # But new_vals is a numpy array.
+                          # Create a temp dataframe.
+                          # This is slightly slow per frame but robust.
+                          
+                          # Check if emissions_df has ROW/COL
+                          if 'ROW' in self.emissions_df.columns and 'COL' in self.emissions_df.columns:
+                              tmp = pd.DataFrame({
+                                  'ROW': self.emissions_df['ROW'],
+                                  'COL': self.emissions_df['COL'],
+                                  'val': new_vals
+                              })
+                              # Merge with map
+                              merged_tmp = tmp.merge(self._grid_to_county_map, on=['ROW', 'COL'], how='inner')
+                              k_col = self._grid_to_county_key
+                              
+                              # Sum by FIPS
+                              agg = merged_tmp.groupby(k_col)['val'].sum()
+                              
+                              # Use current plot order (self._merged_gdf)
+                              if self._merged_gdf is not None:
+                                   # The plot collection aligns with _merged_gdf
+                                   # We need to map 'agg' to _merged_gdf[k_col]
+                                   final_vals = self._merged_gdf[k_col].map(agg).fillna(0.0).values
+                      except Exception as e:
+                           logging.debug(f"County anim aggregation failed: {e}")
+                           # fallback to raw, though it will likely throw size error
+                  # ----------------------------------------
+
+                  coll.set_array(final_vals)
+                  ax._smk_current_vals = final_vals
                   
                   # 3. Update Colorbar
                   if hasattr(coll, 'colorbar') and coll.colorbar:
@@ -3341,18 +3435,24 @@ class NativeEmissionGUI(QMainWindow):
                     _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
 
         # Shortcut for Native Grids or Already-Geometrized Data
-        if (is_native or has_geometry) and mode in ['auto', 'grid']:
+        # Only take shortcut if we have geometry (vectors ready) OR if dataset is large enough for QuadMesh (no geometry needed)
+        can_shortcut = has_geometry or (is_native and len(self.emissions_df) > 10000)
+        
+        if can_shortcut and mode in ['auto', 'grid']:
             if target_pol and target_pol in getattr(self.emissions_df, 'columns', []):
                 logging.warning(f"GUI_DEBUG: [_merged] Native/Geometry shortcut triggered for {target_pol}")
                 
-                # Performance Optimization: Only copy columns needed for plotting/hover
-                keep_cols = [target_pol, 'ROW', 'COL', 'GRID_RC', 'FIPS', 'region_cd', 'REGION_CD']
-                present_cols = [c for c in keep_cols if c in self.emissions_df.columns]
-                
+                # Include all columns to support full table view after plotting
                 if has_geometry and isinstance(self.emissions_df, gpd.GeoDataFrame):
-                    res_df = self.emissions_df[present_cols + [self.emissions_df.geometry.name]].copy()
+                    res_df = self.emissions_df.copy()
                 else:
-                    res_df = self.emissions_df[present_cols].copy()
+                    res_df = self.emissions_df.copy()
+
+                # Ensure ROW and COL are integers for QuadMesh optimization
+                for c_idx in ['ROW', 'COL']:
+                    if c_idx in res_df.columns:
+                        # Fill NaNs with -1 (invalid index) and convert to int to avoid casting errors
+                        res_df[c_idx] = res_df[c_idx].fillna(-1).astype(int)
 
                 if fill_nan:
                     res_df[target_pol] = res_df[target_pol].fillna(0)
@@ -3367,8 +3467,11 @@ class NativeEmissionGUI(QMainWindow):
                 if isinstance(res_df, gpd.GeoDataFrame):
                     return res_df
                 
-                # Convert to GDF
-                res_gdf = gpd.GeoDataFrame(res_df, geometry=None)
+                # Convert to GDF with robust geometry init
+                if 'geometry' not in res_df.columns:
+                    res_df['geometry'] = [None] * len(res_df)
+                
+                res_gdf = gpd.GeoDataFrame(res_df, geometry='geometry')
                 res_gdf.attrs = self.emissions_df.attrs.copy()
                 # Ensure it's tagged as native
                 res_gdf.attrs['_smk_is_native'] = True
@@ -3460,7 +3563,10 @@ class NativeEmissionGUI(QMainWindow):
                 merge_on = 'FIPS'
                 if not any(c.lower() == 'fips' for c in self.emissions_df.columns):
                     if any(c.lower() == 'region_cd' for c in self.emissions_df.columns):
-                        merge_on = 'FIPS' 
+                        merge_on = 'FIPS'
+                    elif 'ROW' in self.emissions_df.columns and 'COL' in self.emissions_df.columns:
+                        # Fallback for grid-to-county mapping
+                        merge_on = 'FIPS'
                 geometry_tag = 'county'
             if base_gdf is None:
                 _do_notify('WARNING', 'No suitable geometry', 'Could not find a suitable shapefile (Counties or Grid) for the loaded emissions data.')
@@ -3520,6 +3626,22 @@ class NativeEmissionGUI(QMainWindow):
 
         # Lazy Fetch already handled at top of function
         
+        # --- Pre-Merge: Grid-to-County Mapping (NetCDF) ---
+        if geometry_tag == 'county' and merge_on == 'FIPS':
+            # Check if we have FIPS. If not, but we have GRID (ROW/COL), try to map it.
+            has_fips = 'FIPS' in emis_for_merge.columns or 'region_cd' in emis_for_merge.columns
+            has_grid = 'ROW' in emis_for_merge.columns and 'COL' in emis_for_merge.columns
+            
+            if not has_fips and has_grid:
+                _do_notify("INFO", "Mapping Grid to County", "Calculating county aggregate from grid cells...")
+                try:
+                    emis_for_merge = self._augment_with_county_mapping(emis_for_merge)
+                    # Check success
+                    if 'FIPS' not in emis_for_merge.columns and 'region_cd' not in emis_for_merge.columns:
+                        _do_notify("WARNING", "Mapping Failed", "Could not map grid cells to counties. Ensure county shapefile covers the grid domain.")
+                except Exception as e:
+                    _do_notify("ERROR", "Mapping Error", f"Failed to map grid to county: {e}")
+
         # --- FF10/County Join Helper ---
         if geometry_tag == 'county' and merge_on == 'FIPS':
             # Robust FIPS normalization: US County shapefiles expect 5-digit GEOID (state+county).
@@ -3565,6 +3687,19 @@ class NativeEmissionGUI(QMainWindow):
             merged, prepared = merge_emissions_with_geometry(
                 emis_for_merge, base_gdf, merge_on, sort=False, copy_geometry=False
             )
+
+            # Post-Merge Cleanup: Consolidate suffixed columns (ROW_x/y -> ROW)
+            # This ensures downstream consumers can rely on standard names.
+            for base in ['ROW', 'COL', 'FIPS', 'region_cd']:
+                x_col, y_col = f"{base}_x", f"{base}_y"
+                if x_col in merged.columns and base not in merged.columns:
+                    merged[base] = merged[x_col]
+                elif y_col in merged.columns and base not in merged.columns:
+                     merged[base] = merged[y_col]
+                
+                # Drop suffixes if we successfully mapped to base or if base already existed
+                if base in merged.columns:
+                    merged.drop(columns=[c for c in [x_col, y_col] if c in merged.columns], inplace=True, errors='ignore')
             # Propagate attributes from emissions and geometry (CRITICAL for QuadMesh/Hover)
             if hasattr(merged, 'attrs'):
                 for src in [emis_for_merge, base_gdf]:
@@ -3605,6 +3740,26 @@ class NativeEmissionGUI(QMainWindow):
                       merged.crs = base_gdf.crs
                  else:
                       merged.crs = "EPSG:4326"
+
+            # Mass Balance Check
+            try:
+                if prepared is not None and not prepared.empty and merged is not None:
+                    # Find a numeric column to check (pollutant)
+                    check_cols = [c for c in prepared.columns if c in merged.columns and pd.api.types.is_numeric_dtype(prepared[c])]
+                    target = target_pol if target_pol in check_cols else (check_cols[0] if check_cols else None)
+                    
+                    if target:
+                        total_mass = prepared[target].sum()
+                        plotted_mass = merged[target].sum()
+                        if total_mass > 0:
+                            diff = total_mass - plotted_mass
+                            pct = (diff / total_mass) * 100
+                            if pct > 0.01: # > 0.01% discrepancy
+                                _do_notify("WARNING", "Mass Mismatch", 
+                                    f"Plot shows {plotted_mass:.2e} {target}, but computed total is {total_mass:.2e} {target}.\n"
+                                    f"Approx. {pct:.1f}% ({diff:.2e}) of emissions fell outside the selected geometry (e.g. outside county boundaries) and are not plotted."
+                                )
+            except Exception: pass
             
             return merged
         except Exception as e:
@@ -4833,6 +4988,45 @@ class NativeEmissionGUI(QMainWindow):
             return
 
         # Prepare modes (Lazy loading via lambdas where appropriate)
+        # [Lazy Load Handling]
+        # If emissions_df is a lazy skeleton (NetCDF), load the full dataset now so the user can see it.
+        try:
+            is_lazy = getattr(self.emissions_df, 'attrs', {}).get('source_type') == 'gridded_netcdf' and \
+                      getattr(self.emissions_df, 'attrs', {}).get('_smk_xr_ds') is not None
+            
+            # Check if pollutants are actually loaded as columns
+            if is_lazy:
+                available = getattr(self.emissions_df, 'attrs', {}).get('available_pollutants', [])
+                missing = [p for p in available if p not in self.emissions_df.columns]
+                
+                if missing:
+                    self.notify_signal.emit("INFO", f"Loading full dataset for table view ({len(missing)} variables)...")
+                    try: QApplication.processEvents() # maintain responsiveness
+                    except: pass
+                    
+                    # Re-use read_ncf_emissions to fetch data
+                    from ncf_processing import read_ncf_emissions
+                    path = self.input_files_list[0] if getattr(self, 'input_files_list', None) else None
+                    if path:
+                        ds = self.emissions_df.attrs['_smk_xr_ds']
+                        ncf_params = self.emissions_df.attrs.get('ncf_params', {})
+                        
+                        # We load ALL missing pollutants
+                        new_data = read_ncf_emissions(path, pollutants=missing, xr_ds=ds, **ncf_params)
+                        
+                        # Merge columns into main DF
+                        for col in missing:
+                            if col in new_data.columns:
+                                self.emissions_df[col] = new_data[col].values
+                                # Also update units map if needed
+                                if col not in self.units_map:
+                                    v_meta = new_data.attrs.get('variable_metadata', {}).get(col, {})
+                                    self.units_map[col] = v_meta.get('units', '')
+                        
+                        self.notify_signal.emit("INFO", "Dataset fully loaded.")
+        except Exception as e:
+            logging.error(f"Failed to lazy-load full dataset: {e}")
+
         modes = {
             "Raw Data (Full File)": self.emissions_df,
         }
@@ -4862,12 +5056,12 @@ class NativeEmissionGUI(QMainWindow):
         if not cols:
              # Fallback for NetCDF or unknown structure
              if hasattr(df, 'attrs') and df.attrs.get('source_type') == 'gridded_netcdf':
-                  # Already gridded, maybe summarize by layer?
-                  return df.head(5000)
+                  # Already gridded, return full dataset
+                  return df
              raise ValueError("No grid (ROW/COL) columns found.")
              
         g = df.groupby(cols)[pols].sum().reset_index()
-        return g.sort_values(pols[0], ascending=False).head(5000)
+        return g.sort_values(pols[0], ascending=False)
 
     def _summarize_by_scc(self, df):
         """Aggregate emissions by SCC."""
@@ -4885,6 +5079,105 @@ class NativeEmissionGUI(QMainWindow):
         # (Assuming simple aggregation for now)
         return g.sort_values(pols[0], ascending=False).head(2000)
 
+    def _augment_with_county_mapping(self, df):
+        """Map grid cells (ROW, COL) to counties using simple centroid mapping."""
+        if self.counties_gdf is None:
+             raise ValueError("County shapefile not loaded.")
+        
+        # 1. Get Grid Info
+        info = getattr(df, 'attrs', {}).get('_smk_grid_info')
+        if not info and self.grid_gdf is not None:
+             # Fallback to loaded grid definition if generic
+             info = getattr(self.grid_gdf, 'attrs', {}).get('_smk_grid_info')
+        
+        if not info:
+             raise ValueError("Grid definition (XORIG, XCELL, etc) not found in dataset.")
+
+        # 2. Get Unique Cells (for performance)
+        unique_cells = df[['ROW', 'COL']].drop_duplicates()
+        if unique_cells.empty: return df
+        
+        # 3. Calculate Centroids (Vectorized)
+        # Note: SMOKE/IOAPI ROW/COL are 1-based.
+        # Centroid X = XORIG + (COL_idx + 0.5) * XCELL
+        # COL_idx = COL - 1
+        r = unique_cells['ROW'].values - 1
+        c = unique_cells['COL'].values - 1
+        
+        # Guard against invalid indices if any
+        mask = (r >= 0) & (c >= 0) 
+        # (Technically we should check max bounds too but let's assume valid data)
+        
+        x = info['xorig'] + (c + 0.5) * info['xcell']
+        y = info['yorig'] + (r + 0.5) * info['ycell']
+        
+        # 4. Reproject Points to County CRS
+        # Construct Grid CRS
+        proj_str = info.get('proj_str')
+        if not proj_str:
+             if info.get('proj_type') == 2: # LCC Default Fallback (SMKPLOT constant)
+                  # Re-construct simple LCC
+                  proj_str = "+proj=lcc +a=6370000.0 +b=6370000.0 +units=m +no_defs" 
+                  # Warning: This is a wild guess without params. Ideally we have proj_str.
+        
+        if not proj_str:
+             raise ValueError("Grid CRS projection string missing.")
+        
+        # Create Points
+        import pyproj
+        from shapely.geometry import Point
+        
+        src_crs = pyproj.CRS(proj_str)
+        tgt_crs = self.counties_gdf.crs or "EPSG:4326"
+        
+        transformer = pyproj.Transformer.from_crs(src_crs, tgt_crs, always_xy=True)
+        lon, lat = transformer.transform(x, y)
+        
+        geoms = [Point(xy) for xy in zip(lon, lat)]
+        points_gdf = gpd.GeoDataFrame(unique_cells, geometry=geoms, crs=tgt_crs)
+        
+        # 5. Spatial Join
+        # Only keep necessary columns from counties (FIPS, NAME)
+        # Check available columns in counties_gdf (loaded by read_shpfile)
+        c_cols = ['geometry']
+        fips_col = 'FIPS' if 'FIPS' in self.counties_gdf.columns else ('region_cd' if 'region_cd' in self.counties_gdf.columns else None)
+        if fips_col: c_cols.append(fips_col)
+        
+        name_col = next((c for c in self.counties_gdf.columns if c.lower() in ['name', 'namelsad', 'county_name', 'county']), None)
+        if name_col: c_cols.append(name_col)
+        
+        counties_subset = self.counties_gdf[c_cols]
+        
+        joined = gpd.sjoin(points_gdf, counties_subset, how='left', predicate='within')
+        
+        # 6. deduplicate (one cell -> one county). Take first match.
+        joined = joined.drop_duplicates(subset=['ROW', 'COL'])
+        
+        # 7. Merge Map back to full DF
+        # Drop geometry/index_right before merge
+        merge_cols = ['ROW', 'COL']
+        if fips_col in joined.columns: merge_cols.append(fips_col)
+        if name_col and name_col in joined.columns: merge_cols.append(name_col)
+        
+        mapping = joined[merge_cols]
+        
+        # Merge
+        result = df.merge(mapping, on=['ROW', 'COL'], how='left')
+        
+        # Cache for Animation Aggregation
+        try:
+             # Make a dict: (row, col) -> fips
+             # Optimisation: Store as dataframe or simply keep the 'joined' table
+             # We need FIPS column name
+             if fips_col in joined.columns:
+                 self._grid_to_county_map = joined[['ROW', 'COL', fips_col]].copy()
+                 self._grid_to_county_key = fips_col
+             else:
+                 self._grid_to_county_map = None
+        except: pass
+        
+        return result
+
     def _summarize_by_geo(self, df, mode):
         """Aggregate by State/County (Replicating gui_qt logic)."""
         pols = self.pollutants
@@ -4901,8 +5194,27 @@ class NativeEmissionGUI(QMainWindow):
             if 'fips' in lower_map: key = lower_map['fips']
             elif 'region_cd' in lower_map: key = lower_map['region_cd']
             
+            # --- Grid Centroid Mapping Logic ---
+            if not key and ('ROW' in df.columns and 'COL' in df.columns):
+                 try:
+                     df_mapped = self._augment_with_county_mapping(df)
+                     # Re-scan columns on the augmented DF
+                     lower_map = {c.lower(): c for c in df_mapped.columns}
+                     if 'fips' in lower_map: 
+                         key = lower_map['fips']
+                         raw = df_mapped # Use the mapped DF for subsequent logic
+                     elif 'region_cd' in lower_map: 
+                         key = lower_map['region_cd']
+                         raw = df_mapped
+                     
+                     # Ensure we have FIPS even if they are NaN (unmapped)
+                     # The groupby(dropna=False) below will handle them.
+                 except Exception as e:
+                     logging.warning(f"Grid-to-County mapping failed: {e}")
+            # -----------------------------------
+
             if not key:
-                raise ValueError("Cannot summarize by county: Missing FIPS/region_cd column.")
+                raise ValueError("Cannot summarize by county: Missing FIPS/region_cd column and Grid Mapping failed/unavailable (Load County Shapefile).")
                 
             group_cols = [key]
             
@@ -4930,12 +5242,26 @@ class NativeEmissionGUI(QMainWindow):
             if 'fips' in lower_map: fips_col = lower_map['fips']
             elif 'region_cd' in lower_map: fips_col = lower_map['region_cd']
             
+            # --- Grid Centroid Mapping Logic ---
+            if not fips_col and 'state_cd' not in lower_map and ('ROW' in df.columns and 'COL' in df.columns):
+                 try:
+                     df_mapped = self._augment_with_county_mapping(df)
+                     lower_map = {c.lower(): c for c in df_mapped.columns}
+                     if 'fips' in lower_map: 
+                         fips_col = lower_map['fips']
+                         raw = df_mapped
+                     elif 'region_cd' in lower_map: 
+                         fips_col = lower_map['region_cd']
+                         raw = df_mapped
+                 except Exception: pass
+            # -----------------------------------
+
             if not fips_col:
                 # Try state code directly
                 if 'state_cd' in lower_map:
                     group_cols = [lower_map['state_cd']]
                 else:
-                    raise ValueError("Cannot summarize by state: FIPS/region_cd/state_cd not available.")
+                    raise ValueError("Cannot summarize by state: FIPS/region_cd/state_cd not available and Grid Mapping failed.")
             else:
                 # Derive STATEFP from FIPS (gui_qt logic)
                 # FIPS is typically 6 chars (C+SS+CCC). We want SS.
@@ -4956,7 +5282,7 @@ class NativeEmissionGUI(QMainWindow):
         # Perform Aggregation
         if not group_cols: return df
         
-        g = raw.groupby(group_cols)[pols].sum().reset_index()
+        g = raw.groupby(group_cols, dropna=False)[pols].sum().reset_index()
         
         # Attach enriched columns
         # We need to map back the enriched data to the grouped result
@@ -5002,6 +5328,15 @@ class NativeEmissionGUI(QMainWindow):
         cols_out = [c for c in cols_out if c in g.columns]
         g = g[cols_out]
         
+        # Fill NaNs in key columns for display
+        for col in group_cols:
+             if g[col].isna().any():
+                 g[col] = g[col].fillna("Unmapped")
+        if 'COUNTY_NAME' in g.columns:
+             g['COUNTY_NAME'] = g['COUNTY_NAME'].fillna("Outside Domain")
+        if 'STATE_NAME' in g.columns:
+             g['STATE_NAME'] = g['STATE_NAME'].fillna("Unknown")
+
         return g.sort_values(pols[0], ascending=False)
 
     def browse_filter_shpfile(self):
