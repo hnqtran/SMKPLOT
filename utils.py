@@ -1,3 +1,4 @@
+# Author: tranhuy@email.unc.edu
 """Utility functions for SMKPLOT GUI."""
 
 import os
@@ -10,7 +11,7 @@ import matplotlib
 import numpy as np
 import pandas as pd
 
-# ---- Moved from data_processing.py ----
+
 
 def normalize_delim(d: Optional[str]) -> Optional[str]:
     """Normalize common delimiter tokens to actual characters."""
@@ -138,7 +139,7 @@ def coerce_merge_key(series: pd.Series, pad: Optional[int] = None) -> pd.Series:
         return original
 
 
-# ---- Moved from batch.py ----
+
 
 def safe_sector_slug(sector: Optional[str]) -> str:
     """Generate a filename-safe slug from a sector name."""
@@ -183,7 +184,7 @@ def is_netcdf_file(filepath: str) -> bool:
     return False
 
 
-# ---- Original utils content (preserved) ----
+
 
 def _prune_incompatible_bundled_libs() -> None:
     """Drop PyInstaller-bundled glibc toolchain libs that require newer glibc.

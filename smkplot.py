@@ -1,4 +1,5 @@
 #!/proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/.venv/bin/python
+# Author: tranhuy@email.unc.edu
 """
 Main entry point for the SMKPLOT application.
 
@@ -307,7 +308,7 @@ def main():
     has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     
     # Selection of engine
-    # 'qt' -> gui_qt.py (PySide6 Shim)
+    # 'qt' -> gui_qt.py (Qt Compatibility)
     # 'tk' -> gui_tk.py (Tkinter)
     # 'auto' -> Try gui.py (Native) -> gui_qt.py -> gui_tk.py
 
@@ -323,13 +324,13 @@ def main():
             target_impl = 'native'
             logging.info("Auto-selected: Native Qt GUI (gui.py)")
         except ImportError:
-            # Priority 2: Shimmed Qt (gui_qt.py) 
+            # Priority 2: Qt Compatibility (gui_qt.py) 
             try:
                 try: import PySide6
                 except ImportError: import PyQt5
                 import gui_qt
                 target_impl = 'qt_shim'
-                logging.info("Auto-selected: Shimmed Qt GUI (gui_qt.py)")
+                logging.info("Auto-selected: Qt Compatibility GUI (gui_qt.py)")
             except ImportError:
                  # Priority 3: Tkinter
                  try:
@@ -404,9 +405,9 @@ def main():
                 logging.exception(f"Native Qt Runtime Error: {e}")
                 return 1
 
-        # Shimmed Qt Dispatch (gui_qt.py)
+        # Qt Compatibility Dispatch (gui_qt.py)
         elif target_impl == 'qt_shim':
-            logging.info("Launching Shimmed Qt GUI (gui_qt.py)...")
+            logging.info("Launching Qt Compatibility GUI (gui_qt.py)...")
             try:
                 try:
                     from PySide6.QtWidgets import QApplication

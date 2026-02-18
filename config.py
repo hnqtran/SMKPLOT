@@ -1,3 +1,4 @@
+# Author: tranhuy@email.unc.edu
 """Configuration constants and settings for SMKPLOT GUI."""
 
 import os
@@ -24,7 +25,7 @@ US_STATE_FIPS_TO_NAME: Dict[str, str] = {
 # ---- Key cols to be kept in exported pivotted csv files
 key_cols = ['country_cd','tribal_code','region_cd','facility_id','unit_id','rel_point_id','facility_name','scc','latitude','longitude']
 
-# Define constant column name lists for remapping (moved from data_processing.py)
+# Constant column name lists for remapping
 COUNTRY_COLS = ['country_cd', 'country', 'country_id']
 TRIBAL_COLS = ['tribal_code', 'tribal_name', 'tribe_id']
 REGION_COLS = ['region_cd', 'regioncd', 'region', 'county_id', 'fips', 'state_county_fips']

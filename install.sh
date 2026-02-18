@@ -1,4 +1,5 @@
 #!/bin/bash
+# Author: tranhuy@email.unc.edu
 
 # SMKPLOT Setup Script
 # This script sets up a local Python virtual environment and configures the tool to use it.

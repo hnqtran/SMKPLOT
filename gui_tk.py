@@ -1,4 +1,5 @@
 """
+# Author: tranhuy@email.unc.edu
 GUI components for SMKPLOT.
 
 ##############################################################################
@@ -84,8 +85,8 @@ class EmissionGUI:
         self.root.title(f"SMKPLOT version {app_version} (Author: tranhuy@email.unc.edu)")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         
-        # --- Monkey-patch for Graticule Recursion Guard ---
-        # Since we cannot touch plotting.py directly, we wrap the function here.
+        # --- Graticule Logic with Recursion Guard ---
+        # We wrap the plotting utility to prevent infinite recursion during zoom events.
         import plotting
         original_draw_graticule = plotting._draw_graticule
         

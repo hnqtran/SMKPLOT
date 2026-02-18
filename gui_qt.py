@@ -1,4 +1,5 @@
 #!/proj/ie/proj/SMOKE/htran/Emission_Modeling_Platform/utils/smkplot/.venv/bin/python
+# Author: tranhuy@email.unc.edu
 """GUI components for SMKPLOT.
 
 ##############################################################################
@@ -54,7 +55,7 @@ from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_ma
 
 # Backend selection: try Tk if DISPLAY exists, otherwise Agg
 
-# --- Qt Compatibility Layer (Antigravity v2) ---
+# --- Qt GUI Layer ---
 import os
 import logging
 # Headless detection to prevent hanging
@@ -62,7 +63,7 @@ if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
     os.environ['QT_QPA_PLATFORM'] = 'offscreen'
     logging.info("No display detected, setting Qt to offscreen mode")
 
-# --- Qt Compatibility Shim ---
+# --- Qt GUI Initialization ---
 try:
     from PySide6 import QtWidgets, QtCore, QtGui
     from PySide6.QtCore import Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings, QRunnable, QThreadPool

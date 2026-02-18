@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Author: tranhuy@email.unc.edu
 """
 Native PySide6 GUI for SMKPLOT.
 
@@ -15,11 +16,6 @@ Native PySide6 GUI for SMKPLOT.
 #      - DO NOT use external GRIDDESC files for NetCDF inputs.
 #    - SMOKE Reports / FF10: MUST use external GRIDDESC file + Grid Name.
 ##############################################################################
-
-This module implements the Native Qt-based graphical user interface for the tool.
-Refactored from gui_qt.py/gui_tk.py to remove Tkinter compatibility layer.
-
-Original Author: tranhuy@email.unc.edu
 """
 
 import os
@@ -50,7 +46,7 @@ if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
     logging.basicConfig(level=logging.INFO)
     sys.stderr.write("WARNING: No DISPLAY detected. Running in headless mode (qt-test). No window will be shown.\n")
 
-# --- Qt Compatibility Shim ---
+# --- Qt GUI Framework Initialization ---
 try:
     from PySide6 import QtWidgets, QtCore, QtGui
     from PySide6.QtCore import Qt, Signal, Slot, QObject, QThread, QTimer, QSize, QEvent, QSettings, QRunnable, QThreadPool
@@ -131,11 +127,11 @@ try:
     from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
     from ncf_processing import get_ncf_dims, create_ncf_domain_gdf, read_ncf_grid_params
 
-    # --- Robust Monkey-patch: Fixed Graticule Logic (Zoom Support) ---
+    # --- Graticule Logic with Zoom Support ---
     import plotting
     
     def _fixed_draw_graticule(ax, tf_fwd, tf_inv, lon_step=None, lat_step=None, with_labels=True):
-        """Native gui.py implementation of graticule drawing to fix zoom issues."""
+        """Implementation of graticule drawing optimized for map projection zoom."""
         artists = {'lines': [], 'texts': []}
         if ax is None or tf_fwd is None or tf_inv is None:
             return artists

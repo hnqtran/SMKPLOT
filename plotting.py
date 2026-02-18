@@ -1,3 +1,4 @@
+# Author: tranhuy@email.unc.edu
 """Plotting utilities for SMKPLOT GUI."""
 
 import logging

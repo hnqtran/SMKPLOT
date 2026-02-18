@@ -1,3 +1,4 @@
+# Author: tranhuy@email.unc.edu
 """Data processing functions for SMKPLOT GUI.
 
 ##############################################################################
