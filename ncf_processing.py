@@ -164,24 +164,29 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
                 gi['p_gam'] = float(getattr(nc_in, 'P_GAM') or 0)
                 gi['xcent'] = float(getattr(nc_in, 'XCENT') or 0)
                 gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
-                 
-                if gi['ncols'] == 1 or gi['nrows'] == 1:
-                        gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
-                        import re
-                        match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
-                        if match:
-                            gi['ncols'] = int(match.group(1))
-                            gi['nrows'] = int(match.group(2))
             except AttributeError:
                 raise ValueError("Could not determine grid parameters.")
 
-    # Read STACK_GROUPS
-    logging.info(f"DEBUG: Reading STACK_GROUPS: {stack_groups_path}")
-    with netCDF4.Dataset(stack_groups_path) as nc_stack:
-        lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
-        lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+        # Read STACK_GROUPS
+        logging.info(f"DEBUG: Reading STACK_GROUPS: {stack_groups_path}")
+        with netCDF4.Dataset(stack_groups_path) as nc_stack:
+            lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
+            lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            
+            # Check for spatial dimensions in STACK_GROUPS FILEDESC attribute
+            if gi is not None and (gi['ncols'] == 1 or gi['nrows'] == 1):
+                filedesc = str(getattr(nc_stack, 'FILEDESC', ''))
+                import re
+                c_match = re.search(r'/NCOLS3D/\s*(\d+)', filedesc)
+                r_match = re.search(r'/NROWS3D/\s*(\d+)', filedesc)
+                if c_match and r_match:
+                    gi['ncols'] = int(c_match.group(1))
+                    gi['nrows'] = int(r_match.group(1))
+                    logging.info(f"Inferred spatial grid dimensions from STACK_GROUPS FILEDESC: {gi['ncols']}x{gi['nrows']}")
+                else:
+                    logging.warning(f"Inline file has 1D dimensions and STACK_GROUPS FILEDESC does not provide NCOLS3D/NROWS3D. Plotting may be incorrect.")
 
-    logging.info(f"DEBUG: Projecting {len(lats)} sources...")
+        logging.info(f"DEBUG: Projecting {len(lats)} sources...")
 
     # Project
     proj_crs = get_proj_object_from_info(gi)
@@ -268,18 +273,8 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                 gi['ycent'] = float(getattr(nc_in, 'YCENT') or 0)
                  
                 # Fix for Inline files where NCOLS/NROWS describe list size (e.g. 1 x NSRC)
-                # We need the spatial grid dimensions. Try to parse from GDNAM.
-                if gi['ncols'] == 1 or gi['nrows'] == 1:
-                        gdnam = str(getattr(nc_in, 'GDNAM', '')).strip()
-                        import re
-                        # Look for _NNNxMMM pattern at end of string
-                        match = re.search(r'_(\d+)[Xx](\d+)\s*$', gdnam)
-                        if match:
-                            gi['ncols'] = int(match.group(1))
-                            gi['nrows'] = int(match.group(2))
-                            logging.info(f"Inferred spatial grid dimensions from GDNAM '{gdnam}': {gi['ncols']}x{gi['nrows']}")
-                        else:
-                            logging.warning(f"Inline file has 1D dimensions ({gi['ncols']}x{gi['nrows']}) and GDNAM '{gdnam}' does not contain explicit dimensions. Plotting may be incorrect without GRIDDESC.")
+                # Spatial dimensions will be inferred from STACK_GROUPS or GDNAM below.
+                pass
 
             except AttributeError:
                 raise ValueError(f"Could not determine grid parameters from INLN header or GRIDDESC for '{grid_name}'.")
@@ -291,6 +286,19 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
             
             lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
             lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            
+            # Check for spatial dimensions in STACK_GROUPS FILEDESC attribute
+            if gi is not None and (gi['ncols'] == 1 or gi['nrows'] == 1):
+                filedesc = str(getattr(nc_stack, 'FILEDESC', ''))
+                import re
+                c_match = re.search(r'/NCOLS3D/\s*(\d+)', filedesc)
+                r_match = re.search(r'/NROWS3D/\s*(\d+)', filedesc)
+                if c_match and r_match:
+                    gi['ncols'] = int(c_match.group(1))
+                    gi['nrows'] = int(r_match.group(1))
+                    logging.info(f"Inferred spatial grid dimensions from STACK_GROUPS FILEDESC: {gi['ncols']}x{gi['nrows']}")
+                else:
+                    logging.warning(f"Inline file has 1D dimensions ({gi['ncols']}x{gi['nrows']}) and STACK_GROUPS FILEDESC does not provide NCOLS3D/NROWS3D.")
 
         # Project
         proj_crs = get_proj_object_from_info(gi)
@@ -391,7 +399,7 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                         n_tsteps = nc_in.variables[vars_to_process[0]].shape[0]
 
                 # Process
-                cpu_count = os.cpu_count() or 1
+                cpu_count = min(8, os.cpu_count() or 1)
                 should_parallel = (n_tsteps >= 24) and (cpu_count > 1) 
                 
                 if should_parallel:

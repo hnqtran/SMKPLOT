@@ -766,9 +766,9 @@ def read_inputfile(
             return None, None
             
         if workers > 0:
-            max_workers = workers
+            max_workers = min(8, workers)
         else:
-            max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+            max_workers = min(8, max(1, multiprocessing.cpu_count() - 1))
         
         # capped by number of files
         max_workers = min(max_workers, len(paths))
@@ -926,7 +926,7 @@ def read_inputfile(
 
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
-    if "#FORMAT=FF10_NONPOINT" in first_line:
+    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
         _emit_user_message(notify, 'INFO', "Detected FF10_NONPOINT format identifier in first line. Readding as FF10 format for nonpoint...")
         result = read_ff10(
             fpath=fpath,
@@ -941,7 +941,7 @@ def read_inputfile(
             encoding=encoding,
             emis_unit="tons/yr",
         )
-    elif "#FORMAT=FF10_POINT" in first_line:
+    elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
         _emit_user_message(notify, 'INFO', "Detected FF10_POINT format identifier in first line. Readding as FF10 format for point...")
         result = read_ff10(
             fpath=fpath,
@@ -1078,9 +1078,9 @@ def read_ff10(
     # Examine 1st row for "#FORMAT=FF10_NONPOINT" or "#FORMAT=FF10_POINT" and dertermine src_type
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
-        if "#FORMAT=FF10_NONPOINT" in first_line:
+        if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
             src_type = "ff10_nonpoint"
-        elif "#FORMAT=FF10_POINT" in first_line:
+        elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
             src_type = "ff10_point"
         else:
             raise ValueError(f"File {fpath} does not have valid FF10 format identifier in first line.")
@@ -1327,9 +1327,9 @@ def _read_single_file_wrapper(fp, src_name, flter_col, flter_start, flter_end, f
         first_line = f.readline().strip()
     
     detected_type = None
-    if "#FORMAT=FF10_NONPOINT" in first_line:
+    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
         detected_type = "ff10_nonpoint"
-    elif "#FORMAT=FF10_POINT" in first_line:
+    elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
         detected_type = "ff10_point"
     else:
         raise ValueError(f"File {fp} in LIST does not have valid FF10 format identifier.")
@@ -1371,9 +1371,9 @@ def read_listfile(
     # Use parallel processing to read files
     # Determine number of workers (leave one core free, max 32)
     if workers > 0:
-        max_workers = workers
+        max_workers = min(8, workers)
     else:
-        max_workers = min(32, max(1, multiprocessing.cpu_count() - 1))
+        max_workers = min(8, max(1, multiprocessing.cpu_count() - 1))
     
     # capped by number of files
     max_workers = min(max_workers, len(filepaths))

@@ -773,6 +773,14 @@ class NativeEmissionGUI(QMainWindow):
         
         # --- Thread Pool ---
         self.threadpool = QThreadPool()
+        
+        # Respect --workers or cap at 8 to prevent overwhelming HPC nodes
+        req_workers = self._json_arguments.get('workers', 0)
+        if req_workers and req_workers > 0:
+            self.threadpool.setMaxThreadCount(int(req_workers))
+        else:
+            self.threadpool.setMaxThreadCount(min(8, os.cpu_count() or 1))
+
         logging.info(f"Multithreading with maximum {self.threadpool.maxThreadCount()} threads")
         
         # Add a debouncer for plot title/stats updates to maintain responsiveness
@@ -1037,7 +1045,6 @@ class NativeEmissionGUI(QMainWindow):
         btn_reset.clicked.connect(self.reset_home_view)
         l_source.addWidget(btn_reset)
 
-        self._init_animation_section(l_source)
         
         l_source.addStretch()
         self.tabs.addTab(page_source, "Source & View")
@@ -1335,7 +1342,9 @@ class NativeEmissionGUI(QMainWindow):
         self.cmb_ncf_layer = QComboBox()
         self.cmb_ncf_time = QComboBox()
         # Connect signals
+        self.cmb_ncf_layer.currentIndexChanged.connect(self._clear_anim_cache)
         self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        self.cmb_ncf_time.currentIndexChanged.connect(self._clear_anim_cache)
         self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
         
         l_ncf.addWidget(QLabel("<b>NetCDF:</b>"))
@@ -1575,41 +1584,6 @@ class NativeEmissionGUI(QMainWindow):
         if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
 
-    def _init_animation_section(self, parent_layout=None):
-        self.anim_group = QGroupBox("6. Animation / Time Nav")
-        layout = QVBoxLayout(self.anim_group)
-        self.anim_group.setVisible(False)
-        
-        self.lbl_anim_time = QLabel("Time: -")
-        layout.addWidget(self.lbl_anim_time)
-        
-        nav_layout = QHBoxLayout()
-        btn_prev = QPushButton("< Prev")
-        btn_prev.clicked.connect(lambda: self._step_time(-1))
-        btn_next = QPushButton("Next >")
-        btn_next.clicked.connect(lambda: self._step_time(1))
-        nav_layout.addWidget(btn_prev)
-        nav_layout.addWidget(btn_next)
-        layout.addLayout(nav_layout)
-        
-        agg_layout = QGridLayout()
-        btn_tot = QPushButton("Total")
-        btn_tot.clicked.connect(lambda: self._show_agg('total'))
-        btn_avg = QPushButton("Avg")
-        btn_avg.clicked.connect(lambda: self._show_agg('avg'))
-        btn_max = QPushButton("Max")
-        btn_max.clicked.connect(lambda: self._show_agg('max'))
-        btn_min = QPushButton("Min")
-        btn_min.clicked.connect(lambda: self._show_agg('min'))
-        
-        agg_layout.addWidget(btn_tot, 0, 0)
-        agg_layout.addWidget(btn_avg, 0, 1)
-        agg_layout.addWidget(btn_max, 1, 0)
-        agg_layout.addWidget(btn_min, 1, 1)
-        layout.addLayout(agg_layout)
-        
-        if parent_layout: parent_layout.addWidget(self.anim_group)
-        else: self.control_layout.addWidget(self.anim_group)
 
     def _init_summary_section(self, parent_layout=None):
         group = QGroupBox("7. Table Summary")
@@ -2585,10 +2559,6 @@ class NativeEmissionGUI(QMainWindow):
                 self.cmb_ncf_time.addItems(ts_items)
                 self.cmb_ncf_time.blockSignals(False)
                 
-                # Show animation controls if we have multiple time steps
-                if n_ts > 1 and hasattr(self, 'anim_group'):
-                     self.anim_group.setVisible(True)
-                     self.lbl_anim_time.setText("Time: Step 1")
 
                 # Update GRIDDESC display to show NCF source
                 try:
@@ -2712,6 +2682,12 @@ class NativeEmissionGUI(QMainWindow):
         except Exception as e:
             self.notify_signal.emit("WARNING", f"Shapefile load error: {e}")
 
+    def _clear_anim_cache(self):
+        """Reset the animation data cache and index."""
+        self._t_data_cache = None
+        self._t_idx = 0
+        self._is_showing_agg = False
+
     def _pollutant_changed(self):
         # Update units label if metadata available
         pol = self.cmb_pollutant.currentText()
@@ -2725,14 +2701,13 @@ class NativeEmissionGUI(QMainWindow):
         
         self.lbl_units.setText(f"Unit: {unit}")
         # Invalidate animation cache if pollutant changed
-        self._t_data_cache = None
-        self._t_idx = 0
-        self._is_showing_agg = False
-        # Hide animation controls when switching pollutants
-        if hasattr(self, 'anim_group') and self.anim_group:
-            self.anim_group.setVisible(False)
+        self._clear_anim_cache()
+        
         # Keep plot_controls_frame visible if NCF data is loaded
-        # (will be reshown if needed by _post_load_update)
+        # Trigger background load of time series to get global min/max for scaling
+        if self.ncf_frame.isVisible():
+             from PyQt5.QtCore import QTimer
+             QTimer.singleShot(100, self._ensure_time_data)
 
     def _ensure_time_data(self):
         if self._t_data_cache is not None: return True
@@ -4010,6 +3985,24 @@ class NativeEmissionGUI(QMainWindow):
                 if isinstance(vmeta, dict) and column in vmeta:
                      unit = vmeta[column].get('units', '')
 
+            # Fixed Scaling for NetCDF or Config
+            extra_plot_kwargs = {'disable_quadmesh': not self.chk_quadmesh.isChecked()}
+            
+            # 1. Config override (Explicit user intent)
+            if self._json_arguments.get('vmin') is not None:
+                try: extra_plot_kwargs['vmin'] = float(self._json_arguments['vmin'])
+                except: pass
+            if self._json_arguments.get('vmax') is not None:
+                try: extra_plot_kwargs['vmax'] = float(self._json_arguments['vmax'])
+                except: pass
+                
+            # 2. Animation Cache (Auto-calculated global limits for NetCDF)
+            if self._t_data_cache:
+                if 'vmin' not in extra_plot_kwargs:
+                    extra_plot_kwargs['vmin'] = self._t_data_cache.get('vmin')
+                if 'vmax' not in extra_plot_kwargs:
+                    extra_plot_kwargs['vmax'] = self._t_data_cache.get('vmax')
+
             logging.info(f"DEBUG: [_render_plot_on_main] Starting create_map_plot...")
             collection = create_map_plot(
                 gdf=gdf,
@@ -4028,7 +4021,7 @@ class NativeEmissionGUI(QMainWindow):
                 zoom_to_data=False,
                 linewidth=p_lw,
                 edgecolor=p_ec,
-                disable_quadmesh=not self.chk_quadmesh.isChecked()
+                **extra_plot_kwargs
             )
             logging.info(f"DEBUG: [_render_plot_on_main] create_map_plot finished.")
             
@@ -4238,18 +4231,26 @@ class NativeEmissionGUI(QMainWindow):
                     else:
                         # Default Formatter for standard linear/log scales
                         if is_log:
-                            fmt = LogFormatter()
+                            # Use a custom formatter to ensure consistent decimal formatting
+                            # and avoid the 1e-02 vs 10^-2 math/scientific flipping.
+                            def _fmt_log_readable(x, pos=None):
+                                if x <= 0: return ""
+                                # Use 'g' format for clean decimals, but limit precision
+                                s = f"{x:.4g}".rstrip('0').rstrip('.')
+                                if not s or s == "0": s = f"{x:g}"
+                                return s
+                            
+                            fmt = FuncFormatter(_fmt_log_readable)
                             if orient_vertical: 
                                 cbar_ax.yaxis.set_major_formatter(fmt)
                             else: 
                                 cbar_ax.xaxis.set_major_formatter(fmt)
                         else:
+                            # For linear scales, prioritize plain decimals for standard ranges
                             fmt = ScalarFormatter(useOffset=False)
-                            fmt.set_scientific(True)
-                            fmt.set_powerlimits((-4, 4))
+                            fmt.set_scientific(False) # Prioritize plain formatting
                             
                             if orient_vertical: 
-                                # Force a few ticks if it's empty
                                 cbar_ax.yaxis.set_major_locator(AutoLocator())
                                 cbar_ax.yaxis.set_major_formatter(fmt)
                             else: 

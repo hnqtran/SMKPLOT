@@ -96,12 +96,28 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
         except (ValueError, AttributeError) as e:
             logging.warning("Failed to configure custom bins/norm: %s", e)
     else:
+        # Respect vmin/vmax if passed in user_kwargs
+        v_min = user_kwargs.get('vmin') if user_kwargs else None
+        v_max = user_kwargs.get('vmax') if user_kwargs else None
+        
         data = gdf[column]
         use_log = log_scale and (data > 0).any()
         if use_log:
             positive = data[data > 0]
             if not positive.empty:
-                kwargs['norm'] = LogNorm(vmin=float(positive.min()), vmax=float(positive.max()))
+                low = float(v_min) if v_min is not None else float(positive.min())
+                high = float(v_max) if v_max is not None else float(positive.max())
+                # Safety for LogNorm
+                if low <= 0: low = 1e-20
+                if high <= low: high = low * 10.0
+                kwargs['norm'] = LogNorm(vmin=low, vmax=high)
+    
+    # Ensure vmin/vmax are in kwargs for linear plots if not already handled by norm
+    if 'norm' not in kwargs:
+        if user_kwargs and 'vmin' in user_kwargs: kwargs['vmin'] = user_kwargs['vmin']
+        if user_kwargs and 'vmax' in user_kwargs: kwargs['vmax'] = user_kwargs['vmax']
+
+    return kwargs
                 
     return kwargs
 

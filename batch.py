@@ -93,12 +93,12 @@ except Exception:
 
 
 def _resolve_worker_count(num_jobs: int) -> int:
-    # Aggressively use all cores if needed
+    # Aggressively use all cores if needed, but cap at 8
     cpu = os.cpu_count() or 1
     if cpu <= 1:
         return 1
-    # Use max available cores minus 1 for system responsiveness, but always at least 1
-    return max(1, cpu - 1)
+    # Use max available cores minus 1 for system responsiveness, but always at least 1 and at most 8
+    return min(8, max(1, cpu - 1))
 
 
 def _write_settings_snapshot(args, plots, files, attrs=None, input_basename=None):
@@ -245,7 +245,9 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         tf_fwd=tf_fwd,
         tf_inv=tf_inv,
         zoom_to_data=zoom_flag,
-        zoom_pad=args.zoom_pad
+        zoom_pad=args.zoom_pad,
+        vmin=getattr(args, 'vmin', None),
+        vmax=getattr(args, 'vmax', None)
     )
 
     # Axis settings handled by create_map_plot (borders enabled)
@@ -1279,7 +1281,7 @@ def _batch_mode(args):
         else:
             worker_count = 1
     else:
-        worker_count = requested_workers
+        worker_count = min(8, requested_workers)
         
     if worker_count <= 1:
         for pol in to_plot:

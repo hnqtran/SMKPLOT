@@ -178,6 +178,8 @@ def parse_args():
     ap.add_argument('--workers', type=int, default=0, help='Number of parallel workers for batch plotting (0=auto).')
     ap.add_argument('--outdir', default='outputs', help='Output directory for batch mode (default to outputs).')
     ap.add_argument('--log-scale', action='store_true', help='Use log scale for color mapping in batch mode.')
+    ap.add_argument('--vmin', type=float, help='Fixed minimum value for colorbar scaling.')
+    ap.add_argument('--vmax', type=float, help='Fixed maximum value for colorbar scaling.')
     ap.add_argument('--self-test', action='store_true', help='Run a quick self-test: generate synthetic data and produce sample outputs to --outdir.')
     ap.add_argument('--run-mode', choices=['gui', 'batch'], help='Execution mode: "gui" to open interactive window, "batch" to run headless (default).')
     ap.add_argument('--log-file', help='Write logs (INFO..ERROR) to this file (appends). If directory given, a timestamped file is created.')
