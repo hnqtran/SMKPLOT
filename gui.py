@@ -2553,7 +2553,7 @@ class NativeEmissionGUI(QMainWindow):
                 self.cmb_ncf_layer.blockSignals(False)
                 # Time
                 n_ts = dims.get('n_tsteps', 1)
-                ts_items = ['Sum All', 'Avg All', 'Max'] + [f"Step {i+1}" for i in range(n_ts)]
+                ts_items = ['Avg All', 'Sum All', 'Max'] + [f"Step {i+1}" for i in range(n_ts)]
                 self.cmb_ncf_time.blockSignals(True)
                 self.cmb_ncf_time.clear()
                 self.cmb_ncf_time.addItems(ts_items)
@@ -2966,7 +2966,11 @@ class NativeEmissionGUI(QMainWindow):
                       if isinstance(coll.norm, LogNorm):
                           if c_vmin <= 0: c_vmin = 1e-20
                           if c_vmax <= c_vmin: c_vmax = c_vmin * 10.0
+                      
+                      # Set vmin/vmax on norm for ALL normalization types
+                      if hasattr(coll.norm, 'vmin'):
                           coll.norm.vmin = c_vmin
+                      if hasattr(coll.norm, 'vmax'):
                           coll.norm.vmax = c_vmax
                       coll.set_clim(c_vmin, c_vmax)
 
