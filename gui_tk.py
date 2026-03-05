@@ -30,6 +30,11 @@ import sys
 import copy
 import logging
 import threading
+import sys
+import traceback
+
+# Increase recursion limit for complex matplotlb/cartopy operations
+sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
 from typing import Optional, List, Dict, Any, Union, Tuple
 
 import pandas as pd
@@ -42,16 +47,139 @@ from matplotlib.colors import BoundaryNorm
 import pyproj
 from shapely.geometry import Polygon
 
-from config import (
-    US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
-    DEFAULT_ONLINE_COUNTIES_URL
-)
-from utils import normalize_delim, is_netcdf_file
-from data_processing import (
-    read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
-    merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
-)
-from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
+# Local imports
+try:
+    from config import (
+        US_STATE_FIPS_TO_NAME, DEFAULT_INPUTS_INITIALDIR, DEFAULT_SHPFILE_INITIALDIR,
+        DEFAULT_ONLINE_COUNTIES_URL, SCC_COLS, DESC_COLS
+    )
+    from utils import normalize_delim, is_netcdf_file
+    from data_processing import (
+        read_inputfile, read_shpfile, extract_grid, create_domain_gdf, detect_pollutants, map_latlon2grd,
+        merge_emissions_with_geometry, filter_dataframe_by_range, filter_dataframe_by_values, get_emis_fips, apply_spatial_filter
+    )
+    from plotting import _plot_crs, _draw_graticule as _draw_graticule_fn, create_map_plot
+    from ncf_processing import get_ncf_dims, create_ncf_domain_gdf, read_ncf_grid_params
+
+    # --- Graticule Logic with Zoom Support ---
+    import plotting
+    
+    def _fixed_draw_graticule(ax, tf_fwd, tf_inv, lon_step=None, lat_step=None, with_labels=True):
+        """Implementation of graticule drawing optimized for map projection zoom."""
+        artists = {'lines': [], 'texts': []}
+        if ax is None or tf_fwd is None or tf_inv is None:
+            return artists
+
+        try:
+            x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+            if not (np.isfinite([x0, x1, y0, y1]).all()): return artists
+            
+            # Detect Lat/Lon span to determine nice steps
+            sx = np.array([x0, x1, x1, x0, 0.5*(x0+x1)])
+            sy = np.array([y0, y0, y1, y1, 0.5*(y0+y1)])
+            sample_lons, sample_lats = tf_inv.transform(sx, sy)
+            valid = (np.abs(sample_lons) < 181.01) & (np.abs(sample_lats) < 91.01)
+            if not valid.any(): return artists
+            
+            lons, lats = sample_lons[valid], sample_lats[valid]
+            lon_span, lat_span = lons.max() - lons.min(), lats.max() - lats.min()
+            
+            def _nice_step(span):
+                if span <= 0: return 1.0
+                target = span / 5.0
+                power = 10 ** np.floor(np.log10(target))
+                base = target / power
+                if base < 1.5: step = 1.0 * power
+                elif base < 3.5: step = 2.0 * power
+                else: step = 5.0 * power
+                return max(step, 1e-6)
+
+            actual_lon_step = lon_step or _nice_step(lon_span)
+            actual_lat_step = lat_step or _nice_step(lat_span)
+            
+            buf_lon = actual_lon_step * 0.5
+            buf_lat = actual_lat_step * 0.5
+            
+            lon_min, lon_max = lons.min() - buf_lon, lons.max() + buf_lon
+            lat_min, lat_max = lats.min() - buf_lat, lats.max() + buf_lat
+            
+            lats_samp = np.linspace(max(-90, lat_min), min(90, lat_max), 505)
+            lons_samp = np.linspace(max(-180, lon_min), min(180, lon_max), 505)
+            
+            old_autoscale = ax.get_autoscale_on()
+            ax.set_autoscale_on(False)
+            
+            def _fmt(v, step):
+                p = 0 if step >= 1 else (1 if step >= 0.1 else (2 if step >= 0.01 else 3))
+                val = abs(v)
+                s = f"{val:.{p}f}".rstrip('0').rstrip('.') if p > 0 else f"{int(round(val))}"
+                return f"{s}\u00b0"
+
+            # 1. Longitude Lines
+            l_start = np.floor(lon_min / actual_lon_step) * actual_lon_step
+            for lon in np.arange(l_start, lon_max + actual_lon_step, actual_lon_step):
+                if lon < -180.001 or lon > 180.001: continue
+                xs, ys = tf_fwd.transform(np.full_like(lats_samp, lon), lats_samp)
+                lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.5, zorder=20)
+                artists['lines'].extend(lines)
+                
+                if with_labels:
+                    mask = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+                    if mask.any():
+                        idx = np.argmin(np.abs(ys[mask] - y0))
+                        lbl = _fmt(lon, actual_lon_step) + ('W' if lon < 0 else 'E' if lon > 0 else '')
+                        t = ax.text(xs[mask][idx], y0 + 0.005*(y1-y0), lbl, 
+                                    fontsize=7, color='#666666', ha='center', va='bottom', zorder=21)
+                        t.set_clip_on(True)
+                        artists['texts'].append(t)
+
+            # 2. Latitude Lines
+            l_start = np.floor(lat_min / actual_lat_step) * actual_lat_step
+            for lat in np.arange(l_start, lat_max + actual_lat_step, actual_lat_step):
+                if lat < -90.001 or lat > 90.001: continue
+                xs, ys = tf_fwd.transform(lons_samp, np.full_like(lons_samp, lat))
+                lines = ax.plot(xs, ys, color='#cccccc', linewidth=0.5, alpha=0.5, zorder=20)
+                artists['lines'].extend(lines)
+                
+                if with_labels:
+                    mask = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+                    if mask.any():
+                        idx = np.argmin(np.abs(xs[mask] - x0))
+                        lbl = _fmt(lat, actual_lat_step) + ('S' if lat < 0 else 'N' if lat > 0 else '')
+                        t = ax.text(x0 + 0.005*(x1-x0), ys[mask][idx], lbl, 
+                                    fontsize=7, color='#666666', ha='left', va='center', zorder=21)
+                        t.set_clip_on(True)
+                        artists['texts'].append(t)
+            
+            ax.set_autoscale_on(old_autoscale)
+        except Exception as e:
+            logging.debug(f"Graticule Draw Error: {e}")
+        return artists
+
+    plotting._draw_graticule = _fixed_draw_graticule
+    _draw_graticule_fn = _fixed_draw_graticule
+
+    _orig_create_map_plot = plotting.create_map_plot
+    def _guarded_create_map_plot(*args, **kwargs):
+        ax = kwargs.get('ax')
+        if not ax and len(args) > 3: ax = args[3]
+        if ax:
+             if getattr(ax, '_smk_drawing_graticule', False):
+                  return _orig_create_map_plot(*args, **kwargs)
+             ax._smk_drawing_graticule = True
+             try:
+                  return _orig_create_map_plot(*args, **kwargs)
+             finally:
+                  ax._smk_drawing_graticule = False
+        return _orig_create_map_plot(*args, **kwargs)
+
+    plotting.create_map_plot = _guarded_create_map_plot
+    create_map_plot = _guarded_create_map_plot
+
+except Exception as e:
+    logging.warning(f"Core imports failed: {e}")
+
+# --------------------------------------------------------
 
 # Backend selection: try Tk if DISPLAY exists, otherwise Agg
 _display = os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')
@@ -61,7 +189,10 @@ try:
     else:
         matplotlib.use('Agg')
 except Exception:
-    matplotlib.use('Agg')
+    try:
+        matplotlib.use('Agg')
+    except Exception:
+        pass
 
 import matplotlib.pyplot as plt  # noqa: E402
 
@@ -216,6 +347,7 @@ class EmissionGUI:
         self.class_bins_var: Optional[tk.StringVar] = None
         # Plot-by mode: auto, county, grid
         self.plot_by_var: Optional[tk.StringVar] = None
+        self._merged_gdf = None
         # SCC selection dropdown (enabled only when SCC/SCC Description exist)
         self.scc_select_var: Optional[tk.StringVar] = None
         self._scc_display_to_code: Dict[str, str] = {}
@@ -393,7 +525,7 @@ class EmissionGUI:
             grid_name = self.grid_name_var.get() if getattr(self, 'grid_name_var', None) else None
             if not grid_name or grid_name == 'Select Grid':
                 return None
-            from .data_processing import extract_grid
+            from data_processing import extract_grid
             coord_params, _ = extract_grid(self.griddesc_path, grid_name)
             # coord_params: proj_type, p_alpha, p_beta, p_gamma, x_cent, y_cent
             _, p_alpha, p_beta, _p_gamma, x_cent, y_cent = coord_params
@@ -1876,54 +2008,136 @@ class EmissionGUI:
         self.load_overlay()
 
 
-    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None) -> Optional[gpd.GeoDataFrame]:
+    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None, fill_nan=False) -> Optional[gpd.GeoDataFrame]:
+        """Prepare and merge emissions with geometry, mirroring gui.py logic exactly."""
+        def _do_notify(level, title, msg, exc=None, **kwargs):
+            if notify: notify(level, title, msg, exc, **kwargs)
+            else: self._notify(level, title, msg, exc=exc, **kwargs)
+
+        # Determine target pollutant early
+        target_pol = pollutant if pollutant else (self.pollutant_var.get() if self.pollutant_var else '')
+        
         if self.emissions_df is None:
             return None
 
-        def _do_notify(level, title, msg, exc=None, **kwargs):
-            if notify:
-                notify(level, title, msg, exc, **kwargs)
-            else:
-                self._notify(level, title, msg, exc=exc, **kwargs)
-
+        # Determine if we already have geometry
+        has_geometry = isinstance(self.emissions_df, gpd.GeoDataFrame) and self.emissions_df.geometry is not None
+        
+        # Robust Native/Gridded Check
+        is_native = getattr(self.emissions_df, 'attrs', {}).get('_smk_is_native', False)
+        if not is_native and hasattr(self.emissions_df, 'columns'):
+             is_native = ('ROW' in self.emissions_df.columns and 'COL' in self.emissions_df.columns)
+             
         mode = (plot_by_mode if plot_by_mode is not None else (self.plot_by_var.get().lower() if self.plot_by_var else 'auto'))
+        
+        # LAZY FETCH: Check if we need to fetch the pollutant into the main DF
+        if target_pol and hasattr(self.emissions_df, 'columns') and target_pol not in self.emissions_df.columns:
+            ds = getattr(self.emissions_df, 'attrs', {}).get('_smk_xr_ds')
+            if ds is not None:
+                try:
+                    _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
+                    from ncf_processing import read_ncf_emissions
+                    ncf_params = self.emissions_df.attrs.get('ncf_params', {})
+                    path = self.inputfile_path
+                    if path:
+                        if ';' in str(path): path = str(path).split(';')[0].strip()
+                        new_data = read_ncf_emissions(path, pollutants=[target_pol], xr_ds=ds, **ncf_params)
+                        if target_pol in new_data.columns:
+                            self.emissions_df[target_pol] = new_data[target_pol].values
+                            if target_pol not in self.units_map:
+                                v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
+                                self.units_map[target_pol] = v_meta.get('units', '')
+                except Exception as e:
+                    _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
+
+        # Shortcut for Native Grids
+        can_shortcut = has_geometry or (is_native and len(self.emissions_df) > 10000)
+        
+        if can_shortcut and mode in ['auto', 'grid']:
+            if target_pol and target_pol in getattr(self.emissions_df, 'columns', []):
+                res_df = self.emissions_df.copy()
+                for c_idx in ['ROW', 'COL']:
+                    if c_idx in res_df.columns:
+                        res_df[c_idx] = res_df[c_idx].fillna(-1).astype(int)
+
+                if fill_nan:
+                    res_df[target_pol] = res_df[target_pol].fillna(0)
+                
+                if 'GRID_RC' not in res_df.columns and 'ROW' in res_df.columns and 'COL' in res_df.columns:
+                    try: res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
+                    except: pass
+                
+                if isinstance(res_df, gpd.GeoDataFrame): return res_df
+                
+                if 'geometry' not in res_df.columns: res_df['geometry'] = [None] * len(res_df)
+                res_gdf = gpd.GeoDataFrame(res_df, geometry='geometry')
+                res_gdf.attrs = self.emissions_df.attrs.copy()
+                res_gdf.attrs['_smk_is_native'] = True
+               
+                if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
+                     if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
+                          res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
+                
+                if getattr(res_gdf, 'crs', None) is None:
+                    try:
+                        info = res_gdf.attrs.get('_smk_grid_info')
+                        if info and info.get('proj_str'):
+                            res_gdf.set_crs(info['proj_str'], inplace=True)
+                    except: pass
+                
+                return res_gdf
+
         base_gdf: Optional[gpd.GeoDataFrame] = None
         merge_on: Optional[str] = None
         geometry_tag = None
-        try:
-            source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type') if isinstance(self.emissions_df, pd.DataFrame) else None
-        except Exception:
-            source_type = None
-
+        
         sel_display = scc_selection if scc_selection is not None else (self.scc_select_var.get() if self.scc_select_var else 'All SCC')
         sel_code = ''
         code_map = scc_code_map if scc_code_map is not None else self._scc_display_to_code
         if code_map:
-            try:
-                sel_code = code_map.get(sel_display, '') or ''
-            except Exception:
-                sel_code = ''
-        use_scc_filter = bool(self._has_scc_cols and sel_code)
+            try: sel_code = code_map.get(sel_display, '') or ''
+            except Exception: sel_code = ''
+        
+        has_scc_cols = any(c.lower() in SCC_COLS for c in self.emissions_df.columns)
+        use_scc_filter = bool(has_scc_cols and sel_code)
 
         if mode == 'grid':
             if self.grid_gdf is None:
-                _do_notify('WARNING', 'Grid not loaded', 'Select a GRIDDESC and Grid Name first to build the grid geometry.')
+                _do_notify('WARNING', 'Grid not loaded', 'Select a GRIDDESC and Grid Name first.')
                 raise ValueError("Handled")
-            self._ensure_ff10_grid_mapping(notify_success=False)
+            
+            if not is_native: self._ensure_ff10_grid_mapping(notify_success=False)
+            else:
+                if 'GRID_RC' not in self.emissions_df.columns and 'ROW' in self.emissions_df.columns:
+                    try: self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
+                    except: pass
             base_gdf = self.grid_gdf
             merge_on = 'GRID_RC'
             geometry_tag = 'grid'
         elif mode == 'county':
             if self.counties_gdf is None:
-                _do_notify('WARNING', 'Counties not loaded', 'Load a counties shapefile or use the online counties option.')
-                raise ValueError("Handled")
-            base_gdf = self.counties_gdf
-            merge_on = 'FIPS'
-            geometry_tag = 'county'
-        else:
+                if self.grid_gdf is not None:
+                    _do_notify('INFO', 'Geo Fallback', 'Counties still loading; using grid view.')
+                    base_gdf = self.grid_gdf
+                    merge_on = 'GRID_RC'
+                    geometry_tag = 'grid'
+                    if not is_native: self._ensure_ff10_grid_mapping(notify_success=False)
+                else:
+                    _do_notify('WARNING', 'Counties not loaded', 'Load a counties shapefile first.')
+                    raise ValueError("Handled")
+            else:
+                base_gdf = self.counties_gdf
+                merge_on = 'FIPS'
+                geometry_tag = 'county'
+        else: # auto
             if self.grid_gdf is not None:
                 if 'GRID_RC' not in getattr(self.emissions_df, 'columns', []):
-                    self._ensure_ff10_grid_mapping(notify_success=False)
+                    if not is_native: self._ensure_ff10_grid_mapping(notify_success=False)
+                    else:
+                        if 'ROW' in self.emissions_df.columns:
+                             try: self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
+                             except: pass
+                             
                 if 'GRID_RC' in getattr(self.emissions_df, 'columns', []):
                     base_gdf = self.grid_gdf
                     merge_on = 'GRID_RC'
@@ -1931,280 +2145,111 @@ class EmissionGUI:
             if base_gdf is None and self.counties_gdf is not None:
                 base_gdf = self.counties_gdf
                 merge_on = 'FIPS'
-                if not merge_on or merge_on.lower() not in {c.lower() for c in self.emissions_df.columns}:
-                    merge_on = 'FIPS'
                 geometry_tag = 'county'
             if base_gdf is None:
-                _do_notify('WARNING', 'No suitable geometry', 'Could not find a suitable shapefile (Counties or Grid) for the loaded emissions data.')
+                _do_notify('WARNING', 'No geometry', 'Could not find a suitable shapefile for plotting.')
                 raise ValueError("Handled")
 
         if merge_on and isinstance(base_gdf, gpd.GeoDataFrame):
             if merge_on not in base_gdf.columns:
-                if merge_on.lower() == 'region_cd' and 'FIPS' in base_gdf.columns:
-                    try:
+                if merge_on == 'FIPS':
+                    col = next((c for c in ['GEOID', 'region_cd', 'FIPS'] if c in base_gdf.columns), None)
+                    if col:
                         base_gdf = base_gdf.copy()
-                        base_gdf['region_cd'] = base_gdf['FIPS']
-                    except Exception:
-                        pass
+                        base_gdf['FIPS'] = base_gdf[col]
+                    else:
+                         _do_notify('WARNING', 'Geometry Missing FIPS', "Layer lacks 'FIPS', 'GEOID', or 'region_cd'.")
+                         raise ValueError("Handled")
                 else:
-                    _do_notify('WARNING', 'Geometry Missing Column', f"Selected geometry layer lacks '{merge_on}' column.")
+                    _do_notify('WARNING', 'Geometry Missing Column', f"Layer lacks '{merge_on}'.")
                     raise ValueError("Handled")
 
         pol_tuple = tuple(self.pollutants or [])
-        if not pol_tuple:
-            try:
-                pol_tuple = tuple(detect_pollutants(self.emissions_df))
-            except Exception:
-                pol_tuple = ()
-
         cache_key = (
             geometry_tag or mode,
             merge_on or '',
-            id(base_gdf) if base_gdf is not None else 0,
-            id(self.emissions_df) if isinstance(self.emissions_df, pd.DataFrame) else 0,
-            id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
+            id(base_gdf),
+            id(self.emissions_df),
+            tuple(self.emissions_df.columns) if hasattr(self.emissions_df, 'columns') else (),
+            id(self.raw_df),
             sel_code if use_scc_filter else '',
             pol_tuple,
-            pollutant or '',
-            getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get(),
-            getattr(self, 'fill_nan_arg', None),
-            # Filter overlay state
-            getattr(self, 'filter_overlay_var', None) and self.filter_overlay_var.get(),
-            id(self.overlay_gdf) if getattr(self, 'overlay_gdf', None) is not None else 0
+            target_pol if fill_nan else '',
+            fill_nan,
+            self.filter_overlay_var.get() if hasattr(self, 'filter_overlay_var') else 'False',
+            id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0
         )
+        
         cached = self._merged_cache.get(cache_key)
-        if cached is not None:
-            cached_merged, cached_prepared, cached_key = cached
-            try:
-                merged_view = cached_merged.copy()
-            except Exception:
-                merged_view = cached_merged
-            try:
-                if cached_prepared is not None:
-                    merged_view.attrs['__prepared_emis'] = cached_prepared
-            except Exception:
-                pass
-            try:
-                if cached_key:
-                    merged_view.attrs['__merge_key'] = cached_key
-            except Exception:
-                pass
-            return merged_view
+        if cached is not None: return cached[0].copy()
 
-        emis_for_merge = self.emissions_df if isinstance(self.emissions_df, pd.DataFrame) else None
-        if emis_for_merge is None:
-            _do_notify('ERROR', 'No Emissions Data', 'Emissions dataset is not loaded or invalid.')
-            return None
+        emis_for_merge = self.emissions_df.copy() if isinstance(self.emissions_df, pd.DataFrame) else None
+        if emis_for_merge is None: return None
 
-        # ON-DEMAND LAZY NETCDF FETCH:
-        # If the requested pollutant is in the NetCDF variables but not in the DataFrame yet
-        target_pol = pollutant if pollutant else (self.pollutant_var.get() if hasattr(self, 'pollutant_var') else None)
-        if target_pol and target_pol not in emis_for_merge.columns:
-                ds = emis_for_merge.attrs.get('_smk_xr_ds')
-                if ds is not None:
-                    _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
-                    try:
-                        from ncf_processing import read_ncf_emissions
-                        ncf_params = emis_for_merge.attrs.get('ncf_params', {})
-                        # Re-read just this pollutant using the cached xarray handle
-                        new_data = read_ncf_emissions(
-                            self.inputfile_path, 
-                            pollutants=[target_pol], 
-                            xr_ds=ds, 
-                            **ncf_params
-                        )
-                        if target_pol in new_data.columns:
-                            # Cache it in the main dataframe so we don't fetch it again
-                            emis_for_merge[target_pol] = new_data[target_pol].values
-                            # Also update units_map if missing
-                            if target_pol not in self.units_map:
-                                v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
-                                self.units_map[target_pol] = v_meta.get('units', '')
-                    except Exception as e:
-                        _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
+        # FIPS normalization
+        if geometry_tag == 'county' and merge_on == 'FIPS':
+            m_col = 'FIPS' if 'FIPS' in emis_for_merge.columns else next((c for c in emis_for_merge.columns if c.lower() == 'region_cd'), None)
+            if m_col:
+                s_reg = emis_for_merge[m_col].astype(str).str.strip().str.zfill(5)
+                emis_for_merge['FIPS'] = s_reg.apply(lambda x: x[1:] if len(x) == 6 and (x.startswith('0') or x.startswith('1')) else x)
+            if base_gdf is not None and 'FIPS' in base_gdf.columns:
+                 base_gdf = base_gdf.copy()
+                 s_geom = base_gdf['FIPS'].astype(str).str.strip().str.zfill(5)
+                 base_gdf['FIPS'] = s_geom.apply(lambda x: x[1:] if len(x) == 6 and x.startswith('0') else x)
 
-        raw_df_for_scc = None
-        if use_scc_filter and isinstance(self.raw_df, pd.DataFrame):
-            cmap = {c.lower(): c for c in self.raw_df.columns}
-            scc_col = cmap.get('scc')
-            desc_col = cmap.get('scc description') or cmap.get('scc_description')
-            if scc_col and scc_col in self.raw_df.columns:
-                try:
-                    mask = self.raw_df[scc_col].astype(str) == sel_code
-                except Exception:
-                    mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            elif desc_col and desc_col in self.raw_df.columns:
-                try:
-                    mask = self.raw_df[desc_col].astype(str) == sel_code
-                except Exception:
-                    mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            else:
-                mask = pd.Series([False] * len(self.raw_df), index=self.raw_df.index)
-            raw_df_for_scc = self.raw_df.loc[mask].copy()
-            if raw_df_for_scc.empty:
-                _do_notify('WARNING', 'SCC filter matched 0 rows', f'No rows matched SCC: {sel_display}. Showing all SCC.')
-                raw_df_for_scc = None
-
+        # SCC Filtering & Re-aggregation
         if merge_on not in emis_for_merge.columns or use_scc_filter:
-            try:
-                raw_df = raw_df_for_scc if use_scc_filter else self.raw_df  # type: ignore[attr-defined]
-            except Exception:
-                raw_df = None
-            if isinstance(raw_df, pd.DataFrame) and merge_on in raw_df.columns:
-                pols = list(self.pollutants or detect_pollutants(raw_df))
+            raw_to_use = self.raw_df
+            if use_scc_filter and self.raw_df is not None:
+                scc_col = next((c for c in raw_to_use.columns if c.lower() in SCC_COLS), None)
+                if scc_col:
+                    raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
+            if isinstance(raw_to_use, pd.DataFrame) and merge_on in raw_to_use.columns:
+                pols = list(self.pollutants or detect_pollutants(raw_to_use))
                 if pols:
                     try:
-                        subset = raw_df[[merge_on] + pols]
-                        try:
-                            grouped = subset.groupby(merge_on, dropna=False, sort=False)
-                        except TypeError:
-                            grouped = subset.groupby(merge_on, sort=False)
-                        agg = grouped.sum(numeric_only=True).reset_index()
-                        try:
-                            agg.attrs = dict(getattr(emis_for_merge, 'attrs', {}))
-                        except Exception:
-                            pass
+                        agg = raw_to_use[[merge_on] + pols].groupby(merge_on, sort=False).sum(numeric_only=True).reset_index()
+                        agg.attrs = dict(getattr(emis_for_merge, 'attrs', {}))
                         emis_for_merge = agg
-                    except Exception:
-                        pass
+                    except: pass
 
         if merge_on not in emis_for_merge.columns:
-            if merge_on == 'GRID_RC':
-                # Enhanced Warning Diagnostics
-                msg_lines = ["Plot by Grid requires 'GRID_RC' column (implied X/Y logic)."]
-                
-                # Check for presence of row/col columns
-                cols_low = [c.lower() for c in emis_for_merge.columns]
-                has_row = any(x in cols_low for x in ['row', 'r', 'y', 'ycell', 'y_cell'])
-                has_col = any(x in cols_low for x in ['col', 'c', 'x', 'xcell', 'x_cell'])
-                
-                if has_row and has_col:
-                    msg_lines.append("Found potential Row/Col columns, but GRID_RC was not generated.")
-                    msg_lines.append("Check that your GRIDDESC file is loaded and the correct Grid Name is selected.")
-                else:
-                    msg_lines.append("Input data appears to be missing 'row'/'col' or 'x'/'y' identifier columns.")
-                
-                if self.grid_gdf is None or self.grid_gdf.empty:
-                    msg_lines.append("CRITICAL: No Grid Definition loaded. You must load a GRIDDESC file.")
-
-                _do_notify('WARNING', 'No GRID_RC in data', "\n".join(msg_lines))
-            else:
-                if source_type in ('ff10_point', 'ff10_nonpoint'):
-                    _do_notify('WARNING', 'No region_cd in data', 'FF10 data requires region_cd for county plots.')
-                else:
-                    _do_notify('WARNING', 'No FIPS in data', 'Plot by County requires emissions with FIPS codes.')
-            
-            # Signal to caller that warning is handled to avoid generic "Missing Data" msg
+            _do_notify('WARNING', 'Missing Join Column', f"Data lacks '{merge_on}'.")
             raise ValueError("Handled")
 
         try:
-            merged, prepared_emis = merge_emissions_with_geometry(
-                emis_for_merge,
-                base_gdf,
-                merge_on,
-                sort=False,
-                copy_geometry=False,
-            )
-            # Propagate attributes from emissions and geometry
+            from data_processing import merge_emissions_with_geometry
+            merged, prepared = merge_emissions_with_geometry(emis_for_merge, base_gdf, merge_on, sort=False, copy_geometry=False)
+            for base in ['ROW', 'COL', 'FIPS', 'region_cd']:
+                x_col, y_col = f"{base}_x", f"{base}_y"
+                if x_col in merged.columns and base not in merged.columns: merged[base] = merged[x_col]
+                elif y_col in merged.columns and base not in merged.columns: merged[base] = merged[y_col]
+                if base in merged.columns: merged.drop(columns=[c for c in [x_col, y_col] if c in merged.columns], inplace=True, errors='ignore')
+            
             if hasattr(merged, 'attrs'):
                 for src in [emis_for_merge, base_gdf]:
-                    if hasattr(src, 'attrs'):
-                        merged.attrs.update(src.attrs)
-        except Exception as exc:
-            _do_notify('ERROR', 'Geometry Merge Failed', str(exc), exc=exc)
+                    if hasattr(src, 'attrs'): merged.attrs.update(src.attrs)
+
+            if fill_nan:
+                pols = list(self.pollutants or [])
+                if target_pol and target_pol not in pols: pols.append(target_pol)
+                cols_to_fill = [c for c in pols if c in merged.columns]
+                if cols_to_fill: merged[cols_to_fill] = merged[cols_to_fill].fillna(0.0)
+
+            # Spatial Filtering
+            filter_mode = self.filter_overlay_var.get() if hasattr(self, 'filter_overlay_var') else 'False'
+            if filter_mode != 'False' and self.filter_gdf is not None:
+                try:
+                    from data_processing import apply_spatial_filter
+                    merged = apply_spatial_filter(merged, self.filter_gdf, filter_mode)
+                except: pass
+
+            self._merged_cache[cache_key] = (merged.copy(), prepared, merge_on)
+            return merged
+        except Exception as e:
+            _do_notify('ERROR', 'Merge Failed', f"{e}")
             return None
 
-        try:
-            matched_vals = prepared_emis[merge_on].dropna()
-            merged['__has_emissions'] = merged[merge_on].isin(matched_vals)
-        except Exception:
-            try:
-                merged['__has_emissions'] = merged[merge_on].notna()
-            except Exception:
-                merged['__has_emissions'] = False
-        
-        # Apply fill_nan if configured (for map regions with no data)
-        try:
-            fill_arg = getattr(self, 'fill_nan_arg', None)
-            fill_zero = getattr(self, 'fill_zero_var', None) and self.fill_zero_var.get()
-
-            do_fill = False
-            fill_val = 0.0
-
-            if fill_zero:
-                do_fill = True
-                fill_val = 0.0
-            elif fill_arg is not None:
-                if isinstance(fill_arg, bool) and not fill_arg:
-                    do_fill = False
-                elif isinstance(fill_arg, str) and str(fill_arg).lower() == 'false':
-                    do_fill = False
-                else:
-                    try:
-                        fill_val = float(fill_arg)
-                        do_fill = True
-                    except Exception:
-                        pass
-                
-            if do_fill:
-                # Identify pollutant columns to fill
-                pols = getattr(self, 'pollutants', [])
-                if pols:
-                    cols_to_fill = [c for c in pols if c in merged.columns]
-                    if cols_to_fill:
-                            merged[cols_to_fill] = merged[cols_to_fill].fillna(fill_val)
-        except Exception as e:
-            logging.warning(f"Error filling NaNs in merged geometry: {e}")
-
-        # Filter by Filter Shapefile if enabled (new logic with backward compatibility)
-        try:
-            filter_mode = None
-            filter_gdf_to_use = getattr(self, 'filter_gdf', None)
-            
-            # Check new filter_shapefile_opt first
-            if getattr(self, 'filter_overlay_var', None):
-                val = self.filter_overlay_var.get()
-                if isinstance(val, str):
-                    s = val.strip().lower()
-                    if s not in ('false', 'none', 'off', 'null', ''):
-                        filter_mode = 'intersect' if s == 'true' else s
-                elif isinstance(val, bool) and val:
-                    filter_mode = 'intersect'
-            
-            # Backward compatibility: if filter_gdf not set but filtering requested, use overlay_gdf
-            if filter_mode and filter_gdf_to_use is None:
-                ov_gdf = getattr(self, 'overlay_gdf', None)
-                if ov_gdf is not None:
-                    _do_notify('WARNING', 'Deprecated', 'Using overlay for filtering. Please use filter_shapefile instead.', popup=False)
-                    # Convert overlay list to combined GeoDataFrame for filtering
-                    if isinstance(ov_gdf, list):
-                        if ov_gdf:
-                            target_crs = ov_gdf[0].crs
-                            combined_parts = [ov_gdf[0]]
-                            for other in ov_gdf[1:]:
-                                if target_crs and other.crs and other.crs != target_crs:
-                                    other = other.to_crs(target_crs)
-                                combined_parts.append(other)
-                            filter_gdf_to_use = pd.concat(combined_parts, ignore_index=True)
-                    else:
-                        filter_gdf_to_use = ov_gdf
-            
-            # Apply filtering
-            if filter_mode and filter_gdf_to_use is not None:
-                _do_notify('INFO', 'Filtering', f'Filtering data by shapefile ({filter_mode})...', popup=False)
-                try:
-                    merged = apply_spatial_filter(merged, filter_gdf_to_use, filter_mode)
-                except Exception as e:
-                    _do_notify('WARNING', 'Filter Failed', f"Could not filter by shapefile ({filter_mode}): {e}")
-        except Exception as e:
-            _do_notify('WARNING', 'Filter Logic Error', str(e))
-
-        try:
-            cache_df = merged.copy()
-        except Exception:
-            cache_df = merged
-        self._merged_cache[cache_key] = (cache_df, prepared_emis, merge_on)
-        return merged
 
     def _setup_hover(self, merged: gpd.GeoDataFrame, pollutant: str, ax=None, lonlat_transformer: Optional[pyproj.Transformer] = None) -> None:
         """Enhance status bar to show pollutant at cursor and WGS84 lon/lat by overriding format_coord.
@@ -2432,7 +2477,16 @@ class EmissionGUI:
             fig.canvas.draw_idle()
             self._zoom_press = None
 
-            # Ignore tiny drags
+            # Identify click vs drag
+            dist = np.hypot(x1 - x0, y1 - y0)
+            if dist < (ax.get_xlim()[1] - ax.get_xlim()[0]) * 0.01:
+                 if btn == 1:
+                      self._handle_cell_click(x0, y0)
+                 fig.canvas.draw_idle()
+                 return
+
+            xmin, xmax = sorted([x0, x1])
+            ymin, ymax = sorted([y0, y1])
             if abs(xmax - xmin) < 1e-12 or abs(ymax - ymin) < 1e-12:
                 return
 
@@ -2625,6 +2679,9 @@ class EmissionGUI:
             self.root.after(0, self._enable_plot_btn)
 
     def _finalize_plot(self, merged, merged_plot, pollutant, plot_crs_info):
+        # Standardize for Click actions
+        self._merged_gdf = merged_plot
+
         import time
         _t_start = time.time()
         _t_last = [_t_start]  # Use list to avoid nonlocal issues
@@ -3251,10 +3308,12 @@ class EmissionGUI:
         if sel_disp and sel_disp != 'All SCC':
             title_lines.append(f"SCC: {sel_disp}")
         
+        title_holder = {'text': "\n".join(title_lines)}
+        
         # Apply Title to Axes (Fix for missing title)
         try:
             if title_lines:
-                local_ax.set_title("\n".join(title_lines), fontsize=12)
+                local_ax.set_title(title_holder['text'], fontsize=12)
         except Exception:
             pass
 
@@ -3808,115 +3867,8 @@ class EmissionGUI:
                 if event.inaxes != local_ax: return
                 if getattr(toolbar, 'mode', '') != '': return
                 if event.button != 1: return
-                 
-                try:
-                    from shapely.geometry import Point
-                    x, y = event.xdata, event.ydata
-                    pt = Point(x, y)
-                     
-                    target = None
-                    # OPTIMIZATION: High-speed grid math check
-                    info = getattr(merged_plot, 'attrs', {}).get('_smk_grid_info')
-                    if info and 'ROW' in merged_plot.columns:
-                        try:
-                            lx, ly = x, y
-                            # Transform click to native space if needed
-                            native_crs_str = info.get('proj_str')
-                            if native_crs_str:
-                                import pyproj
-                                native_crs = pyproj.CRS.from_user_input(native_crs_str)
-                                axes_crs = getattr(local_ax, '_smk_ax_crs', None) or getattr(merged_plot, 'crs', None)
-                                if axes_crs is not None and not native_crs.equals(axes_crs):
-                                    if not hasattr(local_ax, '_click_lookup_transformer'):
-                                        local_ax._click_lookup_transformer = pyproj.Transformer.from_crs(axes_crs, native_crs, always_xy=True)
-                                    lx, ly = local_ax._click_lookup_transformer.transform(x, y)
-                            
-                            c_look = int(np.floor((lx - info['xorig']) / info['xcell'])) + 1
-                            r_look = int(np.floor((ly - info['yorig']) / info['ycell'])) + 1
-                            
-                            # Lookup
-                            matches = merged_plot[(merged_plot['ROW'] == r_look) & (merged_plot['COL'] == c_look)]
-                            if not matches.empty:
-                                target = matches.iloc[0]
-                        except Exception: target = None
-                    
-                    if target is None:
-                        # FALLBACK: Spatial lookup
-                        if hasattr(merged_plot, 'sindex') and merged_plot.sindex:
-                            cands = list(merged_plot.sindex.intersection((x, y, x, y)))
-                            for idx in cands:
-                                row = merged_plot.iloc[idx]
-                                if row.geometry.contains(pt):
-                                    target = row
-                                    break
-                        else:
-                            matches = merged_plot[merged_plot.intersects(pt)]
-                            if not matches.empty:
-                                target = matches.iloc[0]
-                         
-                    if target is None: return
+                self._handle_cell_click(event.xdata, event.ydata)
 
-                    # Extract R/C
-                    r = None; c = None
-                    if 'ROW' in target: r = target['ROW']
-                    elif 'ROW_x' in target: r = target['ROW_x']
-                     
-                    if 'COL' in target: c = target['COL']
-                    elif 'COL_x' in target: c = target['COL_x']
-                     
-                    if (r is None or c is None) and 'GRID_RC' in target:
-                        try:
-                                parts = str(target['GRID_RC']).split('_')
-                                r = int(parts[0])
-                                c = int(parts[1])
-                        except: pass
-                          
-                    if r is None or c is None: return
-
-                    l_idx = 0; l_op = 'select'
-                    try: 
-                        if hasattr(self, 'ncf_layer_var'):
-                            l_sel = self.ncf_layer_var.get()
-                            if "Sum" in l_sel: l_op = 'sum'
-                            elif "Avg" in l_sel: l_op = 'mean'
-                            else:
-                                parts = l_sel.split()
-                                if len(parts) > 1 and parts[-1].isdigit():
-                                    l_idx = int(parts[-1]) - 1
-                    except: pass
-                     
-                    from ncf_processing import get_ncf_timeseries
-                    self._set_status(f"Extracting Cell ({r}, {c})...", level="INFO")
-                     
-                    attrs = getattr(merged_plot, 'attrs', {})
-                    effective_path = self.inputfile_path
-                    if 'proxy_ncf_path' in attrs:
-                        effective_path = attrs['proxy_ncf_path']
-                    if 'original_ncf_path' in attrs:
-                        effective_path = attrs['original_ncf_path']
-
-                    stack_groups_path = None
-                    if 'stack_groups_path' in attrs:
-                        stack_groups_path = attrs['stack_groups_path']
-                          
-                    res = get_ncf_timeseries(
-                        effective_path,
-                        pollutant,
-                        [int(r)-1],
-                        [int(c)-1],
-                        layer_idx=l_idx,
-                        layer_op=l_op,
-                        op='mean',
-                        stack_groups_path=stack_groups_path
-                    )
-                     
-                    if res:
-                        _display_ts_window(res, f"{pollutant} Time Series Cell ({r}, {c})")
-                        self._set_status(f"Plotted Cell {r}_{c}", level="INFO")
-                     
-                except Exception as e:
-                    logging.error(f"Click handler failed: {e}")
-             
             ts_click_handler = _on_click
 
         local_ax.set_title("\n".join(title_lines))
@@ -4178,100 +4130,67 @@ class EmissionGUI:
                 )
 
             def _update_stats_for_view():
-                if global_stats is None:
-                    stats_text.set_text(_format_stats(None))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                xlim = local_ax.get_xlim()
-                ylim = local_ax.get_ylim()
-                if base_view_holder['limits'] is None:
-                    base_view_holder['limits'] = (xlim, ylim)
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                if _view_matches_base(xlim, ylim):
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
+                xlim = local_ax.get_xlim(); ylim = local_ax.get_ylim()
+                x0, x1 = min(xlim), max(xlim)
+                y0, y1 = min(ylim), max(ylim)
+                
+                # Check for Base View
+                is_base = _view_matches_base(xlim, ylim)
+                
+                # Extract Visible Stats
                 try:
-                    from shapely.geometry import box as _box
-                except Exception:
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                if not (xlim[0] < xlim[1] and ylim[0] < ylim[1]):
-                    stats_text.set_text(_format_stats(global_stats))
-                    try:
-                        local_fig.canvas.draw_idle()
-                    except Exception:
-                        pass
-                    return
-                bbox_geom = _box(min(xlim), min(ylim), max(xlim), max(ylim))
-                try:
-                    sidx = gdf_for_stats.sindex
-                except Exception:
-                    sidx = None
-                if sidx is not None:
-                    try:
-                        idx = list(sidx.intersection(bbox_geom.bounds))
-                        sub = gdf_for_stats.iloc[idx]
-                    except Exception:
-                        sub = gdf_for_stats
-                else:
-                    sub = gdf_for_stats
-                try:
-                    sub = sub[sub.geometry.intersects(bbox_geom)]
-                except Exception:
-                    pass
-                subset_values = None
-                if (
-                    prepared_for_stats is not None
-                    and merge_key_name
-                    and hasattr(sub, 'columns')
-                    and merge_key_name in sub.columns
-                    and merge_key_name in prepared_for_stats.columns
-                ):
-                    try:
-                        keys = sub[merge_key_name]
-                        keys = keys[keys.notna()]
-                        if not keys.empty:
-                            subset_values = prepared_for_stats.loc[
-                                prepared_for_stats[merge_key_name].isin(keys.unique()),
-                                pol,
-                            ]
-                    except Exception:
-                        subset_values = None
-                if subset_values is None:
-                    if sub is not None and hasattr(sub, 'index'):
-                        try:
-                            subset_values = merged.loc[sub.index, pol]
-                        except Exception:
+                    vals = getattr(local_ax, '_smk_current_vals', None)
+                    if vals is None:
+                         for c in local_ax.collections:
+                             if hasattr(c, 'get_array') and c.get_array() is not None:
+                                 vals = c.get_array()
+                                 break
+                    if vals is None or vals.size == 0: return
+
+                    if is_base:
+                        filtered = vals
+                    else:
+                        from shapely.geometry import box
+                        view_box = box(x0, y0, x1, y1)
+                        filtered = vals
+                        
+                        # A. Grid Optimization 
+                        info = getattr(merged_plot, 'attrs', {}).get('_smk_grid_info')
+                        if info and 'ROW' in merged_plot.columns:
                             try:
-                                subset_values = sub.get(pol) if hasattr(sub, 'get') else None
-                            except Exception:
-                                subset_values = None
-                    elif sub is not None and hasattr(sub, 'get'):
-                        subset_values = sub.get(pol)
-                subset_stats = _calc_stats(subset_values)
-                if subset_stats is None:
-                    subset_stats = global_stats
-                stats_text.set_text(_format_stats(subset_stats))
-                try:
+                                col0 = int(np.floor((x0 - info['xorig']) / info['xcell']))
+                                col1 = int(np.ceil((x1 - info['xorig']) / info['xcell']))
+                                row0 = int(np.floor((y0 - info['yorig']) / info['ycell']))
+                                row1 = int(np.ceil((y1 - info['yorig']) / info['ycell']))
+                                
+                                mask = (merged_plot['ROW'] > row0) & (merged_plot['ROW'] <= row1+1) & \
+                                       (merged_plot['COL'] > col0) & (merged_plot['COL'] <= col1+1)
+                                filtered = vals[mask.values] if mask.size == vals.size else vals
+                            except: filtered = vals
+                        else:
+                            # B. Precise Spatial Slicing
+                            try:
+                                sidx = getattr(merged_plot, 'sindex', None)
+                                if sidx:
+                                    valid_idxs = list(sidx.intersection(view_box.bounds))
+                                    if len(valid_idxs) > 5000:
+                                        filtered = vals[valid_idxs]
+                                    else:
+                                        sub = merged_plot.iloc[valid_idxs]
+                                        precise = sub.geometry.intersects(view_box)
+                                        filtered = vals[np.array(valid_idxs)[precise.values]]
+                            except: filtered = vals
+
+                    # Calculate Stats
+                    clean = filtered[~np.isnan(filtered)] if filtered.size > 0 else np.array([])
+                    stats_t = (float(clean.min()), float(clean.mean()), float(clean.max()), float(clean.sum())) if clean.size > 0 else None
+                    
+                    txt = _format_stats(stats_t)
+                    base = title_holder.get('text', "")
+                    local_ax.set_title(base + "\n" + txt, fontsize=12)
                     local_fig.canvas.draw_idle()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.debug(f"Stats update failed: {e}")
             # Connect to axis limit changes
             # Connect to axis limit changes
             plot_state['stats_cbids'] = []
@@ -4947,3 +4866,134 @@ class EmissionGUI:
             self._notify('INFO', 'Exported', f'Summary saved to {path}')
         except Exception as e:
             self._notify('ERROR', 'Export Error', f'Failed saving CSV: {e}', exc=e)
+
+    def _handle_cell_click(self, x, y):
+        """Handle click for Time Series extraction (Ported from gui.py)."""
+        if self._merged_gdf is None or 'ROW' not in self._merged_gdf.columns:
+            return
+
+        try:
+             # Identify cell
+             info = self._merged_gdf.attrs.get('_smk_grid_info')
+             if not info: return # Can't identify without grid info
+             
+             col_look = int(np.floor((x - info['xorig']) / info['xcell'])) + 1
+             row_look = int(np.floor((y - info['yorig']) / info['ycell'])) + 1
+             
+             logging.info(f"Click at ({x}, {y}) -> Cell ({row_look}, {col_look})")
+             
+             # Check if ncf
+             is_ncf = False
+             try:
+                 # Check if the plot source is NetCDF
+                 attrs = getattr(self.emissions_df, 'attrs', {})
+                 src_type = attrs.get('source_type')
+                 is_ncf = (src_type == 'gridded_netcdf') or is_netcdf_file(self.inputfile_path) or ('proxy_ncf_path' in attrs)
+             except: pass
+             
+             if not is_ncf: return
+             
+             self._notify("INFO", "Extracting TS", f"Extracting Time Series for Cell ({row_look}, {col_look})...")
+             
+             # Layer/Op (defaults to Layer 1)
+             l_idx = 0; l_op = 'select'
+             
+             # Trigger extraction (Tkinter after equivalent of QTimer.singleShot(0, ...))
+             self.root.after(1, lambda: self._exec_ts_plot(row_look, col_look, l_idx, l_op))
+             
+        except Exception as e:
+             logging.error(f"Click handler error: {e}")
+
+    def _exec_ts_plot(self, r, c, l_idx, l_op):
+         try:
+             # Run extraction
+             from ncf_processing import get_ncf_timeseries
+             sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
+             
+             # Get current pollutant
+             pol = self.cmb_pollutant.get() if hasattr(self, 'cmb_pollutant') else ''
+             
+             res = get_ncf_timeseries(
+                self.inputfile_path,
+                pol,
+                [r-1], [c-1],
+                layer_idx=l_idx, layer_op=l_op, op='mean',
+                stack_groups_path=sg_path
+             )
+             
+             if res:
+                 self._show_ts_window(res, f"Cell ({r}, {c})")
+                 self._notify("INFO", "TS Success", f"Plotted Time Series for Cell ({r}, {c})")
+             else:
+                 self._notify("WARNING", "No Data", "No time-series data found for this cell.")
+         except Exception as e:
+             self._notify("ERROR", "TS Failed", f"Extraction failed: {e}")
+
+    def _show_ts_window(self, data, title):
+        try:
+             pol = self.cmb_pollutant.get() if hasattr(self, 'cmb_pollutant') else ''
+             unit = self.units_map.get(pol, "") if hasattr(self, 'units_map') else ""
+             TimeSeriesPlotWindow(data, title, pol, unit, self.root)
+        except Exception as e:
+            logging.error(f"TS Window error: {e}")
+
+class TimeSeriesPlotWindow:
+    def __init__(self, data, title, pollutant, unit, parent=None):
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"Time Series - {title}")
+        self.win.geometry("800x500")
+        self.pollutant = pollutant
+        self.unit = unit
+        
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+        self.figure = Figure(figsize=(8, 5), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.win)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.win)
+        self.toolbar.update()
+        
+        self.toolbar.pack(side='top', fill='x')
+        self.canvas.get_tk_widget().pack(side='top', fill='both', expand=True)
+        
+        self.plot_data(data)
+        
+    def plot_data(self, data):
+        ax = self.figure.add_subplot(111)
+        times = data.get('times', [])
+        vals = data.get('values', [])
+        
+        try:
+            if times and isinstance(times[0], str):
+                try: times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
+                except: times = [pd.to_datetime(t) for t in times]
+        except: pass
+
+        if isinstance(vals, dict):
+            v_len = len(list(vals.values())[0]) if vals else 0
+            if len(times) != v_len: times = range(v_len)
+            for label, series in vals.items():
+                lw = 2.5 if label == 'Total' else 1.0
+                alpha = 1.0 if label == 'Total' else 0.6
+                ms = 4 if label == 'Total' else 2
+                ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+            if len(vals) < 25: ax.legend(fontsize='small', loc='upper right')
+        else:
+            if isinstance(vals, list) and len(vals) > 0 and isinstance(vals[0], (list, np.ndarray)):
+                 vals = vals[0]
+            if len(times) != len(vals): times = range(len(vals))
+            ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
+
+        u_str = str(self.unit or '').strip()
+        y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+        ax.set_ylabel(y_lbl)
+        ax.set_xlabel("Time Step")
+        ax.grid(True, linestyle='--', alpha=0.7)
+        
+        import matplotlib.dates as mdates
+        if len(times) > 0:
+             try:
+                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                 self.figure.autofmt_xdate()
+             except: pass
+        self.canvas.draw()

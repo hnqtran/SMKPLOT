@@ -19,6 +19,7 @@
 import os, sys
 import re
 import warnings
+from functools import lru_cache
 
 _CLEAN_NAME_QUOTE_RE = re.compile(r"['`,]")
 _CLEAN_NAME_WHITESPACE_RE = re.compile(r"\s+")

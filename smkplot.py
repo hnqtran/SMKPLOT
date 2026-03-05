@@ -188,7 +188,7 @@ def parse_args():
     ap.add_argument('--fill-nan', default=None, help='Value to fill missing data with (e.g. 0.0). Applies to both missing emission values and empty map regions (map holes).')
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
-    ap.add_argument('--gui', choices=['qt', 'tk', 'auto'], default='auto', help='GUI toolkit to use: qt, tk or auto (default).')
+    ap.add_argument('--gui', choices=['native', 'tk', 'auto'], default='auto', help='GUI toolkit to use: native (Qt), tk or auto (default).')
 
     args = ap.parse_args()
 
@@ -310,9 +310,9 @@ def main():
     has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
     
     # Selection of engine
-    # 'qt' -> gui_qt.py (Qt Compatibility)
+    # 'native' -> gui.py (Native Qt)
     # 'tk' -> gui_tk.py (Tkinter)
-    # 'auto' -> Try gui.py (Native) -> gui_qt.py -> gui_tk.py
+    # 'auto' -> Try gui.py (Native) -> gui_tk.py
 
     requested_mode = args.gui or 'auto'
     target_impl = None
@@ -326,24 +326,16 @@ def main():
             target_impl = 'native'
             logging.info("Auto-selected: Native Qt GUI (gui.py)")
         except (ImportError, TypeError):
-            # Priority 2: Qt Compatibility (gui_qt.py) 
-            try:
-                try: import PySide6
-                except ImportError: import PyQt5
-                import gui_qt
-                target_impl = 'qt_shim'
-                logging.info("Auto-selected: Qt Compatibility GUI (gui_qt.py)")
-            except (ImportError, TypeError):
-                 # Priority 3: Tkinter
-                 try:
-                     import tkinter
-                     target_impl = 'tk'
-                     logging.info("Auto-selected: Tkinter GUI (gui_tk.py)")
-                 except (ImportError, TypeError):
-                     target_impl = None
-                     logging.warning("No GUI libraries found.")
-    elif requested_mode == 'qt':
-        target_impl = 'qt_shim'
+             # Priority 2: Tkinter
+             try:
+                 import tkinter
+                 target_impl = 'tk'
+                 logging.info("Auto-selected: Tkinter GUI (gui_tk.py)")
+             except (ImportError, TypeError):
+                 target_impl = None
+                 logging.warning("No GUI libraries found.")
+    elif requested_mode in ['qt', 'native']:
+        target_impl = 'native'
     elif requested_mode == 'tk':
          target_impl = 'tk'
     
@@ -352,7 +344,7 @@ def main():
     if not has_display:
         # One last attempt to see if we can connect to a display (might be needed for some X11 forwarding)
         try:
-            if target_impl in ['native', 'qt_shim']:
+            if target_impl == 'native':
                 from PySide6.QtWidgets import QApplication
                 app = QApplication.instance() or QApplication([sys.argv[0]])
                 has_display = True
@@ -374,6 +366,7 @@ def main():
         return _batch_mode(args)
 
     # GUI path
+    app = None
     try:
         # Native PySide6 Dispatch (gui.py)
         if target_impl == 'native':
@@ -407,49 +400,14 @@ def main():
                 logging.exception(f"Native Qt Runtime Error: {e}")
                 return 1
 
-        # Qt Compatibility Dispatch (gui_qt.py)
-        elif target_impl == 'qt_shim':
-            logging.info("Launching Qt Compatibility GUI (gui_qt.py)...")
-            try:
-                try:
-                    from PySide6.QtWidgets import QApplication
-                    from PySide6.QtGui import QFont
-                except ImportError:
-                    from PyQt5.QtWidgets import QApplication
-                    from PyQt5.QtGui import QFont
-                from gui_qt import EmissionGUI as QtGUI, tk as qt_tk
-                
-                app = QApplication.instance() or QApplication(sys.argv)
-                try:
-                    font = QFont()
-                    font.setPointSize(10)
-                    app.setFont(font)
-                except: pass
-                
-                root = qt_tk.Tk() 
-                app_gui = QtGUI(
-                    root,
-                    args.filepath,
-                    args.county_shapefile,
-                    emissions_delim=args.delim,
-                    cli_args=args,
-                    app_version=SMKPLOT_VERSION
-                )
-                root.show()
-                sys.exit(app.exec())
-            except ImportError as ie:
-                 logging.error(f"Qt Launch Failed: {ie}")
-                 return 1
-            except Exception as e:
-                 logging.error(f"Qt Runtime Error: {e}")
-                 import traceback
-                 traceback.print_exc()
-                 return 1
-
         # Tkinter Dispatch (gui_tk.py)
-        import tkinter as tk  # re-import safe
-        from gui_tk import EmissionGUI  # Lazy import
-        root = tk.Tk()
+        try:
+            import tkinter as tk  # re-import safe
+            from gui_tk import EmissionGUI  # Lazy import
+            root = tk.Tk()
+        except ImportError:
+            logging.error("Tkinter library not found; cannot launch GUI.")
+            raise  # bubble up to the global catch-all below for batch fallback
         app = EmissionGUI(
             root,
             args.filepath,
@@ -466,14 +424,18 @@ def main():
         from batch import _batch_mode  # Lazy import
         return _batch_mode(args)
     selected_pollutant = args.pollutant_first or args.pollutant
-    if selected_pollutant:
+    if app is not None and selected_pollutant:
         # Preselect pollutant if provided and present
         def _set_pol():
-            if app.pollutants and selected_pollutant in app.pollutants:
-                app.pollutant_var.set(selected_pollutant)
+            if hasattr(app, 'pollutants') and app.pollutants and selected_pollutant in app.pollutants:
+                if hasattr(app, 'pollutant_var'):
+                    app.pollutant_var.set(selected_pollutant)
         root.after(500, _set_pol)
-    root.mainloop()
-    return 0
+    
+    if app is not None:
+        root.mainloop()
+        return 0
+    return 1
 
 
 if __name__ == '__main__':

@@ -605,6 +605,91 @@ class DetailedStatsWindow(QDialog):
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
 
+class MultiSelectionDialog(QDialog):
+    """Searchable dialog for selecting multiple items with checkboxes."""
+    def __init__(self, title, items, selected=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(500, 600)
+        self.selected = list(selected or [])
+        
+        layout = QVBoxLayout(self)
+        
+        # Search Box
+        search_layout = QHBoxLayout()
+        self.txt_search = QLineEdit()
+        self.txt_search.setPlaceholderText("Find items...")
+        self.txt_search.textChanged.connect(self._filter_items)
+        search_layout.addWidget(QLabel("Search:"))
+        search_layout.addWidget(self.txt_search)
+        layout.addLayout(search_layout)
+        
+        # List with checkboxes
+        self.list_widget = QListWidget()
+        self.items_data = items # Full list
+        self._populate_list(self.items_data)
+        layout.addWidget(self.list_widget)
+        
+        # Action Buttons
+        row_btns = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_all.clicked.connect(self._select_all)
+        btn_none = QPushButton("Clear All")
+        btn_none.clicked.connect(self._clear_all)
+        row_btns.addWidget(btn_all)
+        row_btns.addWidget(btn_none)
+        row_btns.addStretch()
+        layout.addLayout(row_btns)
+        
+        # Standard Dialog Buttons
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    def _populate_list(self, items):
+        self.list_widget.clear()
+        for it in items:
+            list_item = QtWidgets.QListWidgetItem(it)
+            list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)
+            if it in self.selected:
+                list_item.setCheckState(Qt.Checked)
+            else:
+                list_item.setCheckState(Qt.Unchecked)
+            self.list_widget.addItem(list_item)
+
+    def _filter_items(self, text):
+        query = text.lower().strip()
+        # Update current selected state from list BEFORE clearing
+        self._sync_selected()
+        
+        filtered = [it for it in self.items_data if query in it.lower()]
+        self._populate_list(filtered)
+
+    def _sync_selected(self):
+        """Update self.selected from current list widget states."""
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            text = item.text()
+            if item.checkState() == Qt.Checked:
+                if text not in self.selected: self.selected.append(text)
+            else:
+                if text in self.selected: self.selected.remove(text)
+
+    def _select_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(Qt.Checked)
+        self._sync_selected()
+
+    def _clear_all(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setCheckState(Qt.Unchecked)
+        self.selected = []
+
+    def get_selected(self):
+        self._sync_selected()
+        return self.selected
+
 class PlotWindow(QMainWindow):
     """Pop-out window for a specific plot."""
     def __init__(self, gdf, column, meta, parent=None):
@@ -793,6 +878,7 @@ class NativeEmissionGUI(QMainWindow):
         self.class_bins_var = "" 
         self._last_loaded_delim_state = None
         self._scc_display_to_code = {} # Mapping for display-to-code filtering
+        self.selected_sccs = [] # For multiple SCC selection
         self._data_collection = None # Matplotlib collection
         self._table_window = None # To hold reference to summary table window
         
@@ -820,185 +906,129 @@ class NativeEmissionGUI(QMainWindow):
         QTimer.singleShot(100, self._startup_load)
 
     def _apply_styles(self):
-        """Apply a high-contrast, polished theme that ensures readability."""
+        """Apply a high-contrast, premium 'Slate & Indigo' theme."""
         style = """
-            /* Base Styles */
+            /* Global Base */
             QWidget { 
-                font-family: 'Segoe UI', 'Roboto', 'Ubuntu', sans-serif; 
-                font-size: 11px; 
-                color: #212529; 
-                background: transparent;
+                font-family: 'Inter', 'Segoe UI', 'Roboto', sans-serif; 
+                font-size: 12px; 
+                color: #0F172A; 
+                background: #F8FAFC;
             }
             
             QMainWindow, QDialog, QMessageBox {
-                background-color: #f0f2f5;
+                background-color: #F8FAFC;
             }
 
-            /* Containers */
+            /* Group Box - Modern Panel Style */
             QGroupBox {
-                font-weight: bold; 
-                border: 1px solid #d1d5db;
-                border-radius: 6px; 
-                margin-top: 20px; 
+                font-weight: 700; 
+                border: 1px solid #E2E8F0;
+                border-radius: 8px; 
+                margin-top: 1.2em; 
                 padding-top: 15px;
-                background-color: #ffffff;
-                color: #374151;
+                background-color: #FFFFFF;
+                color: #1E293B;
             }
             QGroupBox::title {
                 subcontrol-origin: margin; 
-                left: 10px; 
-                padding: 0 5px; 
-                color: #3b82f6;
+                left: 12px; 
+                padding: 0 8px; 
+                color: #4F46E5;
             }
             
-            /* Inputs - Guaranteed Contrast */
+            /* Inputs - High Contrast */
             QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit {
-                background-color: #ffffff;
-                color: #111827;
-                border: 1px solid #d1d5db;
-                border-radius: 4px;
-                padding: 3px 5px;
-                min-height: 22px;
+                background-color: #FFFFFF;
+                color: #0F172A;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 28px;
             }
             QLineEdit:focus, QComboBox:focus { 
-                border: 1.5px solid #3b82f6; 
-                background-color: #fcfdfe;
+                border: 2px solid #6366F1; 
+                background-color: #F8FAFC;
             }
             
-            QComboBox {
-                combobox-popup: 0;
-            }
             QComboBox::drop-down { 
                 subcontrol-origin: padding;
                 subcontrol-position: top right;
-                width: 24px;
-                border-left: 1px solid #d1d5db;
-                background: #f1f5f9;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 6px solid #0f172a;
-                margin-top: 2px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #ffffff;
-                color: #111827;
-                selection-background-color: #3b82f6;
-                selection-color: #ffffff;
-                border: 1px solid #94a3b8;
-                outline: none;
-                min-width: 450px;
-            }
-            QListView::item {
-                padding: 6px;
-                border-bottom: 0.5px solid #f1f5f9;
-            }
-            QListView::item:hover {
-                background-color: #f1f5f9;
+                width: 28px;
+                border-left: 1px solid #E2E8F0;
             }
             
-            /* Scrollbars */
-            QScrollBar:vertical {
-                border: none;
-                background: #f1f5f9;
-                width: 16px;
-                margin: 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #475569;
-                min-height: 40px;
-                border-radius: 8px;
-                margin: 2px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background: #1e293b;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar:horizontal {
-                border: none;
-                background: #f1f5f9;
-                height: 10px;
-                margin: 0px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #cbd5e1;
-                min-width: 20px;
-                border-radius: 5px;
-                margin: 2px;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-
-            /* Buttons */
+            /* Buttons - Premium Feel */
             QPushButton {
-                background-color: #ffffff;
-                color: #374151;
-                border: 1px solid #d1d5db;
-                border-radius: 4px;
-                padding: 5px 12px;
-                font-weight: 500;
+                background-color: #FFFFFF;
+                color: #334155;
+                border: 1px solid #CBD5E1;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 600;
             }
-            QPushButton:hover { background-color: #f9fafb; border-color: #9ca3af; }
-            QPushButton:pressed { background-color: #f3f4f6; }
+            QPushButton:hover { 
+                background-color: #F1F5F9; 
+                border-color: #94A3B8; 
+                color: #0F172A;
+            }
             
             QPushButton#primaryBtn {
-                background-color: #2563eb;
-                color: #ffffff !important;
-                border: 1px solid #1e3a8a;
-                font-weight: bold;
-                font-size: 12px;
+                background-color: #4F46E5;
+                color: #FFFFFF !important;
+                border: 1px solid #4338CA;
             }
-            QPushButton#primaryBtn:hover { background-color: #1d4ed8; }
-            QPushButton#primaryBtn:disabled { background-color: #93c5fd; color: #f3f4f6; }
+            QPushButton#primaryBtn:hover { background-color: #4338CA; }
+            QPushButton#primaryBtn:pressed { background-color: #3730A3; }
+            QPushButton#primaryBtn:disabled { background-color: #E2E8F0; color: #94A3B8; }
 
-            /* Tabs */
+            /* Tabs - Clean & Minimal */
             QTabWidget::pane { 
-                border: 1px solid #d1d5db; 
+                border: 1px solid #E2E8F0; 
                 top: -1px; 
-                background: #ffffff; 
-                border-radius: 0 0 6px 6px; 
+                background: #FFFFFF; 
+                border-radius: 0 0 8px 8px; 
             }
             QTabBar::tab {
-                background: #e5e7eb; border: 1px solid #d1d5db;
-                padding: 6px 12px; margin-right: 1px;
-                border-top-left-radius: 4px; border-top-right-radius: 4px;
-                color: #4b5563;
+                background: #F1F5F9; 
+                border: 1px solid #E2E8F0;
+                padding: 10px 20px; 
+                margin-right: 2px;
+                border-top-left-radius: 6px; 
+                border-top-right-radius: 6px;
+                color: #64748B;
             }
             QTabBar::tab:selected { 
-                background: #ffffff; border-bottom-color: #ffffff; 
-                font-weight: bold; color: #2563eb; 
+                background: #FFFFFF; 
+                border-bottom-color: #FFFFFF; 
+                color: #4F46E5;
+                font-weight: 700;
             }
             
+            /* Scrollbars - Subtle */
+            QScrollBar:vertical {
+                border: none;
+                background: #F1F5F9;
+                width: 12px;
+            }
+            QScrollBar::handle:vertical {
+                background: #CBD5E1;
+                min-height: 30px;
+                border-radius: 6px;
+                margin: 2px;
+            }
+            QScrollBar::handle:vertical:hover { background: #94A3B8; }
+
             /* Logs & Progress */
-            QTextEdit#log_text { background-color: #ffffff; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; }
-            QProgressBar {
-                background-color: #f3f4f6; 
-                border: 1px solid #d1d5db;
-                border-radius: 10px; 
-                text-align: center; 
-                color: #1f2937;
-                font-weight: bold;
-                height: 18px;
-            }
-            QProgressBar::chunk { background-color: #3b82f6; border-radius: 8px; }
-            
+            QTextEdit#log_text { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px; }
+
             /* Status Bar */
             QStatusBar { 
-                background-color: #ffffff; 
-                border-top: 1px solid #e2e8f0; 
-                color: #475569; 
-                min-height: 28px;
+                background-color: #FFFFFF; 
+                border-top: 1px solid #E2E8F0; 
+                color: #64748B;
+                min-height: 32px;
             }
-            QStatusBar::item { border: none; }
-            QLabel#statusIcon { color: #10b981; font-size: 12px; font-weight: bold; margin-left: 8px; }
-            QLabel#statusMsg { font-weight: 500; margin-left: 4px; color: #1e293b; }
-            QLabel#statusStat { color: #64748b; font-size: 10px; padding: 0 12px; border-left: 1px solid #f1f5f9; font-weight: 500; }
-            QLabel#statusStat:hover { color: #3b82f6; }
         """
         self.setStyleSheet(style)
         if QApplication.instance():
@@ -1432,6 +1462,13 @@ class NativeEmissionGUI(QMainWindow):
         self.txt_scc_search.setMinimumWidth(60)
         self.txt_scc_search.textChanged.connect(self._filter_scc_list)
         scc_layout.addWidget(self.txt_scc_search, 1)
+        
+        self.btn_scc_multi = QPushButton("Multi")
+        self.btn_scc_multi.setFixedWidth(50)
+        self.btn_scc_multi.setToolTip("Select multiple SCCs from a searchable list")
+        self.btn_scc_multi.clicked.connect(self._open_scc_multi)
+        scc_layout.addWidget(self.btn_scc_multi)
+
         layout.addRow("SCC Filter:", scc_layout)
         
         if parent_layout: parent_layout.addWidget(group)
@@ -2573,9 +2610,11 @@ class NativeEmissionGUI(QMainWindow):
             except Exception as e:
                 logging.error(f"Failed to get NCF dims: {e}")
 
-        # Trigger initial filter column population
+        # Trigger initial filter column population - exclude pollutants
         if self.raw_df is not None:
-            raw_cols = sorted([str(c) for c in self.raw_df.columns])
+            # Exclude known pollutants from the generic filter list to reduce confusion
+            p_list = self.pollutants or []
+            raw_cols = sorted([str(c) for c in self.raw_df.columns if c not in p_list])
             self.cmb_filter_col.clear()
             self.cmb_filter_col.addItems(raw_cols)
             
@@ -3475,13 +3514,23 @@ class NativeEmissionGUI(QMainWindow):
             source_type = None
 
         sel_display = scc_selection if scc_selection is not None else self.cmb_scc.currentText()
-        sel_code = ''
+        sel_code = None # Changed from '' to handle lists
         code_map = scc_code_map if scc_code_map is not None else self._scc_display_to_code
-        if code_map:
-            try:
-                sel_code = code_map.get(sel_display, '') or ''
-            except Exception:
-                sel_code = ''
+        
+        if self.selected_sccs and scc_selection is None:
+            # Multi-mode active
+            codes = []
+            for it in self.selected_sccs:
+                 c = code_map.get(it)
+                 if c: codes.append(c)
+            sel_code = codes if codes else None
+        else:
+            # Single-mode or override
+            if code_map:
+                try:
+                    sel_code = code_map.get(sel_display, '') or ''
+                except Exception:
+                    sel_code = ''
         
         has_scc_cols = any(c.lower() in SCC_COLS for c in self.emissions_df.columns)
         use_scc_filter = bool(has_scc_cols and sel_code)
@@ -3574,13 +3623,18 @@ class NativeEmissionGUI(QMainWindow):
             id(base_gdf) if base_gdf is not None else 0,
             id(self.emissions_df) if isinstance(self.emissions_df, pd.DataFrame) else 0,
             tuple(self.emissions_df.columns) if hasattr(self.emissions_df, 'columns') else (),
-            id(self.raw_df) if isinstance(self.raw_df, pd.DataFrame) else 0,
+            tuple(self.raw_df.columns) if hasattr(self.raw_df, 'columns') else (),
+            tuple(self.selected_sccs) if self.selected_sccs else '',
             sel_code if use_scc_filter else '',
             pol_tuple,
             target_pol if fill_nan else '',
             fill_nan,
             self.cmb_filter_op.currentText() if hasattr(self, 'cmb_filter_op') else 'False',
-            id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0
+            id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0,
+            self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else '',
+            self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else '',
+            self.txt_range_min.text() if hasattr(self, 'txt_range_min') else '',
+            self.txt_range_max.text() if hasattr(self, 'txt_range_max') else ''
         )
         
         cached = self._merged_cache.get(cache_key)
@@ -3598,6 +3652,29 @@ class NativeEmissionGUI(QMainWindow):
 
         if emis_for_merge is None:
             return None
+
+        # --- Advanced Attribute Filtering ---
+        # Read filter settings from the Filter Tab widgets
+        f_col = self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else ''
+        f_vals_str = self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else ''
+        f_min = self.txt_range_min.text() if hasattr(self, 'txt_range_min') else ''
+        f_max = self.txt_range_max.text() if hasattr(self, 'txt_range_max') else ''
+        
+        def _apply_attr_filters(df):
+            if not isinstance(df, pd.DataFrame) or not f_col or f_col not in df.columns:
+                return df
+            df_res = df
+            if f_vals_str:
+                # Support comma or space separated list of discrete values
+                f_vals = [v.strip() for v in f_vals_str.replace(',', ' ').split() if v.strip()]
+                if f_vals:
+                    df_res = filter_dataframe_by_values(df_res, f_col, f_vals)
+            if f_min or f_max:
+                # Apply numerical range filter
+                df_res = filter_dataframe_by_range(df_res, f_col, f_min or None, f_max or None)
+            return df_res
+
+        emis_for_merge = _apply_attr_filters(emis_for_merge)
 
         # Lazy Fetch already handled at top of function
         
@@ -3640,7 +3717,14 @@ class NativeEmissionGUI(QMainWindow):
             if use_scc_filter and self.raw_df is not None:
                 scc_col = next((c for c in raw_to_use.columns if c.lower() in SCC_COLS), None)
                 if scc_col:
-                    raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
+                    if isinstance(sel_code, list):
+                        raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip().isin(sel_code)].copy()
+                    else:
+                        raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
+            
+            # Apply generic attribute filters to raw data if we are using it for aggregation
+            if raw_to_use is not None:
+                raw_to_use = _apply_attr_filters(raw_to_use)
             
             if isinstance(raw_to_use, pd.DataFrame) and merge_on in raw_to_use.columns:
                 pols = list(self.pollutants or detect_pollutants(raw_to_use))
@@ -4775,6 +4859,39 @@ class NativeEmissionGUI(QMainWindow):
 
         self.cmb_scc.addItems(filtered)
         self.cmb_scc.blockSignals(False)
+
+    def _open_scc_multi(self):
+        """Open the multi-selection dialog for SCC codes."""
+        if not hasattr(self, '_scc_full_list') or not self._scc_full_list:
+            # Try to capture from combo if post_load was skipped or partial
+            items = [self.cmb_scc.itemText(i) for i in range(self.cmb_scc.count())]
+            if not items or items == ["All SCC"]:
+                QMessageBox.information(self, "No SCCs", "Load emissions data first to populate the SCC list.")
+                return
+            self._scc_full_list = items
+            
+        dlg = MultiSelectionDialog("Select SCCs", self._scc_full_list, selected=self.selected_sccs, parent=self)
+        if dlg.exec():
+            self.selected_sccs = dlg.get_selected()
+            if self.selected_sccs:
+                # Update combo to show state
+                self.cmb_scc.blockSignals(True)
+                self.cmb_scc.clear()
+                self.cmb_scc.addItem(f"Multiple ({len(self.selected_sccs)} selected)")
+                self.cmb_scc.setCurrentIndex(0)
+                self.cmb_scc.setToolTip("\n".join(self.selected_sccs)) # Show selected in tooltip
+                self.cmb_scc.setEnabled(True)
+                self.cmb_scc.blockSignals(False)
+            else:
+                # Revert to standard
+                self.cmb_scc.blockSignals(True)
+                self.cmb_scc.clear()
+                self.cmb_scc.addItems(self._scc_full_list)
+                self.cmb_scc.setCurrentText("All SCC")
+                self.cmb_scc.setToolTip("")
+                self.cmb_scc.blockSignals(False)
+            
+            logging.info(f"Multi-SCC selection updated: {len(self.selected_sccs)} items.")
 
     def _filter_pollutant_list(self, text):
         """Filter the Pollutant ComboBox based on search text."""

@@ -17,11 +17,23 @@ echo "========================================================"
 echo "   SMKPLOT Environment Setup"
 echo "========================================================"
 
-# 1. Check for Python 3
+# 1. Check for Python 3.9+
 if ! command -v python3 &> /dev/null; then
     echo "ERROR: python3 is not installed or not in PATH."
     exit 1
 fi
+
+PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)
+MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)
+
+if [ "$MAJOR" -ne 3 ] || [ "$MINOR" -lt 8 ]; then
+    echo "ERROR: SMKPLOT requires Python 3.8 or higher."
+    echo "       Detected version: $PYTHON_VERSION"
+    echo "       Please use a newer Python version (e.g. 3.8, 3.9, 3.10, 3.11, 3.12)."
+    exit 1
+fi
+echo "      Confirmed Python $PYTHON_VERSION"
 
 # 2. Create Virtual Environment
 if [ ! -d "$VENV_DIR" ]; then
