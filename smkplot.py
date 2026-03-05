@@ -325,7 +325,7 @@ def main():
             import gui
             target_impl = 'native'
             logging.info("Auto-selected: Native Qt GUI (gui.py)")
-        except ImportError:
+        except (ImportError, TypeError):
             # Priority 2: Qt Compatibility (gui_qt.py) 
             try:
                 try: import PySide6
@@ -333,13 +333,13 @@ def main():
                 import gui_qt
                 target_impl = 'qt_shim'
                 logging.info("Auto-selected: Qt Compatibility GUI (gui_qt.py)")
-            except ImportError:
+            except (ImportError, TypeError):
                  # Priority 3: Tkinter
                  try:
                      import tkinter
                      target_impl = 'tk'
                      logging.info("Auto-selected: Tkinter GUI (gui_tk.py)")
-                 except ImportError:
+                 except (ImportError, TypeError):
                      target_impl = None
                      logging.warning("No GUI libraries found.")
     elif requested_mode == 'qt':

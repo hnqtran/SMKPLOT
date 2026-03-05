@@ -94,7 +94,7 @@ if QT_BINDING == "PySide6":
     try:
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
-    except ImportError:
+    except (ImportError, TypeError):
         from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
         from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 else:
@@ -102,7 +102,7 @@ else:
     try:
         from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
         from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-    except ImportError:
+    except (ImportError, TypeError):
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure

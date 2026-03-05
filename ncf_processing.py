@@ -169,9 +169,17 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
 
         # Read STACK_GROUPS
         logging.info(f"DEBUG: Reading STACK_GROUPS: {stack_groups_path}")
+        is_cartesian = False
         with netCDF4.Dataset(stack_groups_path) as nc_stack:
-            lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
-            lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            if 'LATITUDE' in nc_stack.variables and 'LONGITUDE' in nc_stack.variables:
+                lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
+                lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            elif 'xcoord' in nc_stack.variables and 'ycoord' in nc_stack.variables:
+                yy = np.array(nc_stack.variables['ycoord'][:]).flatten()
+                xx = np.array(nc_stack.variables['xcoord'][:]).flatten()
+                is_cartesian = True
+            else:
+                raise ValueError("STACK_GROUPS file must contain coordinates (LATITUDE/LONGITUDE or xcoord/ycoord).")
             
             # Check for spatial dimensions in STACK_GROUPS FILEDESC attribute
             if gi is not None and (gi['ncols'] == 1 or gi['nrows'] == 1):
@@ -186,12 +194,15 @@ def _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, grid_name):
                 else:
                     logging.warning(f"Inline file has 1D dimensions and STACK_GROUPS FILEDESC does not provide NCOLS3D/NROWS3D. Plotting may be incorrect.")
 
-        logging.info(f"DEBUG: Projecting {len(lats)} sources...")
+        logging.info(f"DEBUG: Mapping {len(xx if is_cartesian else lats)} sources...")
 
-    # Project
-    proj_crs = get_proj_object_from_info(gi)
-    proj = pyproj.Proj(proj_crs)
-    xx, yy = proj(lons, lats)
+    # Project if needed
+    if not is_cartesian:
+        proj_crs = get_proj_object_from_info(gi)
+        proj = pyproj.Proj(proj_crs)
+        xx, yy = proj(lons, lats)
+    
+    # xx, yy are now in meters relative to projection origin
     
     if gi['xcell'] == 0 or gi['ycell'] == 0:
         raise ValueError("Grid cell size is zero.")
@@ -280,12 +291,17 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                 raise ValueError(f"Could not determine grid parameters from INLN header or GRIDDESC for '{grid_name}'.")
 
         # Read STACK_GROUPS
+        is_cartesian = False
         with netCDF4.Dataset(stack_groups_path) as nc_stack:
-            if 'LATITUDE' not in nc_stack.variables or 'LONGITUDE' not in nc_stack.variables:
-                raise ValueError("STACK_GROUPS file must contain LATITUDE and LONGITUDE variables.")
-            
-            lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
-            lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            if 'LATITUDE' in nc_stack.variables and 'LONGITUDE' in nc_stack.variables:
+                lats = np.array(nc_stack.variables['LATITUDE'][:]).flatten()
+                lons = np.array(nc_stack.variables['LONGITUDE'][:]).flatten()
+            elif 'xcoord' in nc_stack.variables and 'ycoord' in nc_stack.variables:
+                yy = np.array(nc_stack.variables['ycoord'][:]).flatten()
+                xx = np.array(nc_stack.variables['xcoord'][:]).flatten()
+                is_cartesian = True
+            else:
+                raise ValueError("STACK_GROUPS file must contain coordinates (LATITUDE/LONGITUDE or xcoord/ycoord).")
             
             # Check for spatial dimensions in STACK_GROUPS FILEDESC attribute
             if gi is not None and (gi['ncols'] == 1 or gi['nrows'] == 1):
@@ -300,10 +316,13 @@ def process_inline_emissions(inln_path: str, stack_groups_path: str, griddesc_pa
                 else:
                     logging.warning(f"Inline file has 1D dimensions ({gi['ncols']}x{gi['nrows']}) and STACK_GROUPS FILEDESC does not provide NCOLS3D/NROWS3D.")
 
-        # Project
-        proj_crs = get_proj_object_from_info(gi)
-        proj = pyproj.Proj(proj_crs)
-        xx, yy = proj(lons, lats)
+        # Project if needed
+        if not is_cartesian:
+            proj_crs = get_proj_object_from_info(gi)
+            proj = pyproj.Proj(proj_crs)
+            xx, yy = proj(lons, lats)
+        
+        # xx, yy are now in meters relative to projection origin
         
         # Calculate Grid Indices (0-based)
         # Avoid division by zero if xcell/ycell are 0 (bad header)
@@ -776,6 +795,15 @@ def read_ncf_emissions(
             ncols = dims['COL'].size if 'COL' in dims else 0
             if (nrows == 1 and ncols > 1) or (ncols == 1 and nrows > 1):
                 is_inline_candidate = True
+                # Check for self-contained coordinates (CAMx style)
+                if 'xcoord' in ds.variables and 'ycoord' in ds.variables:
+                    if not stack_groups:
+                        stack_groups = ncf_path
+                        _notify('INFO', "Self-contained CAMx coordinates (xcoord/ycoord) detected.")
+                elif 'LATITUDE' in ds.variables and 'LONGITUDE' in ds.variables:
+                    if not stack_groups:
+                        stack_groups = ncf_path
+                        _notify('INFO', "Self-contained coordinates (LATITUDE/LONGITUDE) detected.")
     except Exception:
         pass
              
@@ -2001,16 +2029,33 @@ def read_inline_emissions_lazy(inln_path, stack_groups_path, pollutants, tstep_i
     valid_indices, v_rows, v_cols, gi = _get_inline_mapping(inln_path, stack_groups_path, griddesc_path, None)
     data_dict = {}
     with netCDF4.Dataset(inln_path) as nc_in:
+        # Determine Source Count from valid_indices/STACK_GROUPS
+        src_count = len(valid_indices) if valid_indices is not None else 0
+        # If we failed to get a count from mapping, we might need to infer it from the variable shapes
+        
         if pollutants is None:
-            # Only pick float/int vars with appropriate dimensions (contain source dim?)
-            # Heuristic: must not be TFLAG, and must have at least one dim that is NOT TSTEP/LAY/DATE-TIME?
-            # Or just exclude char.
+            # Only pick float/int vars with appropriate dimensions (contain source dim)
+            # We exclude standard metadata vars
+            excluded_vars = {'TFLAG', 'ETFLAG', 'SDATE', 'STIME', 'TSTEP', 'VAR'}
             pollutants = []
             for v in nc_in.variables:
-                if v == 'TFLAG': continue
-                if v not in nc_in.dimensions:
-                        if np.issubdtype(nc_in.variables[v].dtype, np.number):
-                            pollutants.append(v)
+                if v in excluded_vars: continue
+                var_obj = nc_in.variables[v]
+                if not np.issubdtype(var_obj.dtype, np.number): continue
+                
+                # Dynamic Check: Must have a dimension matching the stack count
+                # Point source files are 1D (excluding TSTEP/LAY), so we look for the source dim
+                if any(dim_size >= 1 for dim_size in var_obj.shape):
+                    # We check if the largest dimension (usually the source list) matches 
+                    # what we expect from STACK_GROUPS or coordinates.
+                    # Note: xcoord/ycoord size is the true source count
+                    if hasattr(nc_in, 'dimensions') and 'COL' in nc_in.dimensions:
+                         col_size = nc_in.dimensions['COL'].size
+                         if any(s == col_size for s in var_obj.shape):
+                             pollutants.append(v)
+                         continue
+                    
+                    pollutants.append(v)
         
         for pol in pollutants:
             if pol not in nc_in.variables: continue
@@ -2064,13 +2109,11 @@ def read_inline_emissions_lazy(inln_path, stack_groups_path, pollutants, tstep_i
             data = data.flatten()
             grid = np.zeros((gi['nrows'], gi['ncols']), dtype=np.float32)
             if valid_indices.size > 0:
+                # Boundary Safety Check
                 if valid_indices.max() >= data.size:
-                    logging.error(f"Lazy Read Mismatch: Data size {data.size} <= Max Index {valid_indices.max()}. Check STACK_GROUPS vs INLN file compatibility.")
-                    # Prevent crash, but result will be wrong/partial
-                    # subset = data[valid_indices[valid_indices < data.size]]
-                    # Actually better to raise or return empty to signal issue
-                    # But for now let it crash or filter?
-                    pass
+                    logging.error(f"Lazy Read Mismatch for '{pol}': Data size {data.size} is smaller than Max Index {valid_indices.max()}. Skipping variable.")
+                    continue
+                
                 subset = data[valid_indices]
                 np.add.at(grid, (v_rows, v_cols), subset)
             data_dict[pol] = grid.flatten()
