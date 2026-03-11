@@ -787,15 +787,21 @@ def read_ncf_emissions(
 
     # We can also detect inline by shape in the dataset
     is_inline_candidate = False
+    if stack_groups:
+        is_inline_candidate = True
+
     try:
         with netCDF4.Dataset(ncf_path, 'r') as ds:
             dims = ds.dimensions
             # Inline uses ROW/COL dim names but one of them is 1.
             nrows = dims['ROW'].size if 'ROW' in dims else 0
             ncols = dims['COL'].size if 'COL' in dims else 0
-            if (nrows == 1 and ncols > 1) or (ncols == 1 and nrows > 1):
+            
+            # Explicit string or shape detection
+            if (nrows == 1 and ncols > 1) or (ncols == 1 and nrows > 1) or ('inln_' in base_name):
                 is_inline_candidate = True
-                # Check for self-contained coordinates (CAMx style)
+                
+            if is_inline_candidate:
                 if 'xcoord' in ds.variables and 'ycoord' in ds.variables:
                     if not stack_groups:
                         stack_groups = ncf_path
