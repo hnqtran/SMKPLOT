@@ -956,13 +956,29 @@ def _batch_mode(args):
         try:
             if 'FIPS' in emis_agg.columns:
                 emis_agg = emis_agg.copy()
-                emis_agg['FIPS'] = coerce_merge_key(emis_agg['FIPS'], pad=6)
+                # Safety net: re-normalize FIPS in case 12-digit format wasn't caught by get_emis_fips
+                fips_str = emis_agg['FIPS'].astype(str).str.strip()
+                emis_agg['FIPS'] = fips_str.apply(lambda x: x[-6:] if len(x) > 6 else x).str.zfill(6)
         except Exception:
             logging.exception("Failed to normalize emissions FIPS prior to merge")
         try:
             if 'FIPS' in base_geom.columns:
                 base_geom = base_geom.copy()
-                base_geom['FIPS'] = coerce_merge_key(base_geom['FIPS'], pad=6)
+                # Normalize geometry FIPS to 6-digit format to match emissions data
+                # Handle 12-digit codes, extract last 6, or prepend 0 to 5-digit standard US FIPS
+                fips_str = base_geom['FIPS'].astype(str).str.strip()
+                def normalize_geom_fips(x):
+                    x_str = str(x).strip()
+                    # If 12+ digits, extract last 6
+                    if len(x_str) > 6:
+                        return x_str[-6:]
+                    # If 5 digits, prepend '0' for 6-digit format
+                    elif len(x_str) == 5:
+                        return '0' + x_str
+                    # Otherwise use as-is or pad to 6
+                    else:
+                        return x_str.zfill(6)
+                base_geom['FIPS'] = fips_str.apply(normalize_geom_fips)
         except Exception:
             logging.exception("Failed to normalize geometry FIPS prior to merge")
 

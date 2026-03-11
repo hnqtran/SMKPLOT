@@ -829,6 +829,7 @@ class NativeEmissionGUI(QMainWindow):
         self._merged_gdf = None
         self._hover_enabled = True
         self._last_stats_calc = None
+        self._loading_active = False
         
         # Syncing variables with gui_qt.py for higher fidelity logic replication
         self._loader_messages = []
@@ -1804,10 +1805,28 @@ class NativeEmissionGUI(QMainWindow):
                 self.txt_custom_delim.setText(delim)
         
         # 2. Filtering
-        # NOTE: filter_col / filter_val are data-loading filters applied during
-        # read_inputfile() → read_ff10(). They must NOT be copied into the GUI's
-        # Filter tab, which is for ad-hoc post-load filtering. Doing so would
-        # cause double-filtering and crash on Categorical columns.
+        # Data-loading filters (applied during read_inputfile)
+        f_col = cli.get('filter_col')
+        if f_col:
+            if hasattr(self, 'cmb_filter_col'):
+                self.cmb_filter_col.setCurrentText(str(f_col))
+        
+        f_val = cli.get('filter_val') or cli.get('filter_values')
+        if f_val:
+            if hasattr(self, 'txt_filter_val'):
+                if isinstance(f_val, list):
+                    self.txt_filter_val.setText(", ".join(map(str, f_val)))
+                else:
+                    self.txt_filter_val.setText(str(f_val))
+        
+        f_start = cli.get('filter_start')
+        if f_start and hasattr(self, 'txt_range_min'):
+            self.txt_range_min.setText(str(f_start))
+        
+        f_end = cli.get('filter_end')
+        if f_end and hasattr(self, 'txt_range_max'):
+            self.txt_range_max.setText(str(f_end))
+
         if cli.get('filtered_by_op') or cli.get('filter_shapefile_opt'): 
             self.cmb_filter_op.setCurrentText(str(cli.get('filtered_by_op') or cli.get('filter_shapefile_opt')))
         
@@ -1895,6 +1914,11 @@ class NativeEmissionGUI(QMainWindow):
 
     def load_input_file(self, file_paths):
         """Orchestrate the loading of input files."""
+        if hasattr(self, '_loading_active') and self._loading_active:
+             logging.warning("Load already in progress. Ignoring redundant call.")
+             return
+        self._loading_active = True
+        
         if isinstance(file_paths, str):
             file_paths = [file_paths]
             
@@ -1923,11 +1947,29 @@ class NativeEmissionGUI(QMainWindow):
         is_nc = is_netcdf_file(file_paths[0])
         ncf_params = self._get_ncf_params() if is_nc else {}
 
+        # Capture Filter Args (Priority: 1. Current UI State, 2. Initial Config)
+        f_col = self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else ""
+        if f_col in ("", "Select Column"):
+             f_col = getattr(self, '_json_arguments', {}).get('filter_col')
+        
+        f_val_txt = self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else ""
+        if f_val_txt:
+            # Parse possible comma-separated values from the UI text box
+            f_val = [x.strip() for x in f_val_txt.split(",") if x.strip()]
+        else:
+            f_val = getattr(self, '_json_arguments', {}).get('filter_val') or getattr(self, '_json_arguments', {}).get('filter_values')
+
+        f_start = self.txt_range_min.text() if hasattr(self, 'txt_range_min') else ""
+        if not f_start: f_start = getattr(self, '_json_arguments', {}).get('filter_start')
+        
+        f_end = self.txt_range_max.text() if hasattr(self, 'txt_range_max') else ""
+        if not f_end: f_end = getattr(self, '_json_arguments', {}).get('filter_end')
+        
         # Start Worker Thread
         self._start_progress("Loading data...")
         
         # Prepare background task
-        worker = Worker(self._task_load_input, file_paths, delim, skip, comment, ncf_params)
+        worker = Worker(self._task_load_input, file_paths, delim, skip, comment, ncf_params, f_col, f_start, f_end, f_val)
         worker.signals.result.connect(self._on_input_load_finished)
         worker.signals.error.connect(self._on_worker_error)
         self.threadpool.start(worker)
@@ -2201,7 +2243,7 @@ class NativeEmissionGUI(QMainWindow):
         
         return params
 
-    def _task_load_input(self, paths, delim, skip, comment, ncf_params, progress_callback):
+    def _task_load_input(self, paths, delim, skip, comment, ncf_params, f_col, f_start, f_end, f_val, progress_callback):
         """Worker task: Load input file(s) and calculate stats."""
         # This runs in a background thread. NO UI ACCESS ALLOWED.
         try:
@@ -2231,7 +2273,8 @@ class NativeEmissionGUI(QMainWindow):
                          d, r = read_inputfile(
                              p, delim=delim, skiprows=skip, comment=comment,
                              notify=worker_notify, lazy=True, return_raw=True,
-                             workers=1, ncf_params=ncf_params
+                             workers=1, ncf_params=ncf_params,
+                             flter_col=f_col, flter_start=f_start, flter_end=f_end, flter_val=f_val
                          )
                          if d is not None: dfs.append(d)
                          if r is not None: raw_dfs.append(r)
@@ -2259,7 +2302,8 @@ class NativeEmissionGUI(QMainWindow):
                      lazy=True,
                      return_raw=True,
                      workers=1,
-                     ncf_params=ncf_params
+                     ncf_params=ncf_params,
+                     flter_col=f_col, flter_start=f_start, flter_end=f_end, flter_val=f_val
                  )
             
             if df is not None:
@@ -2336,6 +2380,7 @@ class NativeEmissionGUI(QMainWindow):
     @Slot(object)
     def _on_input_load_finished(self, res):
         """Main thread: Update dataframes and UI."""
+        self._loading_active = False
         if res is None: 
              self.stop_progress_signal.emit()
              return
@@ -2362,6 +2407,7 @@ class NativeEmissionGUI(QMainWindow):
     @Slot(tuple)
     def _on_worker_error(self, err):
         """Generic error handler for workers."""
+        self._loading_active = False
         self.stop_progress_signal.emit()
         self.notify_signal.emit("ERROR", f"Task failed: {err[1]}")
 
@@ -2683,6 +2729,15 @@ class NativeEmissionGUI(QMainWindow):
             raw_cols = sorted([str(c) for c in self.raw_df.columns if c not in p_list])
             self.cmb_filter_col.clear()
             self.cmb_filter_col.addItems(raw_cols)
+
+            # Restore filter column from configuration if requested (persistence)
+            f_col_cfg = self._json_arguments.get('filter_col')
+            if f_col_cfg:
+                # Case-insensitive match against what we just loaded
+                target = str(f_col_cfg).strip().lower()
+                match = next((c for c in raw_cols if str(c).lower() == target), None)
+                if match:
+                    self.cmb_filter_col.setCurrentText(match)
             
             # SCC Detection & Mapping
             self._scc_display_to_code = {}
@@ -3748,7 +3803,7 @@ class NativeEmissionGUI(QMainWindow):
             tuple(self.selected_sccs) if self.selected_sccs else '',
             sel_code if use_scc_filter else '',
             pol_tuple,
-            target_pol if fill_nan else '',
+            target_pol,
             fill_nan,
             f_op,
             id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0,
@@ -3836,36 +3891,75 @@ class NativeEmissionGUI(QMainWindow):
             
             if m_col:
                 s_reg = emis_for_merge[m_col].astype(str).str.strip().str.zfill(5)
-                # Strip US country prefix (0 or 1) from 6-digit codes to match 5-digit shapefiles
-                emis_for_merge['FIPS'] = s_reg.apply(lambda x: x[1:] if len(x) == 6 and (x.startswith('0') or x.startswith('1')) else x)
+                # Handle SMKREPORT's 12-digit FIPS format (extract last 6 digits)
+                # Also ensure 6-digit format for consistent merging
+                def normalize_fips(x):
+                    x_str = str(x).strip()
+                    # If 12+ digits, extract last 6 (SMKREPORT format)
+                    if len(x_str) > 6:
+                        return x_str[-6:]
+                    # Otherwise, pad to 6 digits
+                    else:
+                        return x_str.zfill(6)
+                
+                emis_for_merge['FIPS'] = s_reg.apply(normalize_fips)
             
-            # Also ensure geometry side is normalized to 5 digits for reliable join
+            # Normalize geometry FIPS to 6-digit format to match emissions data
             if base_gdf is not None and 'FIPS' in base_gdf.columns:
                  base_gdf = base_gdf.copy()
-                 s_geom = base_gdf['FIPS'].astype(str).str.strip().str.zfill(5)
-                 base_gdf['FIPS'] = s_geom.apply(lambda x: x[1:] if len(x) == 6 and x.startswith('0') else x)
+                 s_geom = base_gdf['FIPS'].astype(str).str.strip()
+                 # Convert to 6-digit format: handle 12-digit (SMKREPORT), extract last 6,
+                 # or pad 5-digit standard US FIPS with leading 0
+                 def normalize_geom_fips(x):
+                     x_str = str(x).strip()
+                     # If 12+ digits, extract last 6 (rare, but handle edge case)
+                     if len(x_str) > 6:
+                         return x_str[-6:]
+                     # If 5 digits, prepend '0' for 6-digit format
+                     elif len(x_str) == 5:
+                         return '0' + x_str
+                     # Otherwise use as-is or pad to 6
+                     else:
+                         return x_str.zfill(6)
+                 base_gdf['FIPS'] = s_geom.apply(normalize_geom_fips)
 
         # SCC Filtering & Re-aggregation
-        if merge_on not in emis_for_merge.columns or use_scc_filter:
-            raw_to_use = self.raw_df
-            if use_scc_filter and self.raw_df is not None:
-                scc_col = next((c for c in raw_to_use.columns if c.lower() in SCC_COLS), None)
+        # BUGFIX: Force aggregation for county/grid modes to match Batch aggregation behavior.
+        # Without this, FF10 point-level data is merged with county geometries without aggregation,
+        # causing higher statistics in GUI than Batch mode.
+        # NOTE: Only apply aggregation for FF10 data; SMKREPORT is already aggregated at county level
+        source_type = getattr(self.emissions_df, 'attrs', {}).get('source_type', '')
+        is_ff10 = source_type in ('ff10_point', 'ff10_nonpoint')
+        
+        if merge_on not in emis_for_merge.columns or use_scc_filter or (geometry_tag in ('county', 'grid') and is_ff10):
+            # Prefer emis_for_merge if it already has merge_on column (e.g., FF10 with FIPS)
+            # Only use raw_df if merge_on is missing or SCC filtering is needed
+            if merge_on in emis_for_merge.columns and not use_scc_filter:
+                # Use processed data that already has merge_on column
+                data_to_agg = emis_for_merge
+            else:
+                # Fall back to raw_df for missing columns or SCC filtering
+                data_to_agg = self.raw_df
+            
+            if use_scc_filter and data_to_agg is not None:
+                scc_col = next((c for c in data_to_agg.columns if c.lower() in SCC_COLS), None)
                 if scc_col:
                     if isinstance(sel_code, list):
-                        raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip().isin(sel_code)].copy()
+                        data_to_agg = data_to_agg[data_to_agg[scc_col].astype(str).str.strip().isin(sel_code)].copy()
                     else:
-                        raw_to_use = raw_to_use[raw_to_use[scc_col].astype(str).str.strip() == sel_code].copy()
+                        data_to_agg = data_to_agg[data_to_agg[scc_col].astype(str).str.strip() == sel_code].copy()
             
-            # Apply generic attribute filters to raw data if we are using it for aggregation
-            if raw_to_use is not None:
-                raw_to_use = _apply_attr_filters(raw_to_use)
+            # Apply generic attribute filters
+            if data_to_agg is not None:
+                data_to_agg = _apply_attr_filters(data_to_agg)
             
-            if isinstance(raw_to_use, pd.DataFrame) and merge_on in raw_to_use.columns:
-                pols = list(self.pollutants or detect_pollutants(raw_to_use))
+            if isinstance(data_to_agg, pd.DataFrame) and merge_on in data_to_agg.columns:
+                pols = list(self.pollutants or detect_pollutants(data_to_agg))
                 if pols:
                     try:
-                        subset = raw_to_use[[merge_on] + pols]
-                        agg = subset.groupby(merge_on, sort=False).sum(numeric_only=True).reset_index()
+                        subset = data_to_agg[[merge_on] + pols]
+                        # Match Batch mode aggregation parameters exactly (batch.py line 946)
+                        agg = subset.groupby(merge_on, dropna=False, sort=False, observed=False).sum(numeric_only=True).reset_index()
                         agg.attrs = dict(getattr(emis_for_merge, 'attrs', {}))
                         emis_for_merge = agg
                     except Exception as e:
@@ -3874,6 +3968,17 @@ class NativeEmissionGUI(QMainWindow):
         if merge_on not in emis_for_merge.columns:
             _do_notify('WARNING', 'Missing Join Column', f"Data lacks '{merge_on}' required for {geometry_tag} plot.")
             raise ValueError("Handled")
+
+        # DEBUG: Check FIPS match before merge
+        if merge_on == 'FIPS' and 'FIPS' in emis_for_merge.columns and 'FIPS' in base_gdf.columns:
+            emis_fips = set(emis_for_merge['FIPS'].dropna().unique().astype(str))
+            geom_fips = set(base_gdf['FIPS'].dropna().unique().astype(str))
+            matched = emis_fips & geom_fips
+            emis_only = emis_fips - geom_fips
+            geom_only = geom_fips - emis_fips
+            logging.warning(f"DEBUG: FIPS Match Before Merge - Emis rows with matching FIPS: {len(emis_for_merge[emis_for_merge['FIPS'].isin(matched)])}/{len(emis_for_merge)}")
+            logging.warning(f"DEBUG: FIPS in emis but not geom: {len(emis_only)} codes (sample: {list(emis_only)[:5]})")
+            logging.warning(f"DEBUG: FIPS in geom but not emis: {len(geom_only)} codes")
 
         try:
             from data_processing import merge_emissions_with_geometry
@@ -4234,10 +4339,10 @@ class NativeEmissionGUI(QMainWindow):
             # If the column is missing (e.g. was optimized away or lazy-load failed to sync),
             # try to re-fetch it directly into the GDF if we have grid info.
             if actual_col is None and self.input_files_list:
-                try:
-                    logging.warning(f"Pollutant '{column}' missing from GDF. Attempting emergency recovery fetch...")
-                    path = self.input_files_list[0]
-                    if path.endswith(('.nc', '.ncf', '.timind')):
+                path = self.input_files_list[0]
+                if path.endswith(('.nc', '.ncf', '.timind')):
+                    try:
+                        logging.warning(f"Pollutant '{column}' missing from GDF. Attempting emergency recovery fetch...")
                         from ncf_processing import read_ncf_emissions
                         # Extract just the single pollutant for this layer/time
                         lay_idx = self.cmb_ncf_layer.currentIndex() if hasattr(self, 'cmb_ncf_layer') else 0
@@ -4251,8 +4356,8 @@ class NativeEmissionGUI(QMainWindow):
                             gdf[column] = rec_df[column].values
                             actual_col = column
                             logging.info(f"Emergency recovery successful for {column}")
-                except Exception as ex:
-                    logging.error(f"Emergency recovery failed: {ex}")
+                    except Exception as ex:
+                        logging.error(f"Emergency recovery failed: {ex}")
 
             if actual_col is None:
                 raise KeyError(f"Pollutant '{column}' not found in dataset. Available columns: {list(gdf.columns)}")
@@ -4529,10 +4634,11 @@ class NativeEmissionGUI(QMainWindow):
                             # and avoid the 1e-02 vs 10^-2 math/scientific flipping.
                             def _fmt_log_readable(x, pos=None):
                                 if x <= 0: return ""
-                                # Use 'g' format for clean decimals, but limit precision
-                                s = f"{x:.4g}".rstrip('0').rstrip('.')
-                                if not s or s == "0": s = f"{x:g}"
-                                return s
+                                # Prioritize plain decimal/integer formatting up to 10^10 to avoid scientific notation
+                                if 1e-4 <= x <= 1e10:
+                                    s = f"{x:f}".rstrip('0').rstrip('.')
+                                    if s: return s
+                                return f"{x:g}"
                             
                             fmt = FuncFormatter(_fmt_log_readable)
                             if orient_vertical: 

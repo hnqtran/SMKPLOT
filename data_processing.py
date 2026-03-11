@@ -613,7 +613,10 @@ def filter_dataframe_by_range(
     def _extract(token) -> str:
         if token is None:
             return ''
-        match = pattern.search(str(token).strip())
+        text = str(token).strip().replace('"', '').replace("'", "")
+        # Remove trailing .0 artifacts before digit extraction
+        text = re.sub(r"\.0+$", "", text)
+        match = pattern.search(text)
         return match.group(1) if match else ''
 
     extracted = df[col_name].apply(_extract)
@@ -640,54 +643,63 @@ def filter_dataframe_by_values(
     if not column or not values:
         return df
 
-    normalized_tokens: List[str] = []
-    digits_only = True
+    # Prepare filter tokens: strip quotes/whitespace and track digit-only status
+    raw_tokens: List[str] = []
+    digit_tokens: List[str] = []
+    all_numeric = True
+    
     for raw in values:
-        if raw is None:
-            continue
-        text = str(raw).strip()
-        if not text:
-            continue
+        if raw is None: continue
+        # Strip literal quotes and outer whitespace
+        text = str(raw).strip().replace('"', '').replace("'", "")
+        if not text: continue
+        
+        raw_tokens.append(text.lower())
         digits = re.sub(r"\D", "", text)
         if digits:
-            normalized_tokens.append(digits)
+            digit_tokens.append(digits)
         else:
-            digits_only = False
-            normalized_tokens.append(text.lower())
-    if not normalized_tokens:
+            all_numeric = False
+
+    if not raw_tokens:
         return df
 
     target = str(column).strip().lower()
-    col_name = None
-    for cand in df.columns:
-        if str(cand).strip().lower() == target:
-            col_name = cand
-            break
+    col_name = next((c for c in df.columns if str(c).strip().lower() == target), None)
+    
     if col_name is None:
         logging.warning("Filter column %s not found in DataFrame; skipping value filter", column)
         return df
 
     series = df[col_name]
-    # Categorical columns report is_string_dtype=True but .fillna('') fails
-    # because '' is not an existing category. Convert to plain string first.
+    # Ensure string series with standard cleaning
     if pd.api.types.is_categorical_dtype(series):
         series = series.astype('string')
     elif not pd.api.types.is_string_dtype(series):
         series = series.astype('string')
-    series = series.fillna('').str.strip()
 
-    if digits_only and normalized_tokens:
-        width = max(len(tok) for tok in normalized_tokens)
-        normalized = [tok[-width:].zfill(width) for tok in normalized_tokens]
-        series_cmp = series.str.replace(r"\D", "", regex=True).str[-width:].str.zfill(width)
-    else:
-        normalized = normalized_tokens
-        series_cmp = series.str.lower()
+    s_clean = series.fillna('').astype(str).str.strip().str.replace('"', '', regex=False).str.replace("'", "", regex=False)
+    # Remove trailing .0 artifacts (e.g. "123.0" -> "123") from previously-float columns
+    s_clean = s_clean.str.replace(r"\.0+$", "", regex=True)
 
-    mask = series_cmp.isin(normalized)
+    # 1. Try Exact match first (most accurate for ID-like strings)
+    mask = s_clean.str.lower().isin(raw_tokens)
+    
+    # 2. Fallback to fuzzy digit matching if requested values are numeric and no exact matches found
+    if not mask.any() and all_numeric and digit_tokens:
+        width = max(len(tok) for tok in digit_tokens)
+        norm_targets = [tok[-width:].zfill(width) for tok in digit_tokens]
+        # Extract digits from series, pad, and compare
+        s_digits = s_clean.str.replace(r"\D", "", regex=True).str[-width:].str.zfill(width)
+        mask = s_digits.isin(norm_targets)
+        if mask.any():
+            logging.info(f"Fuzzy digit match applied for {column} using {len(digit_tokens)} tokens")
+
     if mask.all():
         return df
+        
     filtered = df.loc[mask].copy()
+    logging.info(f"Filtering {column}: rows reduced from {len(df)} to {len(filtered)}")
     try:
         filtered.attrs = dict(getattr(df, 'attrs', {}) or {})
     except Exception:
@@ -1156,21 +1168,33 @@ def read_ff10(
     sep = detected_sep or ','
 
     # Use pandas C engine for speed
-    # Specify dtypes for common columns to save memory and avoid type inference overhead
-    dtype_map = {
-        'region_cd': 'string',
-        'region': 'string',
-        'fips': 'string',
-        'scc': 'string',
-        'poll': 'category',
-        'country_cd': 'category',
-        'tribal_code': 'category',
-        'facility_id': 'string',
-        'unit_id': 'string',
-        'rel_point_id': 'string',
-        'ann_value': 'float32',
-        'emission': 'float32'
-    }
+    # Get actual columns from header line (captured during scan)
+    # We re-parse to ensure we get exact column names (case-sensitive) for usecols matches
+    try:
+        clean_header = header_line.replace('"', '').replace("'", "").strip()
+        file_cols = [t.strip() for t in clean_header.split(sep)]
+    except Exception:
+        file_cols = []
+
+    # Specify dtypes for common columns: identifiers MUST be strings to avoid numeric artifacts.
+    from config import (
+        COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, 
+        UNIT_COLS, REL_COLS, SCC_COLS, POL_COLS, EMIS_COLS, LAT_COLS, LON_COLS,
+        key_cols
+    )
+    
+    id_aliases = (COUNTRY_COLS + TRIBAL_COLS + REGION_COLS + FACILITY_COLS + 
+                  UNIT_COLS + REL_COLS + SCC_COLS)
+                  
+    dtype_map = {}
+    for col in file_cols:
+        c_low = col.lower()
+        if any(c_low == a.lower() for a in id_aliases):
+            dtype_map[col] = 'string'
+        elif c_low in POL_COLS:
+            dtype_map[col] = 'category'
+        elif c_low in EMIS_COLS:
+            dtype_map[col] = 'float32'
 
     # Identify usecols based on key_cols to optimize reading
     from config import (
@@ -1180,13 +1204,7 @@ def read_ff10(
     )
     
     
-    # Get actual columns from header line (captured during scan)
-    # We re-parse to ensure we get exact column names (case-sensitive) for usecols matches
-    try:
-        clean_header = header_line.replace('"', '').replace("'", "").strip()
-        file_cols = [t.strip() for t in clean_header.split(sep)]
-    except Exception:
-        file_cols = []
+    pass # file_cols already populated above
 
     use_cols = []
     if file_cols:
@@ -1302,6 +1320,10 @@ def read_ff10(
     # Use safe pivot to avoid OverflowError
     index_cols = [icol for icol in col_lst if icol not in (pol_col, emis_col)]
     df = _safe_pivot(df, index_cols, pol_col, emis_col)
+
+    # Ensure column names derived from SCC (or other pivoted values) are always strings
+    # This prevents numeric SCC codes like 100027 from being treated as numeric columns
+    df.columns = [str(col) if not isinstance(col, str) else col for col in df.columns]
 
     # Identify pollutant columns
     pollutant_cols = [col for col in df.columns if col not in col_lst]
@@ -1614,6 +1636,21 @@ def read_smkreport(
     splitter = sep if sep is not None else (';' if ';' in header_line else ',')
     col_names = [t.strip() for t in header_line.split(splitter)]
 
+    # Enforce identifier columns as strings to avoid numeric artifacts
+    from config import (
+        COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS, 
+        UNIT_COLS, REL_COLS, SCC_COLS, EMIS_COLS
+    )
+    dtype_map = {}
+    id_aliases = (COUNTRY_COLS + TRIBAL_COLS + REGION_COLS + FACILITY_COLS + 
+                  UNIT_COLS + REL_COLS + SCC_COLS)
+    for col in col_names:
+        c_low = col.lower()
+        if any(c_low == a.lower() for a in id_aliases):
+            dtype_map[col] = 'string'
+        elif c_low in EMIS_COLS:
+            dtype_map[col] = 'float32'
+
     # Improve read performance by maximizing C engine usage
     read_kwargs = {
         'filepath_or_buffer': fpath,
@@ -1622,6 +1659,8 @@ def read_smkreport(
         'names': col_names,
         'comment': comment_marker,
         'encoding': encoding,
+        'dtype': dtype_map,
+        'low_memory': False
     }
 
     if sep == ' ':
@@ -2376,30 +2415,32 @@ def detect_pollutants(df: pd.DataFrame) -> List[str]:
             return list(lazy_pols)
     except Exception:
         pass
-    # Exclude grid identifiers as well
-    id_like = {
-        'fips', 'region', 'state', 'county', 'x', 'y', 'x cell', 'y cell', 'row', 'col', 'grid_rc',
-        '#label', 'label', 'src', 'source', 'sourcename', 'source_name', 'scc', 'scc description',
-        'region_cd', 'state_cd', 'county_cd',
-        'facility id', 'fac name', 'country_cd', 'tribal_code', 'emis_type',
-        'facility_id', 'unit_id', 'rel_point_id','latitude','longitude','lat_dd','lon_dd','lat','lon',
-        'stkhgt', 'stkdiam', 'stktemp', 'stkflow', 'stkvel', 'erptype', 'naics', 'census_tract',
-        'design_capacity', 'design_capacity_units', 'reg_codes', 'fac_source_type', 'unit_type_code',
-        'control_ids', 'control_measures', 'current_cost', 'cumulative_cost', 'projection_factor',
-        'submitter_id', 'calc_method', 'data_set_id', 'facil_category_code', 'oris_facility_code',
-        'oris_boiler_id', 'ipm_yn', 'calc_year', 'date_updated', 'fug_height', 'fug_width_xdim',
-        'fug_length_ydim', 'fug_angle', 'zipcode', 'annual_avg_hours_per_year',
-        'jan_value', 'feb_value', 'mar_value', 'apr_value', 'may_value', 'jun_value',
-        'jul_value', 'aug_value', 'sep_value', 'oct_value', 'nov_value', 'dec_value',
-        'ann_pct_red', 'jan_pctred', 'feb_pctred', 'mar_pctred', 'apr_pctred',
-        'may_pctred', 'jun_pctred', 'jul_pctred', 'aug_pctred', 'sep_pctred', 
-        'oct_pctred', 'nov_pctred', 'dec_pctred', 'process_id', 'agy_facility_id',
-        'agy_unit_id', 'agy_rel_point_id', 'agy_process_id', 'll_datum', 'horiz_coll_mthd'
+    
+    # Build exclusion set from config (more maintainable than hardcoded list)
+    from config import (
+        COUNTRY_COLS, TRIBAL_COLS, REGION_COLS, FACILITY_COLS,
+        UNIT_COLS, REL_COLS, SCC_COLS, LAT_COLS, LON_COLS, POL_COLS, EMIS_COLS,
+        DESC_COLS
+    )
+    
+    # All metadata columns from config + common grid/geometry columns
+    metadata_aliases = (COUNTRY_COLS + TRIBAL_COLS + REGION_COLS + FACILITY_COLS +
+                       UNIT_COLS + REL_COLS + SCC_COLS + LAT_COLS + LON_COLS + POL_COLS + EMIS_COLS + DESC_COLS)
+    
+    id_like = set(c.lower().strip() for c in metadata_aliases) | {
+        'fips', 'state', 'county', 'x', 'y', 'x cell', 'y cell', 'row', 'col', 'grid_rc',
+        '#label', 'label', 'src', 'source', 'sourcename', 'source_name',
+        'state_cd', 'county_cd', 'emis_type', 'naics', 'census_tract',
+        'design_capacity', 'design_capacity_units', 'reg_codes', 'fac_source_type',
+        'control_ids', 'control_measures', 'current_cost', 'cumulative_cost',
+        'zipcode', 'annual_avg_hours_per_year', 'project_id', 'data_quality_flag'
     }
+    
     detected = [
         c for c in df.columns
-        if c.lower() not in id_like
+        if c.lower().strip() not in id_like
         and not c.lower().startswith('unnamed')
+        and not (isinstance(c, str) and c.isdigit())  # Exclude numeric column names (SCC codes)
         and pd.api.types.is_numeric_dtype(df[c])
     ]
     try:
@@ -2459,31 +2500,17 @@ def remap_tribal_fips(df: pd.DataFrame, fips_col: str = 'FIPS') -> pd.DataFrame:
     return df
 
 def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
-    # Step 1: Remap tribal codes if they exist in FIPS or tribal_code columns
-    df = remap_tribal_fips(df, 'FIPS')
-    
-    # If FIPS column exists, we might still want to normalize it or ensure it's 6 digits.
-    # However, if it's already there and seems to be the right length/format, we can skip heavy rebuilds.
-    # For now, let's remove the aggressive early return to ensure normalization happens if needed.
-    # We will only skip if FIPS is already 6-digit strings on average.
-    pass
-
-    # Find region_cd column if df
+    # Locate region column
     region_col = _check_column_in_df(df, REGION_COLS, warn=False)
 
-    # Check if region_col less than 6 characters long, affix with country code
     if region_col:
+        # Check if region_col less than 6 characters long, affix with country code
         lengths = df[region_col].astype('string').str.strip().str.len()
-        region_stats = lengths.describe()
-        max_len = int(region_stats['max'])
+        max_len = int(lengths.max()) if not lengths.empty else 0
 
         if max_len < 6:
-            # Locate country_cd column if exists
             country_col = _check_column_in_df(df, COUNTRY_COLS, warn=False)
             if country_col:
-                if verbose:
-                    logging.info(f"Building FIPS by affixing country code from column {country_col} to region_cd column {region_col}")
-                ## Map country code value from COUNTRY_CODE_MAPPINGS dict to new column df[country_id]
                 country_codes = (
                     df[country_col]
                     .astype('string')
@@ -2491,58 +2518,42 @@ def get_emis_fips(df: pd.DataFrame, verbose: bool = True):
                     .str.upper()
                     .map(COUNTRY_CODE_MAPPINGS)
                     .fillna('0')
-            )
+                )
             else:
-                country_codes = pd.Series('0', index=df.index)  # default to US
-            # Affix region code with country code
-            # Ensure robust string conversion (handle potential float/int types)
-            s_region = df[region_col].astype(str)
-            # If float dtype, convert to int first to avoid ".0" suffix
-            if pd.api.types.is_float_dtype(df[region_col]):
-                try:
-                    s_region = df[region_col].fillna(-1).astype(int).astype(str).replace('-1', '')
-                except Exception:
-                    pass
+                country_codes = pd.Series('0', index=df.index)
             
-            fips_suffix = s_region.str.strip().str.zfill(5)
-            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
-            # then assign directly to avoids FutureWarning: Index.insert.
+            s_region = df[region_col].astype(str)
+            if pd.api.types.is_float_dtype(df[region_col]):
+                s_region = df[region_col].fillna(-1).astype(int).astype(str).replace('-1', '')
+            
             df = df.copy()
-            df['FIPS'] = country_codes + fips_suffix
+            df['FIPS'] = country_codes + s_region.str.strip().str.zfill(5)
         else:
-            # Ensure robust string conversion
             s_region = df[region_col].astype(str)
             if pd.api.types.is_float_dtype(df[region_col]):
-                try:
-                    s_region = df[region_col].fillna(-1).astype(int).astype(str).replace('-1', '')
-                except Exception:
-                    pass
+                s_region = df[region_col].fillna(-1).astype(int).astype(str).replace('-1', '')
             
-            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
-            # then assign directly to avoids FutureWarning: Index.insert.
             df = df.copy()
-            df['FIPS'] = s_region.str.zfill(6)
-        
-        return df
+            df['FIPS'] = s_region.str.strip().str.zfill(6)
     else:
-        if verbose:
-            print("region_cd column not found, checking for statefp and countyfp columns to build FIPS")
-        # Find if there is statefp and countyfp columns to build fips
+        # Fallback to statefp/countyfp
         statefp_col = _check_column_in_df(df, ['statefp','state_cd','state_code'], warn=False)
         countyfp_col = _check_column_in_df(df, ['countyfp','county_cd','county_code'], warn=False)
         if statefp_col and countyfp_col:
-            original_attrs = df.attrs.copy()
-            new_fips = '0' + df[statefp_col].astype(str).str.zfill(2) + df[countyfp_col].astype(str).str.zfill(3)
-            # Consolidate via copy to avoid Fragmentation PerformanceWarning, 
-            # then assign directly to avoids FutureWarning: Index.insert.
             df = df.copy()
-            df['FIPS'] = new_fips
+            df['FIPS'] = '0' + df[statefp_col].astype(str).str.zfill(2) + df[countyfp_col].astype(str).str.zfill(3)
 
-    # Final pass: Remap tribal codes in the newly built or existing FIPS column
-    if 'FIPS' in df.columns:
-        df = remap_tribal_fips(df, 'FIPS')
+    if 'FIPS' not in df.columns:
+        logging.warning("No valid Region/FIPS columns found; FIPS column not created.")
+        raise ValueError("No valid FIPS code columns found")
 
+    # Handle SMKREPORT's 12-digit FIPS format (extract last 6 digits and normalize to 6-digit)
+    df = df.copy()
+    fips_str = df['FIPS'].astype(str).str.strip()
+    # Extract last 6 digits if longer than 6 digits, else use as-is
+    df['FIPS'] = fips_str.apply(lambda x: x[-6:] if len(x) > 6 else x).str.zfill(6)
+
+    # ALWAYS Remap tribal codes in the newly built or existing FIPS column
+    df = remap_tribal_fips(df, 'FIPS')
     return df
-    
-    raise ValueError("No valid FIPS code columns found")
 

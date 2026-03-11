@@ -12,6 +12,7 @@ import pyproj
 import matplotlib.pyplot as plt
 import matplotlib.cm as mplcm
 from matplotlib.colors import BoundaryNorm, LogNorm
+from matplotlib.ticker import ScalarFormatter, FuncFormatter
 from matplotlib.figure import Figure
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -92,7 +93,12 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
                 
             kwargs['cmap'] = cmap
             kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
-            kwargs['legend_kwds'] = {'ticks': bins, 'format': '%.10g'} 
+            
+            # Use non-scientific formatter for discrete bins
+            formatter = ScalarFormatter()
+            formatter.set_scientific(False)
+            formatter.set_useOffset(False)
+            kwargs['legend_kwds'] = {'ticks': bins, 'format': formatter} 
         except (ValueError, AttributeError) as e:
             logging.warning("Failed to configure custom bins/norm: %s", e)
     else:
@@ -115,11 +121,31 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
                 if low <= 0: low = 1e-20
                 if high <= low: high = low * 10.0
                 kwargs['norm'] = LogNorm(vmin=low, vmax=high)
+
+                # Enforce human-readable log labels without scientific notation
+                def _fmt_log_readable(x, pos=None):
+                    if x <= 0: return ""
+                    # Prioritize plain decimal/integer formatting up to 10^10
+                    if 1e-4 <= x <= 1e10:
+                        s = f"{x:f}".rstrip('0').rstrip('.')
+                        if s: return s
+                    return f"{x:g}"
+
+                kwargs['legend_kwds'] = {'format': FuncFormatter(_fmt_log_readable)}
     
     # Ensure vmin/vmax are in kwargs for linear plots if not already handled by norm
     if 'norm' not in kwargs:
         if user_kwargs and 'vmin' in user_kwargs: kwargs['vmin'] = user_kwargs['vmin']
         if user_kwargs and 'vmax' in user_kwargs: kwargs['vmax'] = user_kwargs['vmax']
+        
+        # Enforce non-scientific formatting for linear scales
+        formatter = ScalarFormatter()
+        formatter.set_scientific(False)
+        formatter.set_useOffset(False)
+        if 'legend_kwds' not in kwargs:
+            kwargs['legend_kwds'] = {'format': formatter}
+        else:
+            kwargs['legend_kwds']['format'] = formatter
 
     return kwargs
                 
@@ -344,7 +370,10 @@ def create_map_plot(
                 from mpl_toolkits.axes_grid1 import make_axes_locatable
                 divider = make_axes_locatable(ax)
                 cax = divider.append_axes("right", size="2%", pad=0.1)
-                plt.colorbar(collection, cax=cax)
+                
+                # Apply legend/colorbar keywords (formatters, ticks, etc.) to manual colorbar
+                cb_kw = plot_kwargs.get('legend_kwds', {}).copy()
+                plt.colorbar(collection, cax=cax, **cb_kw)
                 cax.set_label('<colorbar>')
             except Exception as e:
                 logging.debug("Failed to add manual colorbar: %s", e)
