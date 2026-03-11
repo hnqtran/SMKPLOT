@@ -668,7 +668,11 @@ def filter_dataframe_by_values(
         return df
 
     series = df[col_name]
-    if not pd.api.types.is_string_dtype(series):
+    # Categorical columns report is_string_dtype=True but .fillna('') fails
+    # because '' is not an existing category. Convert to plain string first.
+    if pd.api.types.is_categorical_dtype(series):
+        series = series.astype('string')
+    elif not pd.api.types.is_string_dtype(series):
         series = series.astype('string')
     series = series.fillna('').str.strip()
 
@@ -742,6 +746,10 @@ def read_inputfile(
                 result_df.attrs['source_name'] = sector
             result_df.attrs['source_type'] = 'gridded_netcdf'
             
+            # Persist ncf_params in attrs for future lazy-loading calls
+            if ncf_params:
+                result_df.attrs['ncf_params'] = ncf_params
+            
             # Filtering if requested (post-read)
             # Currently not implemented for NetCDF inputs (typically wide format)
             # filtered_df = result_df
@@ -782,6 +790,7 @@ def read_inputfile(
                         p, sector, delim, skiprows, comment, encoding, header_last, 
                         flter_col, flter_start, flter_end, flter_val, notify,
                         return_raw=return_raw,
+                        ncf_params=ncf_params,
                         lazy=lazy,
                         workers=workers
                     )
@@ -807,7 +816,7 @@ def read_inputfile(
                         p, sector, delim, skiprows, comment, encoding, header_last,
                         flter_col, flter_start, flter_end, flter_val, None, # notify cannot be passed
                         return_raw,
-                        None, # ncf_params
+                        ncf_params,
                         lazy,
                         0 # sub-workers
                     )
@@ -1025,7 +1034,7 @@ def _read_and_process_chunks(
     process_chunk_func: Callable[[pd.DataFrame], pd.DataFrame]
 ) -> pd.DataFrame:
     """Read CSV in chunks and apply processing per chunk to reduce memory usage."""
-    # Use a reasonable chunk size (e.g. 50k rows)
+    import gc
     chunk_size = 50000
     read_kwargs['chunksize'] = chunk_size
     
@@ -1035,6 +1044,11 @@ def _read_and_process_chunks(
         for chunk in reader:
             if chunk.empty: continue
             
+            # --- Memory Optimization: Downcast all floats to 32-bit ---
+            # This reduces memory footprint by 50% for numeric columns.
+            for col in chunk.select_dtypes(include=['float64']).columns:
+                chunk[col] = chunk[col].astype('float32')
+
             # Apply processing (renaming, filtering)
             try:
                 processed = process_chunk_func(chunk)
@@ -1059,7 +1073,10 @@ def _read_and_process_chunks(
         read_kwargs['nrows'] = 0
         return read_func(**read_kwargs)
 
-    return pd.concat(chunks, ignore_index=True)
+    res = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
+    return res
 
 def read_ff10(
     fpath: str,
@@ -2180,6 +2197,21 @@ def _create_domain_gdf_cached(
         gdf['GRID_RC'] = [f"{r}_{c}" for r, c in zip(rows_attr, cols_attr)]
     
     _categorize_columns(gdf, ['GRID_RC'])
+    
+    # Attach grid info for optimized QuadMesh plotting
+    try:
+        gdf.attrs['_smk_grid_info'] = {
+            'xorig': xorig,
+            'yorig': yorig,
+            'xcell': xcell,
+            'ycell': ycell,
+            'ncols': ncols,
+            'nrows': nrows,
+            'proj_str': proj_str
+        }
+    except Exception:
+        pass
+
     try:
         _ = gdf.sindex
     except Exception:

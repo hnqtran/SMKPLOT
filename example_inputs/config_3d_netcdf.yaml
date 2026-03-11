@@ -1,0 +1,24 @@
+# Example 3D NetCDF Configuration (Manual Test)
+# Run from root: ./smkplot.py example_inputs/config_3d_netcdf.yaml
+
+arguments:
+  filepath: "./example_inputs/example_3d.nc"
+  pollutant: "O3"
+  pltyp: "grid"
+  projection: "lcc"
+
+  # NetCDF Specific Settings
+  # Options: avg/sum/max/min (aggregations) or integer index (0-based)
+  # 0 = LAY 0 / TSTEP 0, 1 = LAY 1 / TSTEP 1, etc.
+  ncf-zdim: 0
+  ncf-tdim: 1
+
+  # Visual Settings
+  cmap: "viridis"
+  log-scale: false
+  zoom-to-data: true
+  vmin: 40.0
+  vmax: 100.0
+
+  outdir: "./test_outputs/3d_netcdf"
+  run_mode: "gui"

@@ -100,6 +100,10 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
         v_min = user_kwargs.get('vmin') if user_kwargs else None
         v_max = user_kwargs.get('vmax') if user_kwargs else None
         
+        if column not in gdf.columns:
+            logging.warning(f"Column '{column}' missing from GDF columns.")
+            return kwargs
+            
         data = gdf[column]
         use_log = log_scale and (data > 0).any()
         if use_log:
@@ -308,21 +312,18 @@ def create_map_plot(
     # 3. Plot Data
     collection = None
     try:
-        # Optimization: Use QuadMesh (pcolormesh) for large regular grids
+        # Optimization: Use QuadMesh (pcolormesh) for regular grids
         info = gdf.attrs.get('_smk_grid_info')
-        if len(gdf) > 10000:
-            if not info:
-                logging.info(f"QuadMesh skipped: No _smk_grid_info attribute found in GDF (Size: {len(gdf)}).")
-            else:
-                try:
-                    collection = _draw_gridded_mesh(gdf, column, ax, plot_kwargs, target_crs=crs_proj)
-                    if collection:
-                        logging.info(f"Using Optimized QuadMesh for {len(gdf)} cells.")
-                    else:
-                        logging.warning("QuadMesh function returned None.")
-                except Exception as qe:
-                    logging.warning(f"QuadMesh optimization failed: {qe}")
-                    collection = None
+        if info:
+            try:
+                collection = _draw_gridded_mesh(gdf, column, ax, plot_kwargs, target_crs=crs_proj)
+                if collection:
+                    logging.info(f"Using Optimized QuadMesh for {len(gdf)} cells.")
+                else:
+                    logging.warning("QuadMesh function returned None.")
+            except Exception as qe:
+                logging.warning(f"QuadMesh optimization failed: {qe}")
+                collection = None
 
         if collection is None:
             # PERFORMANCE OPTIMIZATION:

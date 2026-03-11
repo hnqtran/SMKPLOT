@@ -83,10 +83,6 @@ except ImportError:
     except ImportError: from PyQt5.QtGui import QAction
     QT_BINDING = "PyQt5"
 
-import pandas as pd
-import numpy as np
-import geopandas as gpd
-import pyproj
 import shapely
 # --- Matplotlib Backend Setup ---
 import matplotlib
@@ -853,6 +849,7 @@ class NativeEmissionGUI(QMainWindow):
         self._t_data_cache = None
         self._t_idx = 0
         self._is_showing_agg = False
+        self._ncf_refresh_active = False
         self._anim_timer = QTimer()
         self._anim_timer.timeout.connect(lambda: self._step_time(1))
         
@@ -1069,11 +1066,7 @@ class NativeEmissionGUI(QMainWindow):
         # View / Plot Settings (Moved from separate tab)
         self._init_plot_settings_section(l_source)
         
-        # Reset View helper
-        btn_reset = QPushButton("Reset View to All Data")
-        btn_reset.setIcon(self.style().standardIcon(QStyle.SP_FileDialogToParent))
-        btn_reset.clicked.connect(self.reset_home_view)
-        l_source.addWidget(btn_reset)
+
 
         
         l_source.addStretch()
@@ -1111,11 +1104,11 @@ class NativeEmissionGUI(QMainWindow):
         
         footer_layout.addWidget(self.btn_main_plot, 2)
 
-        btn_export = QPushButton("Export Configuration")
-        btn_export.setToolTip("Save current settings to a YAML configuration file")
-        btn_export.setMinimumHeight(45)
-        btn_export.clicked.connect(self.export_configuration)
-        footer_layout.addWidget(btn_export, 1)
+        self.btn_export = QPushButton("Export Configuration")
+        self.btn_export.setToolTip("Save current settings to a YAML configuration file")
+        self.btn_export.setMinimumHeight(45)
+        self.btn_export.clicked.connect(self.export_configuration)
+        footer_layout.addWidget(self.btn_export, 1)
         
         left_layout.addWidget(self.footer_frame)
         
@@ -1153,7 +1146,8 @@ class NativeEmissionGUI(QMainWindow):
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False); self.progress_bar.setVisible(False)
-        self.progress_bar.setFixedHeight(3)
+        self.progress_bar.setFixedHeight(5)
+        self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #3b82f6; border-radius: 2px; }")
         log_layout.addWidget(self.log_text)
         log_layout.addWidget(self.progress_bar)
         
@@ -1277,22 +1271,22 @@ class NativeEmissionGUI(QMainWindow):
         
         # Tools Row (Load, Preview, Meta)
         row_tools = QHBoxLayout()
-        btn_load = QPushButton("Load Data")
-        btn_load.setObjectName("primaryBtn")
-        btn_load.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
-        btn_load.clicked.connect(lambda: self.load_input_file(self.txt_input.text()))
+        self.btn_load_data = QPushButton("Load Data")
+        self.btn_load_data.setObjectName("primaryBtn")
+        self.btn_load_data.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.btn_load_data.clicked.connect(lambda: self.load_input_file(self.txt_input.text()))
         
-        btn_preview = QPushButton("View Table")
-        btn_preview.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        btn_preview.clicked.connect(self.preview_data)
+        self.btn_preview = QPushButton("View Table")
+        self.btn_preview.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.btn_preview.clicked.connect(self.preview_data)
         
-        btn_meta = QPushButton("Metadata")
-        btn_meta.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
-        btn_meta.clicked.connect(self.show_metadata)
+        self.btn_metadata = QPushButton("Metadata")
+        self.btn_metadata.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
+        self.btn_metadata.clicked.connect(self.show_metadata)
         
-        row_tools.addWidget(btn_load, 2)
-        row_tools.addWidget(btn_preview, 1)
-        row_tools.addWidget(btn_meta, 1)
+        row_tools.addWidget(self.btn_load_data, 2)
+        row_tools.addWidget(self.btn_preview, 1)
+        row_tools.addWidget(self.btn_metadata, 1)
         l_file.addLayout(row_tools)
         
         layout.addWidget(file_box)
@@ -1305,60 +1299,64 @@ class NativeEmissionGUI(QMainWindow):
         l_form.setVerticalSpacing(6)
         l_form.setHorizontalSpacing(10)
         
-        # Row 1: Delimiter & Skip
+        # Row 1: Delimiter & Skip & Comment
         l_form.addWidget(QLabel("Delimiter:"), 0, 0)
-        self.cmb_delim = QComboBox()
+        self.cmb_delim = QComboBox(); self.cmb_delim.setFixedWidth(100)
         self.cmb_delim.addItems(['auto', 'comma', 'semicolon', 'tab', 'pipe', 'space', 'other'])
         self.cmb_delim.currentTextChanged.connect(self._on_delim_toggle)
-        self.txt_custom_delim = QLineEdit(); self.txt_custom_delim.setPlaceholderText("Char"); self.txt_custom_delim.setVisible(False); self.txt_custom_delim.setFixedWidth(40)
-        d_box = QHBoxLayout(); d_box.setContentsMargins(0,0,0,0)
+        self.txt_custom_delim = QLineEdit(); self.txt_custom_delim.setPlaceholderText("Char"); self.txt_custom_delim.setVisible(False); self.txt_custom_delim.setFixedWidth(30)
+        d_box = QHBoxLayout(); d_box.setContentsMargins(0,0,0,0); d_box.setSpacing(2)
         d_box.addWidget(self.cmb_delim); d_box.addWidget(self.txt_custom_delim)
         l_form.addLayout(d_box, 0, 1)
         
-        l_form.addWidget(QLabel("Skip Rows:"), 0, 2)
-        self.spin_skip = QSpinBox(); self.spin_skip.setRange(0, 100)
+        l_form.addWidget(QLabel("# Row Skip:"), 0, 2)
+        self.spin_skip = QSpinBox(); self.spin_skip.setRange(0, 100); self.spin_skip.setFixedWidth(60)
         l_form.addWidget(self.spin_skip, 0, 3)
 
+        l_form.addWidget(QLabel("Comment:"), 0, 4)
+        self.txt_comment = QLineEdit("#"); self.txt_comment.setFixedWidth(40); self.txt_comment.setAlignment(Qt.AlignCenter)
+        l_form.addWidget(self.txt_comment, 0, 5)
+        
         # Row 2: GRIDDESC & Selection
         l_form.addWidget(QLabel("GRIDDESC:"), 1, 0)
         self.txt_griddesc = QLineEdit()
         self.txt_griddesc.setPlaceholderText("Path to GRIDDESC")
         self.txt_griddesc.editingFinished.connect(self._on_griddesc_path_edit)
-        btn_gd = QPushButton("..."); btn_gd.setFixedWidth(30); btn_gd.clicked.connect(self.select_griddesc_file)
+        self.btn_browse_gd = QPushButton("..."); self.btn_browse_gd.setFixedWidth(30); self.btn_browse_gd.clicked.connect(self.select_griddesc_file)
         g_box = QHBoxLayout(); g_box.setContentsMargins(0,0,0,0); g_box.setSpacing(2)
-        g_box.addWidget(self.txt_griddesc); g_box.addWidget(btn_gd)
-        l_form.addLayout(g_box, 1, 1, 1, 3) # Span 3 cols
+        g_box.addWidget(self.txt_griddesc); g_box.addWidget(self.btn_browse_gd)
+        l_form.addLayout(g_box, 1, 1, 1, 5) # Spans all 5 input columns
 
         # Row 3: Grid Name Selection
         l_form.addWidget(QLabel("Grid Name:"), 2, 0)
         self.cmb_gridname = QComboBox()
         self.cmb_gridname.addItem("Select Grid")
         self.cmb_gridname.currentTextChanged.connect(self._grid_name_changed)
-        l_form.addWidget(self.cmb_gridname, 2, 1, 1, 3)
+        l_form.addWidget(self.cmb_gridname, 2, 1, 1, 5)
 
         # Row 4: County Shapefile
         l_form.addWidget(QLabel("Counties:"), 3, 0)
         self.txt_counties = QLineEdit()
         self.txt_counties.setPlaceholderText("Shp Path / Online Year")
         self.txt_counties.editingFinished.connect(self._on_counties_path_edit)
-        btn_c_browse = QPushButton("..."); btn_c_browse.setFixedWidth(30); btn_c_browse.clicked.connect(self.select_county_file)
+        self.btn_browse_counties = QPushButton("..."); self.btn_browse_counties.setFixedWidth(30); self.btn_browse_counties.clicked.connect(self.select_county_file)
         c_box = QHBoxLayout(); c_box.setContentsMargins(0,0,0,0); c_box.setSpacing(2)
-        c_box.addWidget(self.txt_counties); c_box.addWidget(btn_c_browse)
-        l_form.addLayout(c_box, 3, 1, 1, 3)
+        c_box.addWidget(self.txt_counties); c_box.addWidget(self.btn_browse_counties)
+        l_form.addLayout(c_box, 3, 1, 1, 5)
         
         # Row 5: Online Counties (Fetch)
         l_form.addWidget(QLabel("Online Map:"), 4, 0)
         self.cmb_online_year = QComboBox()
         self.cmb_online_year.addItems(['2020', '2023'])
-        btn_online = QPushButton("Fetch")
-        btn_online.setToolTip("Download US Counties shapefile from Census.gov")
-        btn_online.clicked.connect(self.use_online_counties)
+        self.btn_fetch_online = QPushButton("Fetch")
+        self.btn_fetch_online.setToolTip("Download US Counties shapefile from Census.gov")
+        self.btn_fetch_online.clicked.connect(self.use_online_counties)
         
         o_box = QHBoxLayout(); o_box.setContentsMargins(0,0,0,0)
         o_box.addWidget(self.cmb_online_year)
-        o_box.addWidget(btn_online)
+        o_box.addWidget(self.btn_fetch_online)
         o_box.addStretch()
-        l_form.addLayout(o_box, 4, 1, 1, 3)
+        l_form.addLayout(o_box, 4, 1, 1, 5)
         
         layout.addWidget(form_frame)
         
@@ -1371,11 +1369,9 @@ class NativeEmissionGUI(QMainWindow):
         
         self.cmb_ncf_layer = QComboBox()
         self.cmb_ncf_time = QComboBox()
-        # Connect signals
-        self.cmb_ncf_layer.currentIndexChanged.connect(self._clear_anim_cache)
-        self.cmb_ncf_layer.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
-        self.cmb_ncf_time.currentIndexChanged.connect(self._clear_anim_cache)
-        self.cmb_ncf_time.currentIndexChanged.connect(lambda: self.load_input_file(self.input_files_list))
+        # Connect signals: Use helper to ensure plot update after load
+        self.cmb_ncf_layer.currentIndexChanged.connect(self._trigger_ncf_refresh)
+        self.cmb_ncf_time.currentIndexChanged.connect(self._trigger_ncf_refresh)
         
         l_ncf.addWidget(QLabel("<b>NetCDF:</b>"))
         l_ncf.addWidget(QLabel("Layer:"))
@@ -1384,27 +1380,6 @@ class NativeEmissionGUI(QMainWindow):
         l_ncf.addWidget(self.cmb_ncf_time, 1)
         
         layout.addWidget(self.ncf_frame)
-
-        # Parse Options (Skip, Comment)
-        extra_lyt = QHBoxLayout()
-        self.spin_skip = QSpinBox()
-        extra_lyt.addWidget(QLabel("Skip:"))
-        extra_lyt.addWidget(self.spin_skip)
-        
-        self.txt_comment = QLineEdit("#")
-        self.txt_comment.setFixedWidth(30)
-        extra_lyt.addWidget(QLabel("Com:"))
-        extra_lyt.addWidget(self.txt_comment)
-        
-        parse_box = QWidget() # wrapper to add border/margin if needed, currently just plain
-        p_layout = QVBoxLayout(parse_box); p_layout.setContentsMargins(0,0,0,0)
-        p_row = QHBoxLayout()
-        p_row.addWidget(QLabel("Additional Options:")) 
-        p_row.addLayout(extra_lyt)
-        p_row.addStretch()
-        p_layout.addLayout(p_row)
-        
-        layout.addWidget(parse_box)
 
         if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
@@ -1444,6 +1419,9 @@ class NativeEmissionGUI(QMainWindow):
         scc_layout = QHBoxLayout()
         scc_layout.setSpacing(4)
         self.cmb_scc = QComboBox()
+        self.cmb_scc.setMinimumWidth(100)
+        self.cmb_scc.setMaximumWidth(320)
+        self.cmb_scc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.cmb_scc.setMaxVisibleItems(8)
         # Enable smooth pixel-based scrolling for long lists
         self.cmb_scc.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -1454,22 +1432,16 @@ class NativeEmissionGUI(QMainWindow):
         self.cmb_scc.setInsertPolicy(QComboBox.NoInsert)
         self.cmb_scc.addItem("All SCC")
         self.cmb_scc.setEnabled(False)
-        scc_layout.addWidget(self.cmb_scc, 3)
+        scc_layout.addWidget(self.cmb_scc, 1)
         
-        self.txt_scc_search = QLineEdit()
-        self.txt_scc_search.setClearButtonEnabled(True)
-        self.txt_scc_search.setPlaceholderText("Find...")
-        self.txt_scc_search.setMinimumWidth(60)
-        self.txt_scc_search.textChanged.connect(self._filter_scc_list)
-        scc_layout.addWidget(self.txt_scc_search, 1)
-        
-        self.btn_scc_multi = QPushButton("Multi")
-        self.btn_scc_multi.setFixedWidth(50)
+        self.btn_scc_multi = QPushButton("Search")
+        self.btn_scc_multi.setFixedWidth(90)
         self.btn_scc_multi.setToolTip("Select multiple SCCs from a searchable list")
+        self.btn_scc_multi.setEnabled(False)
         self.btn_scc_multi.clicked.connect(self._open_scc_multi)
         scc_layout.addWidget(self.btn_scc_multi)
 
-        layout.addRow("SCC Filter:", scc_layout)
+        layout.addRow("SCC:", scc_layout)
         
         if parent_layout: parent_layout.addWidget(group)
         if parent_layout: parent_layout.addWidget(group)
@@ -1529,18 +1501,26 @@ class NativeEmissionGUI(QMainWindow):
         layout.setVerticalSpacing(4)
         layout.setLabelAlignment(Qt.AlignRight)
         
+        # Consolidate Bins & CMap into one row
+        bins_cmap_layout = QHBoxLayout()
+        bins_cmap_layout.setSpacing(6)
+        
         self.txt_bins = QLineEdit()
         self.txt_bins.setPlaceholderText("e.g. 0, 1, 10, 100")
-        layout.addRow("Custom Bins:", self.txt_bins)
+        bins_cmap_layout.addWidget(self.txt_bins, 1)
         
+        bins_cmap_layout.addWidget(QLabel("CMap:"))
         self.cmb_cmap = QComboBox()
+        self.cmb_cmap.setFixedWidth(120)
         self.cmb_cmap.setMaxVisibleItems(8)
         self.cmb_cmap.view().setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.cmb_cmap.view().setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.cmb_cmap.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.cmb_cmap.addItems(sorted([m for m in plt.colormaps() if not m.endswith('_r')]))
         self.cmb_cmap.setCurrentText('jet')
-        layout.addRow("Colormap:", self.cmb_cmap)
+        bins_cmap_layout.addWidget(self.cmb_cmap)
+        
+        layout.addRow("Bins:", bins_cmap_layout)
         
         ov_row = QHBoxLayout()
         ov_row.setSpacing(4)
@@ -1548,19 +1528,28 @@ class NativeEmissionGUI(QMainWindow):
         self.txt_overlay_shp.setPlaceholderText("Roads, Cities, etc...")
         self.txt_overlay_shp.editingFinished.connect(self._on_overlay_path_edit)
         ov_row.addWidget(self.txt_overlay_shp, 1)
-        btn_ov = QPushButton("Browse")
-        btn_ov.clicked.connect(self.browse_overlay_shpfile)
-        ov_row.addWidget(btn_ov, 0)
+        self.btn_browse_overlay = QPushButton("Browse")
+        self.btn_browse_overlay.clicked.connect(self.browse_overlay_shpfile)
+        ov_row.addWidget(self.btn_browse_overlay, 0)
         layout.addRow("Overlay:", ov_row)
         
         # Limits
         lim_layout = QHBoxLayout()
+        tip = "Force a specific color-bar range for the map. For NetCDF files, this overrides the automatic global scaling (e.g. for animations)."
+        
         self.txt_rmin = QLineEdit(); self.txt_rmin.setPlaceholderText("Min")
+        self.txt_rmin.setToolTip(tip)
         self.txt_rmax = QLineEdit(); self.txt_rmax.setPlaceholderText("Max")
+        self.txt_rmax.setToolTip(tip)
+        
         lim_layout.addWidget(self.txt_rmin)
-        lim_layout.addWidget(QLabel("to"))
+        l_to = QLabel("to"); l_to.setToolTip(tip)
+        lim_layout.addWidget(l_to)
         lim_layout.addWidget(self.txt_rmax)
-        layout.addRow("Fixed Scale:", lim_layout)
+        
+        l_fixed = QLabel("Fixed Scale:")
+        l_fixed.setToolTip(tip)
+        layout.addRow(l_fixed, lim_layout)
         
         # Toggles
         check_layout = QGridLayout()
@@ -1577,23 +1566,13 @@ class NativeEmissionGUI(QMainWindow):
         self.chk_nan0 = QCheckBox("Fill NaN values with 0")
         self.chk_nan0.setToolTip("Fill NaN values with 0.0. This affects both the map visualization and the calculated statistics (Sum, Mean).")
         
-        self.chk_graticule = QCheckBox("Graticule")
-        self.chk_graticule.setChecked(True)
-        self.chk_graticule.setToolTip("Show lat/lon grid lines")
-        
         self.chk_rev_cmap = QCheckBox("Reverse CMap")
         self.chk_rev_cmap.setToolTip("Invert the colormap colors")
-        
-        self.chk_quadmesh = QCheckBox("Fast QuadMesh")
-        self.chk_quadmesh.setChecked(True)
-        self.chk_quadmesh.setToolTip("Dramatically faster plotting for large grids")
         
         check_layout.addWidget(self.chk_log, 0, 0)
         check_layout.addWidget(self.chk_zoom, 0, 1)
         check_layout.addWidget(self.chk_nan0, 1, 0)
-        check_layout.addWidget(self.chk_graticule, 1, 1)
-        check_layout.addWidget(self.chk_rev_cmap, 2, 0)
-        check_layout.addWidget(self.chk_quadmesh, 2, 1)
+        check_layout.addWidget(self.chk_rev_cmap, 1, 1)
         layout.addRow("Controls:", check_layout)
         
         if parent_layout: parent_layout.addWidget(group)
@@ -1825,10 +1804,10 @@ class NativeEmissionGUI(QMainWindow):
                 self.txt_custom_delim.setText(delim)
         
         # 2. Filtering
-        if cli.get('filtered_by_column') or cli.get('filter_col'): 
-            self.cmb_filter_col.setCurrentText(str(cli.get('filtered_by_column') or cli.get('filter_col')))
-        if cli.get('filtered_by_val') or cli.get('filter_val'): 
-            self.txt_filter_val.setText(str(cli.get('filtered_by_val') or cli.get('filter_val')))
+        # NOTE: filter_col / filter_val are data-loading filters applied during
+        # read_inputfile() → read_ff10(). They must NOT be copied into the GUI's
+        # Filter tab, which is for ad-hoc post-load filtering. Doing so would
+        # cause double-filtering and crash on Categorical columns.
         if cli.get('filtered_by_op') or cli.get('filter_shapefile_opt'): 
             self.cmb_filter_op.setCurrentText(str(cli.get('filtered_by_op') or cli.get('filter_shapefile_opt')))
         
@@ -1878,11 +1857,32 @@ class NativeEmissionGUI(QMainWindow):
              self.chk_nan0.setChecked(default_checked)
              
              if hasattr(self, 'txt_nan_val'): self.txt_nan_val.setText(str(nan_val))
-
+        # Scale overrides
         low = cli.get('fixed_min') or cli.get('fixed_range_min') or cli.get('vmin')
         high = cli.get('fixed_max') or cli.get('fixed_range_max') or cli.get('vmax')
         if low is not None: self.txt_rmin.setText(str(low))
         if high is not None: self.txt_rmax.setText(str(high))
+
+        # 5. NetCDF Settings
+        zdim = cli.get('ncf-zdim') if 'ncf-zdim' in cli else cli.get('ncf_zdim')
+        if zdim is not None: self._last_cfg_zdim = str(zdim)
+        tdim = cli.get('ncf-tdim') if 'ncf-tdim' in cli else cli.get('ncf_tdim')
+        if tdim is not None: self._last_cfg_tdim = str(tdim)
+
+    def _batch_dim(self, ui_text: str) -> str:
+        """Convert UI labels like 'Avg All' to batch keywords like 'avg', and 'LAY 0' to index '0'."""
+        if not ui_text: return "0"
+        t = ui_text.lower()
+        if "avg" in t: return "avg"
+        if "sum" in t: return "sum"
+        if "max" in t: return "max"
+        if "min" in t: return "min"
+        # Consistency: Convert "LAY X" or "TSTEP X" to 0-based integer index
+        if "lay" in t or "step" in t:
+            try:
+                return str(int(t.split()[-1]))
+            except: pass
+        return ui_text 
 
     def select_input_file(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -2176,9 +2176,9 @@ class NativeEmissionGUI(QMainWindow):
         lay_txt = self.cmb_ncf_layer.currentText().lower()
         if 'sum' in lay_txt: params['layer_op'] = 'sum'; params['layer_idx'] = None
         elif 'avg' in lay_txt or 'mean' in lay_txt: params['layer_op'] = 'mean'; params['layer_idx'] = None
-        elif 'layer' in lay_txt:
+        elif 'lay' in lay_txt:
             try:
-                params['layer_idx'] = int(lay_txt.split()[-1]) - 1
+                params['layer_idx'] = int(lay_txt.split()[-1])
                 params['layer_op'] = 'select'
             except:
                 params['layer_idx'] = 0; params['layer_op'] = 'select'
@@ -2192,7 +2192,7 @@ class NativeEmissionGUI(QMainWindow):
         elif 'max' in ts_txt: params['tstep_op'] = 'max'; params['tstep_idx'] = None
         elif 'step' in ts_txt:
             try:
-                params['tstep_idx'] = int(ts_txt.split()[-1]) - 1
+                params['tstep_idx'] = int(ts_txt.split()[-1])
                 params['tstep_op'] = 'select'
             except:
                 params['tstep_idx'] = 0; params['tstep_op'] = 'select'
@@ -2285,6 +2285,8 @@ class NativeEmissionGUI(QMainWindow):
                     
                     if isinstance(df, pd.DataFrame):
                         pols = detect_pollutants(df)
+                        # Filter for columns that actually exist in df (NetCDF lazy loading has attributes for cols that aren't loaded yet)
+                        pols = [p for p in pols if p in df.columns]
                         if pols:
                             sums = df[pols].sum()
                             maxs = df[pols].max()
@@ -2385,24 +2387,45 @@ class NativeEmissionGUI(QMainWindow):
 
     def _start_progress(self, msg="Processing...", pol=None):
         """Show progress bar and status message."""
-        sys.stdout.write(f">>> GUI_FLOW: Entering _start_progress (msg: {msg}) <<<\n")
-        sys.stdout.flush()
-        logging.warning(f"GUI_DEBUG: [_start_progress] Disabling button. msg: {msg}")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0) # Indeterminate
+        
         if pol:
             self.status_label.setText(f"Plotting {pol}...")
+            self.btn_main_plot.setText("PLOTTING...")
         else:
             self.status_label.setText(msg)
-        self.btn_main_plot.setEnabled(False)
+            if "Loading data" in msg:
+                self.btn_load_data.setText("LOADING...")
+        
+        # Disable all major action buttons to prevent conflicting tasks
+        for btn in [self.btn_main_plot, self.btn_load_data, self.btn_preview, 
+                    self.btn_metadata, self.btn_browse_gd, self.btn_browse_counties, 
+                    self.btn_fetch_online, self.btn_export, self.btn_browse_overlay,
+                    self.btn_scc_multi]:
+            if hasattr(self, btn.objectName()) or btn: # Basic check
+                 try: btn.setEnabled(False)
+                 except: pass
 
     @Slot()
     def _stop_progress(self):
         """Helper to re-enable UI after plot or load."""
+        QApplication.restoreOverrideCursor()
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 1)
+        
+        # Re-enable buttons and reset text
         self.btn_main_plot.setEnabled(True)
         self.btn_main_plot.setText("GENERATE PLOT")
+        self.btn_load_data.setEnabled(True)
+        self.btn_load_data.setText("Load Data")
+        
+        for btn in [self.btn_preview, self.btn_metadata, self.btn_browse_gd, 
+                    self.btn_browse_counties, self.btn_fetch_online, 
+                    self.btn_export, self.btn_browse_overlay, self.btn_scc_multi]:
+             if btn: btn.setEnabled(True)
+             
         self._set_status_busy(False)
 
     def _ensure_ff10_grid_mapping(self, *, notify_success: bool = True) -> None:
@@ -2501,12 +2524,15 @@ class NativeEmissionGUI(QMainWindow):
         c = pyproj.CRS.from_epsg(4326)
         tf = pyproj.Transformer.from_crs(c, c, always_xy=True)
         return c, tf, tf
-        return pyproj.CRS.from_epsg(4326), None, None
 
     @Slot(list, bool)
     def _post_load_update(self, pollutants, is_ncf):
         """Update UI after background loading finishes."""
         if self.emissions_df is None: return
+
+        # Capture current selections to prevent reset during UI refresh
+        cur_pol = self.cmb_pollutant.currentText()
+        cur_scc = self.cmb_scc.currentText()
 
         self._invalidate_merge_cache()
         self._ff10_grid_ready = False
@@ -2548,8 +2574,10 @@ class NativeEmissionGUI(QMainWindow):
         self.cmb_pollutant.clear()
         self.cmb_pollutant.addItems(self.pollutants)
         
-        # Restore preselected or first pollutant
-        if self.preselected_pollutant in self.pollutants:
+        # Selection Priority: 1. Current user session, 2. CLI/Config preference, 3. First available
+        if cur_pol in self.pollutants:
+            self.cmb_pollutant.setCurrentText(cur_pol)
+        elif self.preselected_pollutant in self.pollutants:
             self.cmb_pollutant.setCurrentText(self.preselected_pollutant)
         elif self.pollutants:
             self.cmb_pollutant.setCurrentIndex(0)
@@ -2581,19 +2609,57 @@ class NativeEmissionGUI(QMainWindow):
             fname = self.input_files_list[0]
             try:
                 dims = get_ncf_dims(fname)
+                
+                # Capture current selections to prevent reset
+                cur_lay = self.cmb_ncf_layer.currentText()
+                cur_ts = self.cmb_ncf_time.currentText()
+
                 # Layers
                 n_lay = dims.get('n_layers', 1)
-                lay_items = ['Sum All', 'Avg All'] + [f"Layer {i+1}" for i in range(n_lay)]
+                lay_items = ['Sum All', 'Avg All'] + [f"LAY {i}" for i in range(n_lay)]
                 self.cmb_ncf_layer.blockSignals(True)
                 self.cmb_ncf_layer.clear()
                 self.cmb_ncf_layer.addItems(lay_items)
+                
+                # Selection priority: 1. Session persistence, 2. Config/CLI settings, 3. Default (LAY 0)
+                if cur_lay in lay_items:
+                    self.cmb_ncf_layer.setCurrentText(cur_lay)
+                elif hasattr(self, '_last_cfg_zdim'):
+                    cfg_z = str(self._last_cfg_zdim).lower()
+                    for item in lay_items:
+                        # Prioritize strict integer mapping for 0-based consistency
+                        if cfg_z.isdigit() and item == f"LAY {cfg_z}":
+                            self.cmb_ncf_layer.setCurrentText(item)
+                            break
+                        elif not cfg_z.isdigit() and cfg_z in item.lower():
+                            self.cmb_ncf_layer.setCurrentText(item)
+                            break
+                elif 'LAY 0' in lay_items:
+                     self.cmb_ncf_layer.setCurrentText('LAY 0')
                 self.cmb_ncf_layer.blockSignals(False)
+                
                 # Time
                 n_ts = dims.get('n_tsteps', 1)
-                ts_items = ['Avg All', 'Sum All', 'Max'] + [f"Step {i+1}" for i in range(n_ts)]
+                ts_items = ['Avg All', 'Sum All', 'Max'] + [f"TSTEP {i}" for i in range(n_ts)]
                 self.cmb_ncf_time.blockSignals(True)
                 self.cmb_ncf_time.clear()
                 self.cmb_ncf_time.addItems(ts_items)
+                
+                # Selection priority: 1. Session persistence, 2. Config/CLI settings, 3. Default (TSTEP 0)
+                if cur_ts in ts_items:
+                    self.cmb_ncf_time.setCurrentText(cur_ts)
+                elif hasattr(self, '_last_cfg_tdim'):
+                    cfg_t = str(self._last_cfg_tdim).lower()
+                    for item in ts_items:
+                        # Prioritize strict integer mapping
+                        if cfg_t.isdigit() and item == f"TSTEP {cfg_t}":
+                            self.cmb_ncf_time.setCurrentText(item)
+                            break
+                        elif not cfg_t.isdigit() and cfg_t in item.lower():
+                            self.cmb_ncf_time.setCurrentText(item)
+                            break
+                elif 'TSTEP 0' in ts_items:
+                    self.cmb_ncf_time.setCurrentText('TSTEP 0')
                 self.cmb_ncf_time.blockSignals(False)
                 
 
@@ -2655,11 +2721,21 @@ class NativeEmissionGUI(QMainWindow):
                 self.cmb_scc.clear()
                 self.cmb_scc.addItem("All SCC")
                 if self._scc_display_to_code:
-                    self.cmb_scc.addItems(sorted(self._scc_display_to_code.keys()))
+                    scc_items = sorted(self._scc_display_to_code.keys())
+                    self.cmb_scc.addItems(scc_items)
+                    
+                    # Restore previous SCC selection or Multi state
+                    if cur_scc in scc_items or cur_scc == "All SCC":
+                        self.cmb_scc.setCurrentText(cur_scc)
+                    elif self.selected_sccs:
+                        self.cmb_scc.setCurrentText("(Multi)")
+                        
                     self.cmb_scc.setEnabled(True)
+                    self.btn_scc_multi.setEnabled(True)
                     print(f">>> SCC_DEBUG: SCC dropdown ENABLED.")
                 else:
                     self.cmb_scc.setEnabled(False)
+                    self.btn_scc_multi.setEnabled(False)
                     print(f">>> SCC_DEBUG: SCC dropdown DISABLED (no items).")
                 self.cmb_scc.blockSignals(False)
                 self._scc_full_list = None 
@@ -2667,6 +2743,7 @@ class NativeEmissionGUI(QMainWindow):
                 print(f">>> SCC_DEBUG: FAILED with error: {e}")
                 logging.warning(f"SCC mapping failed: {e}")
                 self.cmb_scc.setEnabled(False)
+                self.btn_scc_multi.setEnabled(False)
 
         # Set plot type from config (validation happens in _merged() during plot)
         # Following gui_qt.py pattern: just read the config, don't try to validate/correct
@@ -2685,24 +2762,32 @@ class NativeEmissionGUI(QMainWindow):
         if self.counties_path and self.counties_gdf is None:
              self._load_shapes()
 
-        # Auto-select and plot if configured
-        preselected = getattr(self, 'preselected_pollutant', None)
-        if not preselected:
-            cli = getattr(self, '_json_arguments', {})
-            preselected = cli.get('pollutant')
+        # Auto-select and plot if configured - ONLY if no user session exists
+        if not cur_pol or cur_pol == "":
+            preselected = getattr(self, 'preselected_pollutant', None)
+            if not preselected:
+                cli = getattr(self, '_json_arguments', {})
+                preselected = cli.get('pollutant')
 
-        if preselected:
-            if isinstance(preselected, list): 
-                preselected = preselected[0]
-            elif isinstance(preselected, str) and ',' in preselected:
-                preselected = preselected.split(',')[0].strip()
-                
-            if preselected in pollutants:
-                logging.info(f"Auto-selecting pollutant: {preselected}")
-                self.cmb_pollutant.setCurrentText(preselected)
-                
-                # Trigger plot after a brief delay to allow UI to settle
-                QTimer.singleShot(500, self.update_plot)
+            if preselected:
+                if isinstance(preselected, list): 
+                    preselected = preselected[0]
+                elif isinstance(preselected, str) and ',' in preselected:
+                    preselected = preselected.split(',')[0].strip()
+                    
+                if preselected in pollutants:
+                    logging.info(f"Auto-selecting pollutant: {preselected}")
+                    self.cmb_pollutant.setCurrentText(preselected)
+                    
+                    # Trigger plot after a brief delay to allow UI to settle
+                    QTimer.singleShot(500, self.update_plot)
+        else:
+            # If a refresh was triggered by NCF dim change, update the current plot
+            if self._ncf_refresh_active:
+                logging.info("NCF dimension change detected. Updating plot...")
+                QTimer.singleShot(300, self.update_plot)
+        
+        self._ncf_refresh_active = False
 
     def _load_shapes(self):
         """Load county shapefiles."""
@@ -2727,6 +2812,13 @@ class NativeEmissionGUI(QMainWindow):
         self._t_idx = 0
         self._is_showing_agg = False
 
+    def _trigger_ncf_refresh(self):
+        """Trigger a background reload and visual refresh when NCF dimensions change."""
+        self._clear_anim_cache()
+        self._invalidate_merge_cache()  # Crucial to force re-fetch of pollutants
+        self._ncf_refresh_active = True
+        self.load_input_file(self.input_files_list)
+
     def _pollutant_changed(self):
         # Update units label if metadata available
         pol = self.cmb_pollutant.currentText()
@@ -2745,7 +2837,6 @@ class NativeEmissionGUI(QMainWindow):
         # Keep plot_controls_frame visible if NCF data is loaded
         # Trigger background load of time series to get global min/max for scaling
         if self.ncf_frame.isVisible():
-             from PyQt5.QtCore import QTimer
              QTimer.singleShot(100, self._ensure_time_data)
 
     def _ensure_time_data(self):
@@ -2755,7 +2846,8 @@ class NativeEmissionGUI(QMainWindow):
         
         try:
             from ncf_processing import get_ncf_animation_data
-            df = self.emissions_df
+            # Use _merged_gdf (the plotted GDF) to ensure row/col order matches _update_view
+            df = self._merged_gdf if self._merged_gdf is not None and 'ROW' in getattr(self._merged_gdf, 'columns', []) else self.emissions_df
             # Prepare indices for ALL cells in plot
             r_col = 'ROW'; c_col = 'COL'
             if 'ROW' not in df.columns and 'ROW_x' in df.columns: r_col = 'ROW_x'
@@ -3379,9 +3471,18 @@ class NativeEmissionGUI(QMainWindow):
                 'unit': unit,
                 'vmin': safe_float(self.txt_rmin.text()),
                 'vmax': safe_float(self.txt_rmax.text()),
-                'show_graticule': self.chk_graticule.isChecked() if hasattr(self, 'chk_graticule') else True,
+                'show_graticule': True,
                 'zoom_to_data': self.chk_zoom.isChecked(),
                 'fill_nan': self.chk_nan0.isChecked()
+            }
+
+            # Thread-Safety: Capture filter UI state on the main thread
+            filter_state = {
+                'filter_col': self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else '',
+                'filter_val': self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else '',
+                'range_min': self.txt_range_min.text() if hasattr(self, 'txt_range_min') else '',
+                'range_max': self.txt_range_max.text() if hasattr(self, 'txt_range_max') else '',
+                'filter_op': self.cmb_filter_op.currentText() if hasattr(self, 'cmb_filter_op') else 'False',
             }
             
             logging.warning(f"GUI_DEBUG: [update_plot] Starting background thread for {pol}...")
@@ -3390,7 +3491,7 @@ class NativeEmissionGUI(QMainWindow):
             
             threading.Thread(
                 target=self._plot_worker, 
-                args=(pol, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed),
+                args=(pol, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed, filter_state),
                 daemon=True
             ).start()
             
@@ -3402,14 +3503,18 @@ class NativeEmissionGUI(QMainWindow):
             self._stop_progress()
             self.notify_signal.emit("ERROR", f"Plot Update: {e}")
 
-    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None, fill_nan=False) -> Optional[gpd.GeoDataFrame]:
+    def _merged(self, plot_by_mode=None, scc_selection=None, scc_code_map=None, notify=None, pollutant=None, fill_nan=False, filter_state=None) -> Optional[gpd.GeoDataFrame]:
         """Prepare and merge emissions with geometry, mirroring gui_qt.py logic exactly."""
         def _do_notify(level, title, msg, exc=None, **kwargs):
             if notify: notify(level, title, msg, exc, **kwargs)
             else: self.notify_signal.emit(level, f"{title}: {msg}")
 
+        # Thread-Safety: Use pre-captured filter_state if provided (from main thread)
+        if filter_state is None:
+            filter_state = {}
+
         # Determine target pollutant early
-        target_pol = pollutant if pollutant else self.cmb_pollutant.currentText()
+        target_pol = pollutant if pollutant else ''
         logging.warning(f"GUI_DEBUG: [_merged] Start. Pollutant: {target_pol}, FillNaN: {fill_nan}")
         
         if self.emissions_df is None:
@@ -3428,9 +3533,12 @@ class NativeEmissionGUI(QMainWindow):
         
         logging.warning(f"GUI_DEBUG: [_merged] State: has_geometry={has_geometry}, is_native={is_native}, mode={mode}, len={len(self.emissions_df)}")
 
+        # Local storage for lazy-fetched data in this specific merge call
+        # Using a local variable instead of self._lazy_fetched_col for better thread safety
+        current_lazy_col = None
+
         # LAZY FETCH: Check if we need to fetch the pollutant into the main DF before proceeding
         if target_pol and hasattr(self.emissions_df, 'columns') and target_pol not in self.emissions_df.columns:
-            # ... (lines 2818-2838) ...
             ds = getattr(self.emissions_df, 'attrs', {}).get('_smk_xr_ds')
             if ds is not None:
                 try:
@@ -3441,7 +3549,9 @@ class NativeEmissionGUI(QMainWindow):
                     if path:
                         new_data = read_ncf_emissions(path, pollutants=[target_pol], xr_ds=ds, **ncf_params)
                         if target_pol in new_data.columns:
-                            self.emissions_df[target_pol] = new_data[target_pol].values
+                            # Thread-Safety: Do NOT mutate self.emissions_df from background thread.
+                            # Store column locally for application on the copy below.
+                            current_lazy_col = (target_pol, new_data[target_pol].values)
                             if target_pol not in self.units_map:
                                 v_meta = new_data.attrs.get('variable_metadata', {}).get(target_pol, {})
                                 self.units_map[target_pol] = v_meta.get('units', '')
@@ -3449,60 +3559,67 @@ class NativeEmissionGUI(QMainWindow):
                     _do_notify('WARNING', 'Fetch Failed', f"Could not lazy-load {target_pol}: {e}")
 
         # Shortcut for Native Grids or Already-Geometrized Data
-        # Only take shortcut if we have geometry (vectors ready) OR if dataset is large enough for QuadMesh (no geometry needed)
-        can_shortcut = has_geometry or (is_native and len(self.emissions_df) > 10000)
+        # We always take the shortcut for native gridded data to avoid losing lazy-loaded pollutants
+        # during the complex aggregation/merge logic intended for vector data.
+        can_shortcut = has_geometry or is_native
         
         if can_shortcut and mode in ['auto', 'grid']:
-            if target_pol and target_pol in getattr(self.emissions_df, 'columns', []):
-                logging.warning(f"GUI_DEBUG: [_merged] Native/Geometry shortcut triggered for {target_pol}")
-                
-                # Include all columns to support full table view after plotting
-                if has_geometry and isinstance(self.emissions_df, gpd.GeoDataFrame):
-                    res_df = self.emissions_df.copy()
-                else:
-                    res_df = self.emissions_df.copy()
+            # Determine which columns to keep (IDs + active pollutant)
+            id_cols = {'ROW', 'COL', 'FIPS', 'region_cd', 'GRID_RC', 'SCC', 'geometry'}
+            # Case-insensitive and whitespace-stripped match
+            t_clean = target_pol.strip().upper() if target_pol else None
+            cols_to_keep = [c for c in self.emissions_df.columns if c in id_cols or c.upper() in id_cols or (t_clean and c.strip().upper() == t_clean)]
+            
+            # Create subset copy
+            res_df = self.emissions_df[cols_to_keep].copy()
 
-                # Ensure ROW and COL are integers for QuadMesh optimization
-                for c_idx in ['ROW', 'COL']:
-                    if c_idx in res_df.columns:
-                        # Fill NaNs with -1 (invalid index) and convert to int to avoid casting errors
-                        res_df[c_idx] = res_df[c_idx].fillna(-1).astype(int)
+            # Apply lazy column if it was fetched
+            if current_lazy_col and current_lazy_col[0] == target_pol and target_pol not in res_df.columns:
+                res_df[target_pol] = current_lazy_col[1]
 
-                if fill_nan:
-                    res_df[target_pol] = res_df[target_pol].fillna(0)
-                
-                # ... (rest remains same) ...
-                # Ensure GRID_RC exists
-                if 'GRID_RC' not in res_df.columns and 'ROW' in res_df.columns and 'COL' in res_df.columns:
-                    try: res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
-                    except: pass
-                
-                # Return if GDF
-                if isinstance(res_df, gpd.GeoDataFrame):
-                    return res_df
-                
-                # Convert to GDF with robust geometry init
-                if 'geometry' not in res_df.columns:
-                    res_df['geometry'] = [None] * len(res_df)
-                
-                res_gdf = gpd.GeoDataFrame(res_df, geometry='geometry')
-                res_gdf.attrs = self.emissions_df.attrs.copy()
-                # Ensure it's tagged as native
-                res_gdf.attrs['_smk_is_native'] = True
-               
-                # Inject grid info if missing
-                if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
-                     if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
-                          res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
-                
-                if getattr(res_gdf, 'crs', None) is None:
-                    try:
-                        info = res_gdf.attrs.get('_smk_grid_info')
-                        if info and info.get('proj_str'):
-                            res_gdf.set_crs(info['proj_str'], inplace=True)
-                    except: pass
-                
-                return res_gdf
+            # Ensure ROW and COL are integers for QuadMesh optimization
+            for c_idx in ['ROW', 'COL']:
+                if c_idx in res_df.columns:
+                    # Fill NaNs with -1 (invalid index) and explicitly cast to int64
+                    res_df[c_idx] = res_df[c_idx].fillna(-1).astype('int64')
+
+            if fill_nan and target_pol and target_pol in res_df.columns:
+                res_df[target_pol] = res_df[target_pol].fillna(0).astype('float32')
+            elif target_pol and target_pol in res_df.columns:
+                # Ensure float32 for memory efficiency and matplotlib compatibility
+                if pd.api.types.is_numeric_dtype(res_df[target_pol]):
+                    res_df[target_pol] = res_df[target_pol].astype('float32')
+            
+            # Ensure GRID_RC exists
+            if 'GRID_RC' not in res_df.columns and 'ROW' in res_df.columns and 'COL' in res_df.columns:
+                try: res_df['GRID_RC'] = res_df['ROW'].astype(str) + '_' + res_df['COL'].astype(str)
+                except: pass
+            
+            # Return if already a GeoDataFrame
+            if isinstance(res_df, gpd.GeoDataFrame):
+                return res_df
+            
+            # Convert to GDF with robust geometry init
+            if 'geometry' not in res_df.columns:
+                res_df['geometry'] = [None] * len(res_df)
+            
+            res_gdf = gpd.GeoDataFrame(res_df, geometry='geometry')
+            res_gdf.attrs = self.emissions_df.attrs.copy()
+            res_gdf.attrs['_smk_is_native'] = True
+           
+            # Inject grid info if missing
+            if '_smk_grid_info' not in res_gdf.attrs and self.grid_gdf is not None:
+                 if hasattr(self.grid_gdf, 'attrs') and '_smk_grid_info' in self.grid_gdf.attrs:
+                      res_gdf.attrs['_smk_grid_info'] = self.grid_gdf.attrs['_smk_grid_info']
+            
+            if getattr(res_gdf, 'crs', None) is None:
+                try:
+                    info = res_gdf.attrs.get('_smk_grid_info')
+                    if info and info.get('proj_str'):
+                        res_gdf.set_crs(info['proj_str'], inplace=True)
+                except: pass
+            
+            return res_gdf
 
         base_gdf: Optional[gpd.GeoDataFrame] = None
         merge_on: Optional[str] = None
@@ -3513,8 +3630,8 @@ class NativeEmissionGUI(QMainWindow):
         except Exception:
             source_type = None
 
-        sel_display = scc_selection if scc_selection is not None else self.cmb_scc.currentText()
-        sel_code = None # Changed from '' to handle lists
+        sel_display = scc_selection if scc_selection is not None else ''
+        sel_code = ''  # Empty string for consistent falsy behavior
         code_map = scc_code_map if scc_code_map is not None else self._scc_display_to_code
         
         if self.selected_sccs and scc_selection is None:
@@ -3544,10 +3661,8 @@ class NativeEmissionGUI(QMainWindow):
             if not is_native:
                 self._ensure_ff10_grid_mapping(notify_success=False)
             else:
-                if 'GRID_RC' not in self.emissions_df.columns and 'ROW' in self.emissions_df.columns:
-                    try:
-                        self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
-                    except: pass
+                # GRID_RC will be created on the local copy (emis_for_merge) below
+                pass
 
             base_gdf = self.grid_gdf
             merge_on = 'GRID_RC'
@@ -3574,9 +3689,8 @@ class NativeEmissionGUI(QMainWindow):
                     if not is_native:
                         self._ensure_ff10_grid_mapping(notify_success=False)
                     else:
-                        if 'ROW' in self.emissions_df.columns:
-                             try: self.emissions_df['GRID_RC'] = self.emissions_df['ROW'].astype(str) + '_' + self.emissions_df['COL'].astype(str)
-                             except: pass
+                        # GRID_RC will be created on the local copy (emis_for_merge) below
+                        pass
                              
                 if 'GRID_RC' in getattr(self.emissions_df, 'columns', []):
                     base_gdf = self.grid_gdf
@@ -3616,6 +3730,13 @@ class NativeEmissionGUI(QMainWindow):
         pol_tuple = tuple(self.pollutants or [])
         # target_pol determined above
 
+        # Thread-Safety: Read filter state from pre-captured dict (not from widgets)
+        f_col = filter_state.get('filter_col', '')
+        f_vals_str = filter_state.get('filter_val', '')
+        f_min = filter_state.get('range_min', '')
+        f_max = filter_state.get('range_max', '')
+        f_op = filter_state.get('filter_op', 'False')
+
         # Cache key including NaN fill and spatial filter state
         cache_key = (
             geometry_tag or mode,
@@ -3629,21 +3750,26 @@ class NativeEmissionGUI(QMainWindow):
             pol_tuple,
             target_pol if fill_nan else '',
             fill_nan,
-            self.cmb_filter_op.currentText() if hasattr(self, 'cmb_filter_op') else 'False',
+            f_op,
             id(self.filter_gdf) if getattr(self, 'filter_gdf', None) is not None else 0,
-            self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else '',
-            self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else '',
-            self.txt_range_min.text() if hasattr(self, 'txt_range_min') else '',
-            self.txt_range_max.text() if hasattr(self, 'txt_range_max') else ''
+            f_col,
+            f_vals_str,
+            f_min,
+            f_max
         )
         
         cached = self._merged_cache.get(cache_key)
         if cached is not None:
             return cached[0].copy()
 
-        # Use full copy to avoid issues with duplicate columns in source data
+        # Memory Optimization: Subset columns before heavy operations
+        id_cols = {'ROW', 'COL', 'FIPS', 'region_cd', 'GRID_RC', 'SCC', 'geometry', f_col}
+        t_clean = target_pol.strip().upper() if target_pol else None
+        cols_to_keep = [c for c in self.emissions_df.columns if c in id_cols or c.upper() in id_cols or (t_clean and c.strip().upper() == t_clean)]
+        
         if isinstance(self.emissions_df, pd.DataFrame):
-            emis_for_merge = self.emissions_df.copy()
+            # Subset before copying to save time/memory
+            emis_for_merge = self.emissions_df[cols_to_keep].copy()
             # Copy attrs manually
             if hasattr(self.emissions_df, 'attrs'):
                 emis_for_merge.attrs = self.emissions_df.attrs.copy()
@@ -3653,12 +3779,20 @@ class NativeEmissionGUI(QMainWindow):
         if emis_for_merge is None:
             return None
 
+        # Apply lazy-fetched column to local copy if available
+        if current_lazy_col and current_lazy_col[0] == target_pol and target_pol not in emis_for_merge.columns:
+            emis_for_merge[target_pol] = current_lazy_col[1]
+
+        # Thread-Safety: Ensure GRID_RC on local copy if needed
+        if merge_on == 'GRID_RC' and 'GRID_RC' not in emis_for_merge.columns:
+            if 'ROW' in emis_for_merge.columns and 'COL' in emis_for_merge.columns:
+                try:
+                    emis_for_merge['GRID_RC'] = emis_for_merge['ROW'].astype(str) + '_' + emis_for_merge['COL'].astype(str)
+                except Exception:
+                    pass
+
         # --- Advanced Attribute Filtering ---
-        # Read filter settings from the Filter Tab widgets
-        f_col = self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else ''
-        f_vals_str = self.txt_filter_val.text() if hasattr(self, 'txt_filter_val') else ''
-        f_min = self.txt_range_min.text() if hasattr(self, 'txt_range_min') else ''
-        f_max = self.txt_range_max.text() if hasattr(self, 'txt_range_max') else ''
+        # Filter settings already read from filter_state above
         
         def _apply_attr_filters(df):
             if not isinstance(df, pd.DataFrame) or not f_col or f_col not in df.columns:
@@ -3781,8 +3915,8 @@ class NativeEmissionGUI(QMainWindow):
                         # merged['__has_emissions'] tells us if it was a match
                         merged[cols_to_fill] = merged[cols_to_fill].fillna(0.0)
 
-            # Spatial Filtering
-            filter_mode = self.cmb_filter_op.currentText()
+            # Spatial Filtering (use pre-captured filter_state, not widget)
+            filter_mode = f_op
             if filter_mode != 'False' and self.filter_gdf is not None:
                 _do_notify('INFO', 'Filtering', f'Filtering data by shapefile ({filter_mode})...')
                 from data_processing import apply_spatial_filter
@@ -3820,12 +3954,13 @@ class NativeEmissionGUI(QMainWindow):
                                 )
             except Exception: pass
             
+            import gc; gc.collect()
             return merged
         except Exception as e:
             _do_notify('ERROR', 'Merge Failed', f"{e}")
             return None
 
-    def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed):
+    def _plot_worker(self, pollutant, plot_by_mode, scc_selection, scc_code_map, plot_crs_info, meta_fixed, filter_state=None):
         """Worker thread to prepare data and reproject, mirroring gui_qt.py exactly."""
         try:
             logging.warning(f"GUI_DEBUG: [PlotWorker] Starting for {pollutant}")
@@ -3845,7 +3980,8 @@ class NativeEmissionGUI(QMainWindow):
                     scc_code_map=scc_code_map,
                     notify=safe_notify,
                     pollutant=pollutant,
-                    fill_nan=meta_fixed.get('fill_nan', False)
+                    fill_nan=meta_fixed.get('fill_nan', False),
+                    filter_state=filter_state
                 )
                 if merged is not None:
                     print(f"DEBUG: [PlotWorker] _merged success. Rows: {len(merged)}")
@@ -3959,6 +4095,12 @@ class NativeEmissionGUI(QMainWindow):
             return
         self._smk_rendering = True
         try:
+            # Memory Safety: Detach hover handlers from all axes before clearing
+            # This prevents 'zombie' closures from trying to access GC-locked geometries.
+            for ax in self.figure.axes:
+                ax.format_coord = lambda x, y: ""
+                if hasattr(ax, '_smk_hover_gdf'): ax._smk_hover_gdf = None
+
             if gdf is None or gdf.empty:
                 logging.warning("GDF is empty. Nothing to plot.")
                 self.figure.clear()
@@ -4023,6 +4165,28 @@ class NativeEmissionGUI(QMainWindow):
                      b.clicked.connect(partial(self._on_ts_view_click, mode))
                      self.pc_layout.addWidget(b)
                      
+                 # Cursor Plot Dropdown
+                 self.pc_layout.addSpacing(10)
+                 self.pc_layout.addWidget(QLabel("| Cursor Plot:"))
+                 self.cmb_cursor_mode = QComboBox()
+                 self.cmb_cursor_mode.addItems(["by-TSTEP", "by-LAY"])
+                 
+                 # Dynamic Enablage Logic for Cursor Plot
+                 has_multi_time = (self.cmb_ncf_time.count() > 4) if hasattr(self, 'cmb_ncf_time') else False
+                 has_multi_lay = (self.cmb_ncf_layer.count() > 3) if hasattr(self, 'cmb_ncf_layer') else False
+                 is_inline = (src_type == 'inline_point_lazy') or ('stack_groups_path' in attrs)
+                 
+                 if not has_multi_time:
+                     self.cmb_cursor_mode.model().item(0).setEnabled(False)
+                 if not has_multi_lay or is_inline:
+                     self.cmb_cursor_mode.model().item(1).setEnabled(False)
+                     
+                 # Auto-select available option
+                 if not has_multi_time and (has_multi_lay and not is_inline):
+                     self.cmb_cursor_mode.setCurrentIndex(1)
+                 
+                 self.pc_layout.addWidget(self.cmb_cursor_mode)
+                     
                  self.pc_layout.addStretch()
             # -----------------------------------------------------
 
@@ -4057,8 +4221,44 @@ class NativeEmissionGUI(QMainWindow):
             
             # 6. Render main plot
             self._merged_gdf = gdf
-            ax._smk_current_vals = gdf[column].values
-            ax._smk_pollutant = column 
+            
+            # Defensive Column Resolution: Try strict, then flexible, then recovery
+            actual_col = None
+            if column in gdf.columns:
+                actual_col = column
+            else:
+                # Find case-insensitive match
+                actual_col = next((c for c in gdf.columns if c.strip().upper() == column.strip().upper()), None)
+            
+            # --- EMERGENCY RECOVERY ---
+            # If the column is missing (e.g. was optimized away or lazy-load failed to sync),
+            # try to re-fetch it directly into the GDF if we have grid info.
+            if actual_col is None and self.input_files_list:
+                try:
+                    logging.warning(f"Pollutant '{column}' missing from GDF. Attempting emergency recovery fetch...")
+                    path = self.input_files_list[0]
+                    if path.endswith(('.nc', '.ncf', '.timind')):
+                        from ncf_processing import read_ncf_emissions
+                        # Extract just the single pollutant for this layer/time
+                        lay_idx = self.cmb_ncf_layer.currentIndex() if hasattr(self, 'cmb_ncf_layer') else 0
+                        t_idx = self.cmb_ncf_time.currentIndex() if hasattr(self, 'cmb_ncf_time') else 0
+                        
+                        # Fix for layer index if aggregate mode (Sum/Avg)
+                        if lay_idx < 0: lay_idx = 0
+                        
+                        rec_df = read_ncf_emissions(path, pollutants=[column], layer_idx=lay_idx, time_idx=t_idx)
+                        if column in rec_df.columns:
+                            gdf[column] = rec_df[column].values
+                            actual_col = column
+                            logging.info(f"Emergency recovery successful for {column}")
+                except Exception as ex:
+                    logging.error(f"Emergency recovery failed: {ex}")
+
+            if actual_col is None:
+                raise KeyError(f"Pollutant '{column}' not found in dataset. Available columns: {list(gdf.columns)}")
+
+            ax._smk_current_vals = gdf[actual_col].values
+            ax._smk_pollutant = actual_col 
             ax._smk_time_lbl = None
             
             p_lw = 0.05
@@ -4067,34 +4267,40 @@ class NativeEmissionGUI(QMainWindow):
                 p_lw = 0.0
                 p_ec = 'none'
 
-            unit = self.units_map.get(column, "")
+            unit = self.units_map.get(actual_col, "")
             if not unit:
                 vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
-                if isinstance(vmeta, dict) and column in vmeta:
-                     unit = vmeta[column].get('units', '')
+                if isinstance(vmeta, dict) and actual_col in vmeta:
+                     unit = vmeta[actual_col].get('units', '')
 
             # Fixed Scaling for NetCDF or Config
-            extra_plot_kwargs = {'disable_quadmesh': not self.chk_quadmesh.isChecked()}
+            extra_plot_kwargs = {'disable_quadmesh': False}
             
-            # 1. Config override (Explicit user intent)
-            if self._json_arguments.get('vmin') is not None:
+            # 1. Capture user intent from UI (passed in via meta)
+            if meta.get('vmin') is not None:
+                extra_plot_kwargs['vmin'] = meta['vmin']
+            if meta.get('vmax') is not None:
+                extra_plot_kwargs['vmax'] = meta['vmax']
+
+            # 2. Config override (Backup fallback)
+            if 'vmin' not in extra_plot_kwargs and self._json_arguments.get('vmin') is not None:
                 try: extra_plot_kwargs['vmin'] = float(self._json_arguments['vmin'])
                 except: pass
-            if self._json_arguments.get('vmax') is not None:
+            if 'vmax' not in extra_plot_kwargs and self._json_arguments.get('vmax') is not None:
                 try: extra_plot_kwargs['vmax'] = float(self._json_arguments['vmax'])
                 except: pass
                 
-            # 2. Animation Cache (Auto-calculated global limits for NetCDF)
+            # 3. Animation Cache (Auto-calculated global limits for NetCDF)
             if self._t_data_cache:
                 if 'vmin' not in extra_plot_kwargs:
                     extra_plot_kwargs['vmin'] = self._t_data_cache.get('vmin')
                 if 'vmax' not in extra_plot_kwargs:
                     extra_plot_kwargs['vmax'] = self._t_data_cache.get('vmax')
 
-            logging.info(f"DEBUG: [_render_plot_on_main] Starting create_map_plot...")
+            logging.info(f"DEBUG: [_render_plot_on_main] Starting create_map_plot for {actual_col}...")
             collection = create_map_plot(
                 gdf=gdf,
-                column=column,
+                column=actual_col,
                 title="", 
                 ax=ax,
                 cmap_name=cmap,
@@ -4187,7 +4393,7 @@ class NativeEmissionGUI(QMainWindow):
             self.canvas.draw_idle()
 
             # 6. Install Interactions (Hover & Box-Zoom)
-            self._setup_hover(gdf, column, ax, tf_inv=tf_inv)
+            self._setup_hover(gdf, actual_col, ax, tf_inv=tf_inv)
             self._install_box_zoom(ax)
             
             # Step-wise draw to register axes and allow tick generation
@@ -4271,7 +4477,7 @@ class NativeEmissionGUI(QMainWindow):
                 # 7c. Robust Colorbar Formatting (Fix for small values and custom bins)
                 try:
                     from matplotlib.ticker import FixedLocator, FuncFormatter, ScalarFormatter, LogFormatter, FixedFormatter, AutoLocator
-                    from matplotlib.colors import LogNorm
+                    from matplotlib.colors import LogNorm, BoundaryNorm
                     is_log = isinstance(norm, LogNorm) if norm is not None else False
                     bins_ticks = (bins if bins is not None else [])
 
@@ -4390,9 +4596,6 @@ class NativeEmissionGUI(QMainWindow):
                 self.toolbar.home = _home_override
                 
                 # C. Refresh Navigation Toolbar (Preserve stack if possible)
-                # We no longer clear the _nav_stack here to allow Back/Forward 
-                # to work across zoom/pan states. Home will always return to base.
-                
                 # IMPORTANT: In Qt, we must refresh the button states
                 if hasattr(self.toolbar, 'update'):
                     self.toolbar.update()
@@ -4411,35 +4614,29 @@ class NativeEmissionGUI(QMainWindow):
             except Exception as he:
                 logging.debug(f"Interaction sync failed: {he}")
  
-            self.notify_signal.emit("INFO", f"Plotted {column}")
-            self._update_stats_panel(gdf, column)
+            self.notify_signal.emit("INFO", f"Plotted {actual_col}")
+            self._update_stats_panel(gdf, actual_col)
             self.canvas.draw_idle()
             
+            # Memory Cleanup: explicitly trigger GC after successfully rendering everything
+            import gc
+            self._smk_rendering = False
+            self.canvas.draw()
+            gc.collect()
+            
         except Exception as e:
-            self.notify_signal.emit("ERROR", f"Render failed: {e}")
+            self._smk_rendering = False
+            self._stop_progress()
+            logging.error(f"Render failed: {e}")
+            import traceback
             traceback.print_exc()
+            self.notify_signal.emit("ERROR", f"Render failed: {e}")
+            import gc; gc.collect()
         finally:
             self._smk_rendering = False
             self._stop_progress()
 
-    def reset_home_view(self):
-        """Reset the plot view to the full extent of the loaded data (Full Domain)."""
-        try:
-            if self._merged_gdf is not None and not self._merged_gdf.empty:
-                ax = self.figure.gca()
-                bounds = self._merged_gdf.total_bounds
-                x_pad = (bounds[2] - bounds[0]) * 0.05
-                y_pad = (bounds[3] - bounds[1]) * 0.05
-                if x_pad == 0: x_pad = 0.5
-                if y_pad == 0: y_pad = 0.5
-                ax.set_xlim(bounds[0] - x_pad, bounds[2] + x_pad)
-                ax.set_ylim(bounds[1] - y_pad, bounds[3] + y_pad)
-                self.canvas.draw_idle()
-                self._update_plot_title(ax, immediate=True)
-            elif self.toolbar:
-                self.toolbar.home()
-        except Exception as e:
-            logging.warning(f"Reset view failed: {e}")
+
 
     def _on_canvas_motion(self, event):
         """Update status bar on hover."""
@@ -4495,12 +4692,13 @@ class NativeEmissionGUI(QMainWindow):
              
              # Layer/Op
              l_idx = 0; l_op = 'select'
-             lay_txt = self.cmb_ncf_layer.currentText()
-             if "Sum" in lay_txt: l_op = 'sum'
-             elif "Avg" in lay_txt: l_op = 'mean'
-             elif "Layer" in lay_txt:
-                 try: l_idx = int(lay_txt.split()[-1]) - 1
-                 except: pass
+             if hasattr(self, 'cmb_ncf_layer'):
+                 lay_txt = self.cmb_ncf_layer.currentText()
+                 if "Sum" in lay_txt: l_op = 'sum'
+                 elif "Avg" in lay_txt: l_op = 'mean'
+                 elif "Layer" in lay_txt:
+                     try: l_idx = int(lay_txt.split()[-1]) - 1
+                     except: pass
              
              QTimer.singleShot(0, lambda: self._exec_ts_plot(row_look, col_look, l_idx, l_op))
              
@@ -4509,30 +4707,65 @@ class NativeEmissionGUI(QMainWindow):
 
     def _exec_ts_plot(self, r, c, l_idx, l_op):
          try:
-             # Run extraction (blocking is okay for short TS, or move to thread if slow)
-             from ncf_processing import get_ncf_timeseries
-             # Support for Inline TS
-             sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
-             
-             res = get_ncf_timeseries(
-                self.input_files_list[0],
-                self.cmb_pollutant.currentText(),
-                [r-1], [c-1],
-                layer_idx=l_idx, layer_op=l_op, op='mean',
-                stack_groups_path=sg_path
-             )
-             
-             if res:
-                 self._show_ts_window(res, f"Cell ({r}, {c})")
-                 self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c})")
-             else:
-                 self.notify_signal.emit("WARNING", "No data found for cell.")
+             cursor_mode = "by-TSTEP"
+             if hasattr(self, 'cmb_cursor_mode'):
+                 cursor_mode = self.cmb_cursor_mode.currentText()
+                 
+             if cursor_mode == "by-TSTEP":
+                 from ncf_processing import get_ncf_timeseries
+                 # Support for Inline TS
+                 sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
+                 
+                 res = get_ncf_timeseries(
+                    self.input_files_list[0],
+                    self.cmb_pollutant.currentText(),
+                    [r-1], [c-1],
+                    layer_idx=l_idx, layer_op=l_op, op='mean',
+                    stack_groups_path=sg_path
+                 )
+                 
+                 if res:
+                     self._show_ts_window(res, f"Time Series @ Cell ({r}, {c})")
+                     self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c}) Time Series")
+                 else:
+                     self.notify_signal.emit("WARNING", "No data found for cell.")
+                     
+             elif cursor_mode == "by-LAY":
+                 from ncf_processing import get_ncf_profile
+                 # Get current timestep index
+                 t_idx = self.cmb_ncf_time.currentIndex() if hasattr(self, 'cmb_ncf_time') else 0
+                 
+                 # Adjust layer/time op strings if they are aggregates
+                 t_op = 'select'
+                 if hasattr(self, 'cmb_ncf_time'):
+                     if "Sum" in self.cmb_ncf_time.currentText(): t_op = 'sum'
+                     elif "Avg" in self.cmb_ncf_time.currentText(): t_op = 'mean'
+                 
+                 res = get_ncf_profile(
+                     self.input_files_list[0],
+                     self.cmb_pollutant.currentText(),
+                     [r-1], [c-1],
+                     time_idx=t_idx, time_op=t_op, op='mean',
+                     stack_groups_path=None # Inline not supported for by-LAY currently
+                 )
+                 
+                 if res:
+                     self._show_ts_window(res, f"Vertical Profile @ Cell ({r}, {c})")
+                     self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c}) Profile")
+                 else:
+                     self.notify_signal.emit("WARNING", "No vertical profile data found.")
+
          except Exception as e:
-             self.notify_signal.emit("ERROR", f"TS Extraction failed: {e}")
+             self.notify_signal.emit("ERROR", f"Extraction failed: {e}")
 
     def _show_ts_window(self, data, title):
         try:
              win = TimeSeriesPlotWindow(data, title, self.cmb_pollutant.currentText(), self.units_map.get(self.cmb_pollutant.currentText(), ""), self)
+             # Adjust X-ax label if it's a layer profile
+             if "Profile" in title and hasattr(win, 'ax'):
+                 win.ax.set_xlabel("Layer", fontsize=10, fontweight='bold')
+                 win.canvas.draw()
+                 
              win.show()
         except Exception as e:
             logging.error(f"TS Window error: {e}")
@@ -4577,6 +4810,12 @@ class NativeEmissionGUI(QMainWindow):
         g_arr = gdf['GRID_RC'].values if 'GRID_RC' in gdf_cols else None
         p_arr = gdf[pollutant].values if pollutant in gdf_cols else None
         
+        p_arr = gdf[pollutant].values if pollutant in gdf_cols else None
+        
+        # Memory Safety Check: Keep a light reference to verify GDF hasn't been swapped
+        # during mouse motion (prevents Segfaults in background GC)
+        target_ax._smk_hover_gdf = gdf
+        
         # Robustly handle missing geometry for optimized grids
         geom_arr = None
         try:
@@ -4601,6 +4840,11 @@ class NativeEmissionGUI(QMainWindow):
             except Exception: pass
 
         def _fmt(x: float, y: float) -> str:
+            # CRITICAL SAFETY: Abort if application is busy rendering a new view
+            if getattr(self, '_smk_rendering', False): return ""
+            if getattr(target_ax, '_smk_hover_gdf', None) is not None and target_ax._smk_hover_gdf is not gdf:
+                return ""
+
             # Lon/Lat mapping for status bar display
             base = None
             try:
@@ -4661,7 +4905,8 @@ class NativeEmissionGUI(QMainWindow):
                         geom = geom_arr[idx]
 
                     # Condition: If geometry exists, must contain point. If missing, trust Strategy 1.
-                    if geom is None or geom.contains(pt):
+                    # MEMORY SAFETY: Check if geometry is still a valid object before calling GEOS methods
+                    if geom is None or (hasattr(geom, 'contains') and geom.contains(pt)):
                         parts = [base]
                         
                         # Region/FIPS lookup
@@ -4836,29 +5081,7 @@ class NativeEmissionGUI(QMainWindow):
         if self.emissions_df is not None:
              DetailedStatsWindow(self.emissions_df, pol, self).exec()
 
-    def _filter_scc_list(self, text):
-        """Filter the SCC ComboBox list based on search text."""
-        if not hasattr(self, '_scc_full_list') or self._scc_full_list is None:
-            # Capture whatever is currently in the box (usually populated by _post_load_update)
-            items = [self.cmb_scc.itemText(i) for i in range(self.cmb_scc.count())]
-            if not items or items == ["All SCC"]:
-                return # Nothing to filter yet
-            self._scc_full_list = items
-        
-        self.cmb_scc.blockSignals(True)
-        self.cmb_scc.clear()
-        query = text.lower().strip()
-        
-        if not query:
-            filtered = self._scc_full_list
-        else:
-            filtered = [it for it in self._scc_full_list if query in it.lower()]
-            # Always ensure "All SCC" is available at the top for easy reset
-            if "All SCC" not in filtered:
-                filtered.insert(0, "All SCC")
 
-        self.cmb_scc.addItems(filtered)
-        self.cmb_scc.blockSignals(False)
 
     def _open_scc_multi(self):
         """Open the multi-selection dialog for SCC codes."""
@@ -4951,56 +5174,79 @@ class NativeEmissionGUI(QMainWindow):
         win.show()
 
     def export_configuration(self):
-        """Export current GUI settings to a YAML configuration file."""
+        """Standardize and export current GUI settings to a clean YAML configuration."""
         import yaml
         from datetime import datetime
         
         path, _ = QFileDialog.getSaveFileName(self, "Export Configuration", "", "YAML Config (*.yaml)")
         if not path: return
         
+        self._start_progress("Exporting configuration...")
         try:
-            # Gather settings
+            # SCC selection logic (merge into filter-val if filter-col is SCC)
+            cur_filter_col = self.cmb_filter_col.currentText()
+            filter_vals = self.txt_filter_val.text().strip()
+            
+            # If SCC is the primary filter or selected in the SCC box, handle it
+            scc_text = self.cmb_scc.currentText()
+            if scc_text != "All SCC":
+                if cur_filter_col == "scc" or not cur_filter_col:
+                    cur_filter_col = "scc"
+                    # Combine manual entries with SCC selection if needed
+                    if self.selected_sccs:
+                        filter_vals = ",".join(self.selected_sccs)
+                    elif scc_text:
+                        filter_vals = scc_text
+
             config = {
                 'timestamp_utc': datetime.utcnow().isoformat(),
                 'arguments': {
                     'filepath': self.txt_input.text() or None,
-                    'sector': 'exported_session', # Default placeholder
+                    'sector': 'exported_session', 
                     
                     # File Parsing
                     'delim': self.cmb_delim.currentText().lower(),
-                    'skip_rows': self.spin_skip.value(),
+                    'skiprows': self.spin_skip.value(),
+                    'comment': self.txt_comment.text() or None,
                     
-                    # Paths
+                    # Geometry & Paths
                     'griddesc': self.txt_griddesc.text() or None,
-                    'counties_shp': self.txt_counties.text() or None,
+                    'gridname': self.cmb_gridname.currentText() if self.cmb_gridname.currentIndex() > 0 else None,
+                    'county-shapefile': self.txt_counties.text() or None,
+                    'overlay-shapefile': self.txt_overlay_shp.text() or None,
                     
                     # Filtering
-                    'filter_col': self.cmb_filter_col.currentText() if self.cmb_filter_col.currentText() else None,
-                    'filter_val': self.txt_filter_val.text() if self.txt_filter_val.text() else None,
-                    #'filter_start': None, # TODO: Add if range implemented
-                    #'filter_end': None,   # TODO: Add if range implemented
-                    'filter_shapefile': self.txt_filter_shp.text() if hasattr(self, 'txt_filter_shp') and self.txt_filter_shp.text() else None,
-                    'filter_shapefile_opt': self.cmb_filter_op.currentText().lower() if hasattr(self, 'cmb_filter_op') else None,
+                    'filter-col': cur_filter_col or None,
+                    'filter-val': filter_vals or None,
+                    'filter-start': self.txt_range_min.text() or None,
+                    'filter-end': self.txt_range_max.text() or None,
+                    'filter-shapefile': self.txt_filter_shp.text() if hasattr(self, 'txt_filter_shp') and self.txt_filter_shp.text() else None,
+                    'filter-shapefile-opt': self.cmb_filter_op.currentText().lower() if hasattr(self, 'cmb_filter_op') else None,
                     
                     # Plotting
                     'pollutant': self.cmb_pollutant.currentText() if self.cmb_pollutant.count() > 0 else None,
-                    'plot_title': self.txt_title.text() if hasattr(self, 'txt_title') else None,
+                    'pltyp': self.cmb_pltyp.currentText().lower(),
+                    'projection': self.cmb_proj.currentText().lower(),
                     'vmin': float(self.txt_rmin.text()) if self.txt_rmin.text() else None,
                     'vmax': float(self.txt_rmax.text()) if self.txt_rmax.text() else None,
                     'cmap': self.cmb_cmap.currentText() + ('_r' if self.chk_rev_cmap.isChecked() else ''),
-                    'bins': [float(x.strip()) for x in self.txt_bins.text().split(',')] if self.txt_bins.text().strip() else None,
+                    'bins': self.txt_bins.text() or None,
                     
                     # Boolean Flags
-                    'log_scale': self.chk_log.isChecked(),
-                    'show_grid': self.chk_graticule.isChecked(),
-                    'zoom_to_data': self.chk_zoom.isChecked(),
-                    'fill_nan': self.chk_nan0.isChecked() if hasattr(self, 'chk_nan0') else False,
+                    'log-scale': self.chk_log.isChecked(),
+                    'show-grid': True,
+                    'zoom-to-data': self.chk_zoom.isChecked(),
+                    'fill-nan': self.chk_nan0.isChecked() if hasattr(self, 'chk_nan0') else False,
+                    
+                    # NetCDF Persistence (Map UI labels to batch-friendly keywords)
+                    'ncf-zdim': self._batch_dim(self.cmb_ncf_layer.currentText()) if self.ncf_frame.isVisible() else None,
+                    'ncf-tdim': self._batch_dim(self.cmb_ncf_time.currentText()) if self.ncf_frame.isVisible() else None,
                 }
             }
             
-            # Remove None values to keep it clean
+            # Remove None or empty strings to keep it clean
             args = config['arguments']
-            config['arguments'] = {k: v for k, v in args.items() if v is not None}
+            config['arguments'] = {k: v for k, v in args.items() if v not in [None, ""]}
             
             with open(path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False, sort_keys=False)
@@ -5009,10 +5255,10 @@ class NativeEmissionGUI(QMainWindow):
             QMessageBox.information(self, "Success", f"Configuration saved to:\n{path}")
             
         except Exception as e:
-            msg = f"Could not save configuration:\n{e}"
-            QMessageBox.critical(self, "Export Failed", msg)
+            QMessageBox.critical(self, "Export Failed", f"Could not save configuration:\n{e}")
             logging.error(f"Config export failed: {e}")
-            self.notify_signal.emit("ERROR", f"Config export failed: {e}")
+        finally:
+            self._stop_progress()
 
     def _get_transformers(self, crs):
         """Get transformers for graticule."""
@@ -5618,7 +5864,8 @@ class NativeEmissionGUI(QMainWindow):
 class TimeSeriesPlotWindow(QDialog):
     def __init__(self, data, title, pollutant, unit, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Time Series - {title}")
+        self.is_profile = "Profile" in title
+        self.setWindowTitle(title if self.is_profile else f"Time Series - {title}")
         self.resize(800, 500)
         self.pollutant = pollutant
         self.unit = unit
@@ -5639,17 +5886,17 @@ class TimeSeriesPlotWindow(QDialog):
         times = data.get('times', [])
         vals = data.get('values', [])
         
-        # Convert times to datetime if string
-        try:
-            if times and isinstance(times[0], str):
-                try:
-                    # Attempt detailed SMOKE format parsing first: YYYYDDD_HHMMSS
-                    times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
-                    # Check if parsing resulted in valid dates (not filtered out or all NaT if pandas failed silently logic)
-                except:
-                    # Fallback to auto-detection
-                    times = [pd.to_datetime(t) for t in times]
-        except: pass
+        # Convert times to datetime if string (only for regular TS)
+        if not self.is_profile:
+            try:
+                if times and isinstance(times[0], str):
+                    try:
+                        # Attempt detailed SMOKE format parsing first: YYYYDDD_HHMMSS
+                        times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
+                    except:
+                        # Fallback to auto-detection
+                        times = [pd.to_datetime(t) for t in times]
+            except: pass
 
         if isinstance(vals, dict):
             # Check length of first series to validate times
@@ -5664,7 +5911,10 @@ class TimeSeriesPlotWindow(QDialog):
                 lw = 2.5 if label == 'Total' else 1.0
                 alpha = 1.0 if label == 'Total' else 0.6
                 ms = 4 if label == 'Total' else 2
-                ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                if self.is_profile:
+                    ax.plot(series, range(len(times)), marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                else:
+                    ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
             
             if len(vals) < 25:
                 ax.legend(fontsize='small', loc='upper right')
@@ -5681,22 +5931,32 @@ class TimeSeriesPlotWindow(QDialog):
             if len(times) != len(vals):
                 times = range(len(vals))
 
-            ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
+            if self.is_profile:
+                ax.plot(vals, range(len(times)), marker='o', linestyle='-', markersize=4)
+            else:
+                ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
 
         u_str = str(self.unit or '').strip()
-        y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
-        ax.set_ylabel(y_lbl)
-        ax.set_xlabel("Time Step")
-        ax.grid(True, linestyle='--', alpha=0.7)
         
-        # Date formatting
-        import matplotlib.dates as mdates
-        if len(times) > 0:
-             try:
-                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-                 self.figure.autofmt_xdate()
-             except: pass
+        if self.is_profile:
+            val_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+            ax.set_xlabel(val_lbl)
+            ax.set_ylabel("Layer")
+            ax.set_yticks(range(len(times)))
+            ax.set_yticklabels(times)
+        else:
+            y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+            ax.set_ylabel(y_lbl)
+            ax.set_xlabel("Time Step")
+            # Date formatting
+            import matplotlib.dates as mdates
+            if len(times) > 0:
+                 try:
+                     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                     self.figure.autofmt_xdate()
+                 except: pass
 
+        ax.grid(True, linestyle='--', alpha=0.7)
         self.canvas.draw()
 
 def main():

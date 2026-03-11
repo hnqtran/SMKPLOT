@@ -1728,6 +1728,81 @@ def get_ncf_timeseries(
         else:
             return None
 
+def get_ncf_profile(
+    ncf_path: str,
+    pollutant: str,
+    row_indices: list,
+    col_indices: list,
+    time_idx: int = 0,
+    time_op: str = 'select',
+    op: str = 'sum',
+    stack_groups_path: str = None
+):
+    """
+    Extract vertical profile (by LAY) for a specific grid cell/region.
+    """
+    with netCDF4.Dataset(ncf_path, 'r') as ds:
+        if pollutant not in ds.variables:
+            return None
+        var = ds.variables[pollutant]
+        dims = var.dimensions
+        if 'LAY' not in dims:
+            return None
+        
+        try:
+            units = getattr(var, 'units', '').strip()
+            if isinstance(units, bytes): units = units.decode('utf-8', 'ignore')
+        except:
+            units = ''
+            
+        l_axis = dims.index('LAY')
+        t_axis = dims.index('TSTEP') if 'TSTEP' in dims else None
+        
+        slices = [slice(None)] * len(dims)
+        reduce_time_later = False
+        
+        if t_axis is not None:
+            if time_idx is not None and time_op == 'select':
+                target = time_idx
+                if target >= var.shape[t_axis]: target = 0
+                slices[t_axis] = target
+            elif time_op == 'select':
+                slices[t_axis] = 0
+            else:
+                reduce_time_later = True
+                
+        full_data = var[tuple(slices)]
+        
+        if reduce_time_later and t_axis is not None:
+            axis_idx = dims.index('TSTEP')
+            if time_op == 'sum':
+                full_data = np.sum(full_data, axis=axis_idx)
+            elif time_op == 'mean':
+                full_data = np.mean(full_data, axis=axis_idx)
+            else:
+                full_data = np.take(full_data, 0, axis=axis_idx)
+                
+        if full_data.ndim == 3:
+            try:
+                r_idx = np.array(row_indices, dtype=int)
+                c_idx = np.array(col_indices, dtype=int)
+                if len(r_idx) == 0: return None
+                
+                selected = full_data[:, r_idx, c_idx]
+                
+                if op == 'sum':
+                    series = np.sum(selected, axis=1)
+                else:
+                    series = np.mean(selected, axis=1)
+                    
+                layers = [f"{i+1}" for i in range(len(series))]
+                return {'times': layers, 'values': {'Total': series.tolist()}, 'units': units}
+            except Exception as e:
+                logging.error(f"Profile extraction failed: {e}")
+                return None
+        else:
+            return None
+
 def get_ncf_animation_data(
     ncf_path: str,
     pollutant: str,

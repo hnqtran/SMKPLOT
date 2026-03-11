@@ -974,30 +974,38 @@ class EmissionGUI:
         self.ncf_tstep_label.grid(row=0, column=9, sticky='e', padx=2)
         self.ncf_tstep_menu.grid(row=0, column=10, sticky='w')
 
+        # Cursor Plot (by-TSTEP/by-LAY) control
+        self.cursor_mode_label = ttk.Label(btn_frame, text='Cursor Plot:')
+        self.cursor_mode_label.grid(row=0, column=11, sticky='e', padx=(12,2))
+        self.cursor_mode_var = tk.StringVar(value='by-TSTEP')
+        self.cursor_mode_menu = ttk.Combobox(btn_frame, textvariable=self.cursor_mode_var, state='disabled', width=10)
+        self.cursor_mode_menu['values'] = ['by-TSTEP', 'by-LAY']
+        self.cursor_mode_menu.grid(row=0, column=12, sticky='w')
+
         # Shift subsequent columns due to insertion
-        # Scale next to Zoom to Data and before Bins
+        # Scale next to Cursor Plot and before Plot-by
         self.scale_label = ttk.Label(btn_frame, text="Scale:")
-        self.scale_label.grid(row=0, column=11, sticky='e', padx=(12,2)) # Was 7
+        self.scale_label.grid(row=0, column=13, sticky='e', padx=(12,2)) 
         self.scale_var = tk.StringVar(value='linear')
         self.scale_menu_widget = ttk.OptionMenu(btn_frame, self.scale_var, 'linear', 'linear', 'log')
-        self.scale_menu_widget.grid(row=0, column=12, sticky='w') # Was 8
+        self.scale_menu_widget.grid(row=0, column=14, sticky='w') 
         # Plot-by control (Auto/County/Grid)
         self.plotby_label = ttk.Label(btn_frame, text='Plot by:')
-        self.plotby_label.grid(row=0, column=13, sticky='e', padx=(12,2)) # Was 9
+        self.plotby_label.grid(row=0, column=15, sticky='e', padx=(12,2)) 
         self.plot_by_var = tk.StringVar(value='auto')
         self.plotby_menu_widget = ttk.OptionMenu(btn_frame, self.plot_by_var, 'auto', 'auto', 'county', 'grid')
-        self.plotby_menu_widget.grid(row=0, column=14, sticky='w') # Was 10
+        self.plotby_menu_widget.grid(row=0, column=16, sticky='w') 
         # Projection selection (Auto / WGS84 / LCC)
         self.proj_label = ttk.Label(btn_frame, text='Proj:')
-        self.proj_label.grid(row=0, column=15, sticky='e', padx=(12,2)) # Was 11
+        self.proj_label.grid(row=0, column=17, sticky='e', padx=(12,2)) 
         self.projection_var = tk.StringVar(value='lcc')
         self.proj_menu_widget = ttk.OptionMenu(btn_frame, self.projection_var, 'lcc', 'auto', 'wgs84', 'lcc')
-        self.proj_menu_widget.grid(row=0, column=16, sticky='w') # Was 12
+        self.proj_menu_widget.grid(row=0, column=18, sticky='w') 
         # Bins and Colormap controls
         self.bins_label = ttk.Label(btn_frame, text='Bins:')
-        self.bins_label.grid(row=0, column=17, sticky='e', padx=(12,2)) # Was 13
+        self.bins_label.grid(row=0, column=19, sticky='e', padx=(12,2)) 
         self.bins_entry = ttk.Entry(btn_frame, width=self._w_chars(28, min_chars=18, max_chars=40), textvariable=self.class_bins_var)
-        self.bins_entry.grid(row=0, column=18, sticky='we') # Was 14
+        self.bins_entry.grid(row=0, column=20, sticky='we') 
         self.cmap_label = ttk.Label(btn_frame, text='Colormap:')
         self.cmap_label.grid(row=0, column=19, sticky='e', padx=(12,2)) # Was 15
         self.cmap_menu_widget = ttk.OptionMenu(btn_frame, self.cmap_var, self.cmap_var.get(), *self._cmap_choices)
@@ -1676,6 +1684,28 @@ class EmissionGUI:
                                     self.ncf_tstep_menu.set(target_ts)
                                 elif self.ncf_tstep_var.get() not in ts_vals:
                                     self.ncf_tstep_menu.set(ts_vals[1])
+                                    
+                                # Dynamic Enablage Logic for Cursor Plot
+                                self.cursor_mode_menu.state(['readonly'])
+                                modes = ["by-TSTEP", "by-LAY"]
+                                
+                                attrs = getattr(emissions_df, 'attrs', {})
+                                is_inline = (attrs.get('source_type') == 'inline_point_lazy') or ('stack_groups_path' in attrs)
+                                
+                                if n_ts <= 1:
+                                    modes.remove("by-TSTEP")
+                                if n_lay <= 1 or is_inline:
+                                    # Cannot perform LAY extrations on 2D grids or INLINE sources currently
+                                    if "by-LAY" in modes:
+                                        modes.remove("by-LAY")
+                                
+                                if not modes:
+                                    self.cursor_mode_menu.state(['disabled'])
+                                    self.cursor_mode_var.set('')
+                                else:
+                                    self.cursor_mode_menu['values'] = modes
+                                    if self.cursor_mode_var.get() not in modes:
+                                        self.cursor_mode_var.set(modes[0])
 
                             self.root.after(0, _update_ncf_ui)
 
@@ -4906,32 +4936,66 @@ class EmissionGUI:
 
     def _exec_ts_plot(self, r, c, l_idx, l_op):
          try:
-             # Run extraction
-             from ncf_processing import get_ncf_timeseries
+             cursor_mode = getattr(self, 'cursor_mode_var', tk.StringVar(value='by-TSTEP')).get()
+             
              sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
+             pol = self.pollutant_var.get() if hasattr(self, 'pollutant_var') else ''
              
-             # Get current pollutant
-             pol = self.cmb_pollutant.get() if hasattr(self, 'cmb_pollutant') else ''
-             
-             res = get_ncf_timeseries(
-                self.inputfile_path,
-                pol,
-                [r-1], [c-1],
-                layer_idx=l_idx, layer_op=l_op, op='mean',
-                stack_groups_path=sg_path
-             )
-             
-             if res:
-                 self._show_ts_window(res, f"Cell ({r}, {c})")
-                 self._notify("INFO", "TS Success", f"Plotted Time Series for Cell ({r}, {c})")
-             else:
-                 self._notify("WARNING", "No Data", "No time-series data found for this cell.")
+             if cursor_mode == "by-TSTEP":
+                 from ncf_processing import get_ncf_timeseries
+                 
+                 res = get_ncf_timeseries(
+                    self.inputfile_path,
+                    pol,
+                    [r-1], [c-1],
+                    layer_idx=l_idx, layer_op=l_op, op='mean',
+                    stack_groups_path=sg_path
+                 )
+                 
+                 if res:
+                     self._show_ts_window(res, f"Time Series @ Cell ({r}, {c})")
+                     self._notify("INFO", "TS Success", f"Plotted Time Series for Cell ({r}, {c})")
+                 else:
+                     self._notify("WARNING", "No Data", "No time-series data found for this cell.")
+                     
+             elif cursor_mode == "by-LAY":
+                 from ncf_processing import get_ncf_profile
+                 
+                 # Derive timestep ops
+                 t_idx = 0
+                 t_op = 'select'
+                 t_str = ''
+                 if hasattr(self, 'ncf_tstep_var'):
+                     t_str = self.ncf_tstep_var.get()
+                     if "Sum" in t_str: t_op = 'sum'
+                     elif "Avg" in t_str or "Average" in t_str: t_op = 'mean'
+                     else:
+                         try:
+                             # Default dropdown is 1-indexed string lists
+                             idx = int(t_str) - 1
+                             if idx >= 0: t_idx = idx
+                         except: pass
+
+                 res = get_ncf_profile(
+                    self.inputfile_path,
+                    pol,
+                    [r-1], [c-1],
+                    time_idx=t_idx, time_op=t_op, op='mean',
+                    stack_groups_path=None
+                 )
+                 
+                 if res:
+                     self._show_ts_window(res, f"Profile @ Cell ({r}, {c})")
+                     self._notify("INFO", "TS Success", f"Plotted Vertical Profile for Cell ({r}, {c})")
+                 else:
+                     self._notify("WARNING", "No Data", "No vertical profile data found for this cell.")
+                     
          except Exception as e:
              self._notify("ERROR", "TS Failed", f"Extraction failed: {e}")
 
     def _show_ts_window(self, data, title):
         try:
-             pol = self.cmb_pollutant.get() if hasattr(self, 'cmb_pollutant') else ''
+             pol = self.pollutant_var.get() if hasattr(self, 'pollutant_var') else ''
              unit = self.units_map.get(pol, "") if hasattr(self, 'units_map') else ""
              TimeSeriesPlotWindow(data, title, pol, unit, self.root)
         except Exception as e:
@@ -4940,7 +5004,8 @@ class EmissionGUI:
 class TimeSeriesPlotWindow:
     def __init__(self, data, title, pollutant, unit, parent=None):
         self.win = tk.Toplevel(parent)
-        self.win.title(f"Time Series - {title}")
+        self.is_profile = "Profile" in title
+        self.win.title(title if self.is_profile else f"Time Series - {title}")
         self.win.geometry("800x500")
         self.pollutant = pollutant
         self.unit = unit
@@ -4963,11 +5028,13 @@ class TimeSeriesPlotWindow:
         times = data.get('times', [])
         vals = data.get('values', [])
         
-        try:
-            if times and isinstance(times[0], str):
-                try: times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
-                except: times = [pd.to_datetime(t) for t in times]
-        except: pass
+        # Datetime parse conditionally
+        if not self.is_profile:
+            try:
+                if times and isinstance(times[0], str):
+                    try: times = [pd.to_datetime(t, format='%Y%j_%H%M%S') for t in times]
+                    except: times = [pd.to_datetime(t) for t in times]
+            except: pass
 
         if isinstance(vals, dict):
             v_len = len(list(vals.values())[0]) if vals else 0
@@ -4976,24 +5043,41 @@ class TimeSeriesPlotWindow:
                 lw = 2.5 if label == 'Total' else 1.0
                 alpha = 1.0 if label == 'Total' else 0.6
                 ms = 4 if label == 'Total' else 2
-                ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                
+                if self.is_profile:
+                    ax.plot(series, range(len(times)), marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
+                else:
+                    ax.plot(times, series, marker='o', markersize=ms, label=label, linewidth=lw, alpha=alpha)
             if len(vals) < 25: ax.legend(fontsize='small', loc='upper right')
         else:
             if isinstance(vals, list) and len(vals) > 0 and isinstance(vals[0], (list, np.ndarray)):
                  vals = vals[0]
             if len(times) != len(vals): times = range(len(vals))
-            ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
+            
+            if self.is_profile:
+                ax.plot(vals, range(len(times)), marker='o', linestyle='-', markersize=4)
+            else:
+                ax.plot(times, vals, marker='o', linestyle='-', markersize=4)
 
         u_str = str(self.unit or '').strip()
-        y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
-        ax.set_ylabel(y_lbl)
-        ax.set_xlabel("Time Step")
-        ax.grid(True, linestyle='--', alpha=0.7)
         
-        import matplotlib.dates as mdates
-        if len(times) > 0:
-             try:
-                 ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-                 self.figure.autofmt_xdate()
-             except: pass
+        if self.is_profile:
+            val_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+            ax.set_xlabel(val_lbl)
+            ax.set_ylabel("Layer")
+            ax.set_yticks(range(len(times)))
+            ax.set_yticklabels(times)
+        else:
+            y_lbl = f"{self.pollutant} ({u_str})" if u_str else self.pollutant
+            ax.set_ylabel(y_lbl)
+            ax.set_xlabel("Time Step")
+            
+            import matplotlib.dates as mdates
+            if len(times) > 0:
+                 try:
+                     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+                     self.figure.autofmt_xdate()
+                 except: pass
+                 
+        ax.grid(True, linestyle='--', alpha=0.7)
         self.canvas.draw()

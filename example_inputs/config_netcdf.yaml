@@ -4,8 +4,11 @@ arguments:
   sector: test_netcdf
   pltyp: grid
   pollutant: NOX,VOC
-  ncf_tdim: avg
-  ncf_zdim: 0
+  # NetCDF Specific Settings
+  # Options: avg/sum/max/min (aggregations) or integer index (0-based)
+  # 0 = LAY 0 / TSTEP 0, 1 = LAY 1 / TSTEP 1, etc.
+  ncf-tdim: 0
+  ncf-zdim: 0
   zoom_to_data: true
   cmap: turbo
   outdir: ./test_outputs/netcdf

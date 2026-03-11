@@ -189,6 +189,7 @@ def parse_args():
     ap.add_argument('--ncf-tdim', default='avg', help='NetCDF Time Dimension operation: avg|sum|max|min or specific time step index (0-based). Default: avg.')
     ap.add_argument('--ncf-zdim', default='0', help='NetCDF Layer Dimension operation: avg|sum|max|min or specific layer index (0-based). Default: 0 (layer 1).')
     ap.add_argument('--gui', choices=['native', 'tk', 'auto'], default='auto', help='GUI toolkit to use: native (Qt), tk or auto (default).')
+    ap.add_argument('--low-mem', action='store_true', help='Optimizes memory usage for systems with limited RAM (e.g. 4GB). Disables multi-processing and enables aggressive GC.')
 
     args = ap.parse_args()
 
@@ -228,6 +229,13 @@ def parse_args():
             if current == default:
                 setattr(args, target_key, value)
         
+        # Ensure numeric types for scale arguments if provided as strings in JSON/YAML
+        for k in ['vmin', 'vmax']:
+            val = getattr(args, k, None)
+            if val is not None and not isinstance(val, (int, float)):
+                try: setattr(args, k, float(val))
+                except: pass
+
         # Preserve the config file format for output snapshot
         if config_path.lower().endswith(('.yaml', '.yml')):
             args.yaml = config_path
@@ -430,10 +438,14 @@ def main():
             if hasattr(app, 'pollutants') and app.pollutants and selected_pollutant in app.pollutants:
                 if hasattr(app, 'pollutant_var'):
                     app.pollutant_var.set(selected_pollutant)
-        root.after(500, _set_pol)
+        # Guard: 'root' is only defined when Tkinter path is taken
+        if 'root' in locals():
+            root.after(500, _set_pol)
     
     if app is not None:
-        root.mainloop()
+        # Guard: 'root' is only defined when Tkinter path is taken
+        if 'root' in locals():
+            root.mainloop()
         return 0
     return 1
 

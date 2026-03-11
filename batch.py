@@ -562,12 +562,19 @@ def _batch_mode(args):
     
     # Time Dimension
     t_arg = getattr(args, 'ncf_tdim', 'avg')
-    if str(t_arg).isdigit():
-        ncf_params['tstep_idx'] = int(t_arg)
+    t_str = str(t_arg).strip().lower()
+    if t_str.isdigit():
+        ncf_params['tstep_idx'] = int(t_str)
         ncf_params['tstep_op'] = 'select'
+    elif t_str.startswith('tstep ') or t_str.startswith('step '):
+        try:
+            ncf_params['tstep_idx'] = int(t_str.split()[-1])
+            ncf_params['tstep_op'] = 'select'
+        except:
+            ncf_params['tstep_op'] = 'mean'
     else:
         # map common aliases
-        op = str(t_arg).lower()
+        op = t_str
         if op in ('avg', 'mean', 'average'):
             ncf_params['tstep_op'] = 'mean'
         elif op in ('sum', 'total'):
@@ -582,11 +589,19 @@ def _batch_mode(args):
 
     # Layer Dimension
     z_arg = getattr(args, 'ncf_zdim', '0')
-    if str(z_arg).isdigit():
-        ncf_params['layer_idx'] = int(z_arg)
+    z_str = str(z_arg).strip().lower()
+    if z_str.isdigit():
+        ncf_params['layer_idx'] = int(z_str)
         ncf_params['layer_op'] = 'select'
+    elif z_str.startswith('lay ') or z_str.startswith('layer '):
+        try:
+            ncf_params['layer_idx'] = int(z_str.split()[-1])
+            ncf_params['layer_op'] = 'select'
+        except:
+            ncf_params['layer_idx'] = 0
+            ncf_params['layer_op'] = 'select'
     else:
-        op = str(z_arg).lower()
+        op = z_str
         ncf_params['layer_idx'] = None # Override default 0
         if op in ('avg', 'mean', 'average'):
             ncf_params['layer_op'] = 'mean'
@@ -1274,7 +1289,10 @@ def _batch_mode(args):
     requested_workers = getattr(args, 'workers', 0)
     
     # Auto-detect if workers is 0
-    if requested_workers <= 0:
+    if args.low_mem:
+        worker_count = 1
+        logging.info("Low-Memory mode enabled: Forcing serial execution.")
+    elif requested_workers <= 0:
         if _PLOT_MP_CONTEXT is not None and len(to_plot) >= 1:
             # Default to aggressive parallel usage
             worker_count = _resolve_worker_count(len(to_plot))
@@ -1284,10 +1302,15 @@ def _batch_mode(args):
         worker_count = min(8, requested_workers)
         
     if worker_count <= 1:
+        import gc
         for pol in to_plot:
+            # Memory Optimization: only keep the column we need for THIS plot
+            # (Note: context['merged'] is shared, but we can subset it inside the loop)
             _, out_path = _render_single_pollutant(pol, context)
             logging.info("Wrote %s", out_path)
             generated_plots.append(out_path)
+            if args.low_mem:
+                gc.collect()
     else:
         global _PLOT_CONTEXT
         _PLOT_CONTEXT = context

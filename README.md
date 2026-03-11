@@ -11,12 +11,11 @@ A high-performance tool for visualizing emissions data from SMOKE reports, FF10 
     *   **FF10 Sectors**: Direct support for standard EPA emission formats.
     *   **NetCDF (IOAPI)**: Automatic header parsing (XORIG, XCELL, etc.) for gridded domain generation.
 *   **Interactive Analysis**:
+    *   **3D Vertical Profiling & Time Series Extraction (Cursor Plot)**: Seamlessly click on any grid cell to extract multi-dimensional cross-sections. Extract temporal patterns (`by-TSTEP`) or vertical concentrations across layers (`by-LAY`).
     *   **Cell Inspection**: Point-and-click logic to identify grid/county indices and emissions values.
     *   **Time Series Animation**: Integrated animation controls for NetCDF files to visualize temporal patterns.
-    *   **Temporal Extraction**: Click-to-extract time series plots for specific cells or regions.
-    *   **Domain Stats**: Real-time calculation of spatial statistics (Max, Min, Avg, Total) for current views.
+    *   **Domain Stats**: Real-time calculation of spatial statistics (Max, Min, Avg, Total) for current vertical/temporal slices.
 *   **Administrative Robustness**:
-    *   **Tribal Mapping**: Intelligent mapping of tribal codes (88xxx) to underlying counties (e.g., Navajo Nation to San Juan, NM) using verified costing/cross-reference logic.
     *   **County Data**: Automatic downloading of verified US Census Cartographic Boundary files if local versions are missing.
 *   **Advanced Spatial Operations**:
     *   **Filtering**: Spatial filtering using auxiliary shapefiles (modes: `intersect`, `clipped`, `within`) with robust centroid/representative-point logic.
@@ -26,6 +25,7 @@ A high-performance tool for visualizing emissions data from SMOKE reports, FF10 
     *   **Data Export**: Direct export of processed, filtered, or aggregated data to standard CSV files.
     *   **Metadata Explorer**: Comprehensive view of NetCDF global attributes and variable-specific metadata.
 *   **Performance & Clusters**:
+    *   **Fast QuadMesh Rendering**: Instantaneous visualization of national-scale gridded datasets using optimized vertex-buffer logic.
     *   **Parallel Processing**: Multi-core support for batch plotting tasks.
     *   **Headless Support**: Automatic offscreen rendering on systems without X-server/Wayland.
     *   **Configuration Snapshots**: Reproducible runs via JSON or YAML configuration files.
@@ -43,6 +43,13 @@ chmod +x install.sh
 ./install.sh
 ```
 The script will install dependencies, configure the `smkplot.py` shebang to use the local venv, and verify GUI capabilities.
+
+### Updating SMKPLOT
+If the repository has been updated on GitHub, you can safely pull the latest changes and refresh your environment using the provided updater script:
+```bash
+./update.sh
+```
+*(Note: This will discard any local modifications to the tracked scripts and automatically re-run `install.sh` to ensure all Python dependencies are current).*
 
 ## 📂 Usage
 
@@ -65,7 +72,11 @@ Ideal for large datasets or scheduled runs.
 
 **Example: Using a YAML Configuration**
 ```bash
-./smkplot.py my_config.yaml
+# General use
+./smkplot.py -f my_config.yaml
+
+# Run the 3D NetCDF example
+./smkplot.py -f example_inputs/config_3d_netcdf.yaml
 ```
 
 **Example: Gridded NetCDF with Time Aggregation**
@@ -77,6 +88,16 @@ Ideal for large datasets or scheduled runs.
   --ncf-zdim 0 \
   --bins "0,1,5,10,50,100"
 ```
+*Note: NetCDF dimensions (`ncf-tdim`, `ncf-zdim`) strictly follow a **0-based integer index** convention (e.g., `0` = LAY 0 / TSTEP 0).*
+
+## 📊 Example Dataset
+The `example_inputs/` directory contains pre-configured datasets for testing all tool capabilities:
+*   `example_3d.nc`: A 3D gridded NetCDF file with 5 time steps and 10 vertical layers.
+*   `example_gridded.nc`: A standard 2D gridded NetCDF file.
+*   `example_ff10.csv`: A standard FF10 Nonpoint sector file.
+*   `example_smkreport.csv`: A standard SMOKE report output.
+*   `example_griddesc.txt`: Example grid definitions for the Lambert Conformal projection.
+
 
 ## 🛠️ Advanced Logic
 
@@ -86,8 +107,6 @@ When processing **Inline (1D)** point sources, SMKPLOT requires a matching `STAC
 2.  Auto-locate date-matched `STACK_GROUPS` files within the same directory if not explicitly provided.
 3.  Project lat/lon point coordinates into the target grid CRS with sub-cell precision.
 
-### Tribal-to-County Mapping
-To ensure administrative reports correctly visualize tribal-area emissions on standard maps, SMKPLOT translates tribal FIPS codes to their primary underlying county. This is particularly critical for oil and Gas basins (San Juan, Permian, Northern Plains) where significant emissions occur on tribal lands.
 
 ### Spatial Filter Operations
 *   `intersect`: Keeps any feature that overlaps with the filter geometry.
