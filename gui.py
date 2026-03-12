@@ -774,6 +774,18 @@ class NativeEmissionGUI(QMainWindow):
         self.setWindowTitle(f"SMKPLOT v{app_version} (Native Qt) (Author: tranhuy@email.unc.edu)")
         self.resize(1600, 900)
         
+        # Debug: Log initialization
+        if hasattr(self.cli_args, 'debug') and getattr(self.cli_args, 'debug', False):
+            logging.debug("=" * 70)
+            logging.debug("NATIVE EMISSION GUI INITIALIZATION")
+            logging.debug("=" * 70)
+            logging.debug(f"Input file: {self.inputfile_path}")
+            logging.debug(f"Counties shapefile: {self.counties_path}")
+            logging.debug(f"Grid name: {self.grid_name}")
+            logging.debug(f"GRIDDESC: {self.griddesc_path}")
+            logging.debug(f"Preselected pollutant: {self.preselected_pollutant}")
+            logging.debug(f"Delimiter: {self.emissions_delim}")
+        
         # --- State Variables ---
         # Handle being passed from smkplot.py (cli_args or json_payload as Namespace/dict)
         self.cli_args = cli_args or json_payload
@@ -1749,6 +1761,8 @@ class NativeEmissionGUI(QMainWindow):
 
         # 2. Trigger loading of paths
         if self.inputfile_path:
+            if hasattr(self.cli_args, 'debug') and getattr(self.cli_args, 'debug', False):
+                logging.debug(f"Loading emissions from: {self.inputfile_path}")
             self.load_input_file(self.inputfile_path)
             
         if self.griddesc_path:
@@ -5498,7 +5512,7 @@ class NativeEmissionGUI(QMainWindow):
             logging.error(f"Failed to lazy-load full dataset: {e}")
 
         modes = {
-            "Raw Data (Full File)": self.emissions_df,
+            "Raw Data (Full File)": self.raw_df if self.raw_df is not None else self.emissions_df,
         }
         
         if self._merged_gdf is not None:
@@ -5506,9 +5520,9 @@ class NativeEmissionGUI(QMainWindow):
              
         # Add Summaries (computed on demand)
         # Note: We pass the bound method or lambda
-        modes["Summary by State"] = lambda: self._summarize_by_geo(self.emissions_df, 'state')
-        modes["Summary by County"] = lambda: self._summarize_by_geo(self.emissions_df, 'county')
-        modes["Summary by SCC (Top 2000)"] = lambda: self._summarize_by_scc(self.emissions_df)
+        modes["Summary by State"] = lambda: self._summarize_by_geo(self.raw_df if self.raw_df is not None else self.emissions_df, 'state')
+        modes["Summary by County"] = lambda: self._summarize_by_geo(self.raw_df if self.raw_df is not None else self.emissions_df, 'county')
+        modes["Summary by SCC (Top 2000)"] = lambda: self._summarize_by_scc(self.raw_df if self.raw_df is not None else self.emissions_df)
         modes["Summary by Grid Cell"] = lambda: self._summarize_by_grid(self.emissions_df)
 
         self.preview_win = TableWindow(title="Data Preview", parent=self, modes=modes)
@@ -5535,8 +5549,8 @@ class NativeEmissionGUI(QMainWindow):
 
     def _summarize_by_scc(self, df):
         """Aggregate emissions by SCC."""
-        # Find SCC column (case-insensitive)
-        col = next((c for c in df.columns if c.upper() == 'SCC'), None)
+        # Find SCC column (case-insensitive) using standard aliases and stripping whitespace
+        col = next((c for c in df.columns if c.strip().lower() in SCC_COLS), None)
         if not col:
             raise ValueError("No SCC column found.")
             
@@ -5545,8 +5559,17 @@ class NativeEmissionGUI(QMainWindow):
         
         # Group
         g = df.groupby(col)[pols].sum().reset_index()
+        
         # Add descriptions if lookup available
-        # (Assuming simple aggregation for now)
+        desc_col = next((c for c in df.columns if c.strip().lower() in ['scc description', 'scc_description']), None)
+        if desc_col:
+            # Get first description for each SCC to keep it in the summary
+            descs = df.groupby(col)[desc_col].first().reset_index()
+            g = g.merge(descs, on=col, how='left')
+            # Reorder to put description after SCC
+            cols = [col, desc_col] + [p for p in pols if p in g.columns]
+            g = g[cols]
+            
         return g.sort_values(pols[0], ascending=False).head(2000)
 
     def _augment_with_county_mapping(self, df):
@@ -5931,11 +5954,11 @@ class NativeEmissionGUI(QMainWindow):
             
         group_cols = []
         if mode == 'county':
-            fips_col = next((c for c in raw.columns if c.lower() in ['fips', 'region_cd']), None)
+            fips_col = next((c for c in raw.columns if c.strip().lower() in REGION_COLS), None)
             if not fips_col: raise ValueError("No FIPS column found.")
             group_cols = [fips_col]
         elif mode == 'state':
-            fips_col = next((c for c in raw.columns if c.lower() in ['fips', 'region_cd']), None)
+            fips_col = next((c for c in raw.columns if c.strip().lower() in REGION_COLS), None)
             if not fips_col: 
                 # Fallback to checking any column that might look like FIPS
                 fips_col = next((c for c in raw.columns if 'fips' in c.lower()), None)
@@ -5946,9 +5969,9 @@ class NativeEmissionGUI(QMainWindow):
             raw['STATEFP'] = raw[fips_col].astype(str).str.zfill(6).str[1:3]
             group_cols = ['STATEFP']
         elif mode == 'scc':
-            scc_col = next((c for c in raw.columns if c.lower() in ['scc', 'scc code']), None)
+            scc_col = next((c for c in raw.columns if c.strip().lower() in SCC_COLS), None)
             if not scc_col: raise ValueError("No SCC column found.")
-            desc_cols = [c for c in raw.columns if c.lower() in ['scc description', 'scc_description']]
+            desc_cols = [c for c in raw.columns if c.strip().lower() in ['scc description', 'scc_description']]
             group_cols = [scc_col] + ([desc_cols[0]] if desc_cols else [])
         elif mode == 'grid':
             if 'ROW' in raw.columns and 'COL' in raw.columns:

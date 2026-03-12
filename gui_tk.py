@@ -212,6 +212,16 @@ else:
     filedialog = None  # type: ignore
 class EmissionGUI:
     def __init__(self, root, inputfile_path: Optional[str], counties_path: Optional[str], emissions_delim: Optional[str] = None, *, cli_args=None, app_version: str = "1.0"):
+        logging.info("=" * 70)
+        logging.info("TKINTER EMISSION GUI INITIALIZATION")
+        logging.info("=" * 70)
+        if hasattr(cli_args, 'debug') and getattr(cli_args, 'debug', False):
+            logging.debug(f"Input file: {inputfile_path}")
+            logging.debug(f"Counties shapefile: {counties_path}")
+            logging.debug(f"Delimiter: {emissions_delim}")
+            if cli_args:
+                logging.debug(f"CLI Arguments: {vars(cli_args) if hasattr(cli_args, '__dict__') else cli_args}")
+        
         self.root = root
         self.root.title(f"SMKPLOT version {app_version} (Author: tranhuy@email.unc.edu)")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)

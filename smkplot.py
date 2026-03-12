@@ -182,6 +182,7 @@ def parse_args():
     ap.add_argument('--vmax', type=float, help='Fixed maximum value for colorbar scaling.')
     ap.add_argument('--self-test', action='store_true', help='Run a quick self-test: generate synthetic data and produce sample outputs to --outdir.')
     ap.add_argument('--run-mode', choices=['gui', 'batch'], help='Execution mode: "gui" to open interactive window, "batch" to run headless (default).')
+    ap.add_argument('--debug', action='store_true', help='Enable debug mode (sets --log-level to DEBUG and enables additional debugging output).')
     ap.add_argument('--log-file', help='Write logs (INFO..ERROR) to this file (appends). If directory given, a timestamped file is created.')
     ap.add_argument('--log-level', default='INFO', choices=['DEBUG','INFO','WARNING','ERROR','CRITICAL'], help='Logging level (default INFO).')
     ap.add_argument('--export-csv', action='store_true',  help='Export processed emissions data to CSV file(s).')
@@ -263,6 +264,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    
+    # If --debug flag is set, override log-level to DEBUG
+    if args.debug:
+        args.log_level = 'DEBUG'
+    
     # Setup logging early
     if args.log_file:
         log_path = args.log_file
@@ -284,6 +290,14 @@ def main():
             format='%(levelname)s %(message)s'
         )
     
+    # Debug: Log startup parameters
+    if args.debug:
+        logging.debug(f"SMKPLOT version {SMKPLOT_VERSION}")
+        logging.debug(f"Debug mode enabled")
+        logging.debug(f"Input file: {args.filepath}")
+        logging.debug(f"Requested run mode: {args.run_mode}")
+        logging.debug(f"Requested GUI: {args.gui}")
+    
     # Redirect Python warnings (e.g. DeprecationWarning, UserWarning) to the logging system
     logging.captureWarnings(True)
 
@@ -299,6 +313,8 @@ def main():
     # Only run in batch mode if explicitly requested
     if run_mode == 'batch':
         logging.info("Batch mode explicitly requested.")
+        if args.debug:
+            logging.debug(f"Batch mode configuration: pltyp={getattr(args, 'pltyp', 'not set')}, outdir={args.outdir}")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
         if getattr(args, 'pltyp', None) is None:
@@ -366,6 +382,9 @@ def main():
     # Fallback to batch if GUI is impossible
     if not has_display:
         logging.error("Unable to initialize GUI: No DISPLAY detected. Falling back to batch mode.")
+        if args.debug:
+            logging.debug(f"DISPLAY env var: {os.environ.get('DISPLAY', 'not set')}")
+            logging.debug(f"WAYLAND_DISPLAY env var: {os.environ.get('WAYLAND_DISPLAY', 'not set')}")
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
         if getattr(args, 'pltyp', None) is None:
@@ -379,11 +398,17 @@ def main():
         # Native PySide6 Dispatch (gui.py)
         if target_impl == 'native':
             logging.info("Launching Native Qt GUI (gui.py)...")
+            if args.debug:
+                logging.debug("Initializing PySide6/PyQt5 QApplication")
             try:
                 try:
                     from PySide6.QtWidgets import QApplication
+                    if args.debug:
+                        logging.debug("Successfully imported PySide6")
                 except ImportError:
                     from PyQt5.QtWidgets import QApplication
+                    if args.debug:
+                        logging.debug("Fell back to PyQt5")
                 from gui import NativeEmissionGUI
                 
                 app = QApplication.instance() or QApplication(sys.argv)
@@ -399,7 +424,11 @@ def main():
                     pollutant=args.pollutant,
                     json_payload=args
                 )
+                if args.debug:
+                    logging.debug("NativeEmissionGUI initialized successfully")
                 gui.show()
+                if args.debug:
+                    logging.debug("Entering Qt event loop")
                 sys.exit(app.exec())
             except ImportError as ie:
                 logging.error(f"Native Qt launch failed: {ie}")
@@ -410,9 +439,13 @@ def main():
 
         # Tkinter Dispatch (gui_tk.py)
         try:
+            if args.debug:
+                logging.debug("Initializing Tkinter GUI")
             import tkinter as tk  # re-import safe
             from gui_tk import EmissionGUI  # Lazy import
             root = tk.Tk()
+            if args.debug:
+                logging.debug("Tkinter root window created")
         except ImportError:
             logging.error("Tkinter library not found; cannot launch GUI.")
             raise  # bubble up to the global catch-all below for batch fallback
@@ -427,6 +460,8 @@ def main():
             
     except Exception as e:
         logging.exception("Failed creating GUI; falling back to batch mode")
+        if args.debug:
+            logging.debug(f"Exception details: {type(e).__name__}: {e}", exc_info=True)
         import matplotlib.pyplot as plt
         plt.switch_backend('Agg')
         from batch import _batch_mode  # Lazy import

@@ -370,6 +370,16 @@ def _plot_worker(pol: str) -> Tuple[str, str]:
 
 
 def _batch_mode(args):
+    logging.info("=" * 70)
+    logging.info("BATCH MODE INITIALIZATION")
+    logging.info("=" * 70)
+    if hasattr(args, 'debug') and args.debug:
+        logging.debug(f"Arguments: {vars(args)}")
+        logging.debug(f"Input file: {args.filepath}")
+        logging.debug(f"Plot type: {getattr(args, 'pltyp', 'county')}")
+        logging.debug(f"Output directory: {args.outdir}")
+        logging.debug(f"Pollutants: {args.pollutant_list if hasattr(args, 'pollutant_list') else args.pollutant}")
+    
     generated_plots = []
     generated_files = []
     preprocessed_csv_path = None
@@ -391,6 +401,8 @@ def _batch_mode(args):
     # Optional self-test harness (runs before reading real data if requested)
     if args.self_test:
         logging.info("Starting comprehensive self-test using example_inputs...")
+        if hasattr(args, 'debug') and args.debug:
+            logging.debug("Self-test mode enabled")
         try:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             example_dir = os.path.join(script_dir, 'example_inputs')
