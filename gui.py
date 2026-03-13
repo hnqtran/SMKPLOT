@@ -774,18 +774,6 @@ class NativeEmissionGUI(QMainWindow):
         self.setWindowTitle(f"SMKPLOT v{app_version} (Native Qt) (Author: tranhuy@email.unc.edu)")
         self.resize(1600, 900)
         
-        # Debug: Log initialization
-        if hasattr(self.cli_args, 'debug') and getattr(self.cli_args, 'debug', False):
-            logging.debug("=" * 70)
-            logging.debug("NATIVE EMISSION GUI INITIALIZATION")
-            logging.debug("=" * 70)
-            logging.debug(f"Input file: {self.inputfile_path}")
-            logging.debug(f"Counties shapefile: {self.counties_path}")
-            logging.debug(f"Grid name: {self.grid_name}")
-            logging.debug(f"GRIDDESC: {self.griddesc_path}")
-            logging.debug(f"Preselected pollutant: {self.preselected_pollutant}")
-            logging.debug(f"Delimiter: {self.emissions_delim}")
-        
         # --- State Variables ---
         # Handle being passed from smkplot.py (cli_args or json_payload as Namespace/dict)
         self.cli_args = cli_args or json_payload
@@ -914,6 +902,18 @@ class NativeEmissionGUI(QMainWindow):
         
         # --- Auto-Load if arguments present ---
         QTimer.singleShot(100, self._startup_load)
+
+        # Debug: Log initialization
+        if hasattr(self.cli_args, 'debug') and getattr(self.cli_args, 'debug', False):
+            logging.debug("=" * 70)
+            logging.debug("NATIVE EMISSION GUI INITIALIZATION")
+            logging.debug("=" * 70)
+            logging.debug(f"Input file: {self.inputfile_path}")
+            logging.debug(f"Counties shapefile: {self.counties_path}")
+            logging.debug(f"Grid name: {self.grid_name}")
+            logging.debug(f"GRIDDESC: {self.griddesc_path}")
+            logging.debug(f"Preselected pollutant: {self.preselected_pollutant}")
+            logging.debug(f"Delimiter: {self.emissions_delim}")
 
     def _apply_styles(self):
         """Apply a high-contrast, premium 'Slate & Indigo' theme."""
