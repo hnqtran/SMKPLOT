@@ -272,6 +272,38 @@ except ImportError:
     from plotting import *
     from ncf_processing import *
 
+def _get_adaptive_window_size(preferred_w, preferred_h, min_w=800, min_h=600, scale_factor=0.85):
+    """Scale window dimensions based on available screen space.
+    
+    Args:
+        preferred_w, preferred_h: Desired window dimensions (for large screens)
+        min_w, min_h: Minimum acceptable dimensions
+        scale_factor: Scale to available space (0.85 = 85% of available screen)
+    
+    Returns:
+        Tuple (width, height) adapted to available screen space.
+    """
+    try:
+        from PySide6.QtGui import QGuiApplication
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            geom = screen.availableGeometry()
+            avail_w = geom.width()
+            avail_h = geom.height()
+            
+            # Scale to percentage of available space
+            scaled_w = int(avail_w * scale_factor)
+            scaled_h = int(avail_h * scale_factor)
+            
+            # Respect minimums
+            final_w = max(min_w, min(scaled_w, preferred_w))
+            final_h = max(min_h, min(scaled_h, preferred_h))
+            return final_w, final_h
+    except Exception:
+        pass
+    
+    return preferred_w, preferred_h
+
 class LogHandler(logging.Handler):
     """Custom logging handler that emits a signal locally."""
     def __init__(self, callback):
@@ -323,7 +355,8 @@ class TableWindow(QMainWindow):
     def __init__(self, df=None, title="Data Preview", parent=None, modes=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(1100, 700)
+        w, h = _get_adaptive_window_size(1100, 700, min_w=750, min_h=450)
+        self.resize(w, h)
         self.modes = modes or {}
         self.current_df = df
         
@@ -484,7 +517,8 @@ class MetadataWindow(QDialog):
     def __init__(self, data_obj, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Data Metadata / Attributes")
-        self.resize(600, 500)
+        w, h = _get_adaptive_window_size(600, 500, min_w=450, min_h=350)
+        self.resize(w, h)
         layout = QVBoxLayout(self)
         
         self.text = QTextEdit()
@@ -538,7 +572,8 @@ class DetailedStatsWindow(QDialog):
     def __init__(self, emissions_df, pollutant, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Detailed Statistics: {pollutant}")
-        self.resize(800, 400)
+        w, h = _get_adaptive_window_size(800, 400, min_w=650, min_h=350)
+        self.resize(w, h)
         layout = QVBoxLayout(self)
         
         from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QLabel
@@ -606,7 +641,8 @@ class MultiSelectionDialog(QDialog):
     def __init__(self, title, items, selected=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(500, 600)
+        w, h = _get_adaptive_window_size(500, 600, min_w=400, min_h=450)
+        self.resize(w, h)
         self.selected = list(selected or [])
         
         layout = QVBoxLayout(self)
@@ -691,7 +727,8 @@ class PlotWindow(QMainWindow):
     def __init__(self, gdf, column, meta, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Plot: {column}")
-        self.resize(1000, 800)
+        w, h = _get_adaptive_window_size(1000, 800, min_w=800, min_h=600)
+        self.resize(w, h)
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -772,7 +809,8 @@ class NativeEmissionGUI(QMainWindow):
         # --------------------------------------------------
 
         self.setWindowTitle(f"SMKPLOT v{app_version} (Native Qt) (Author: tranhuy@email.unc.edu)")
-        self.resize(1600, 900)
+        w, h = _get_adaptive_window_size(1600, 900, min_w=1100, min_h=650)
+        self.resize(w, h)
         
         # --- State Variables ---
         # Handle being passed from smkplot.py (cli_args or json_payload as Namespace/dict)
@@ -5995,7 +6033,8 @@ class TimeSeriesPlotWindow(QDialog):
         super().__init__(parent)
         self.is_profile = "Profile" in title
         self.setWindowTitle(title if self.is_profile else f"Time Series - {title}")
-        self.resize(800, 500)
+        w, h = _get_adaptive_window_size(800, 500, min_w=700, min_h=450)
+        self.resize(w, h)
         self.pollutant = pollutant
         self.unit = unit
         
