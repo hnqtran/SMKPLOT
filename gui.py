@@ -589,7 +589,17 @@ class DetailedStatsWindow(QDialog):
         try:
             # First try the currently matched data (filtered by SCC/PlotBy)
             # If we are in the main GUI, we might want the global stats of the DF
-            vals = pd.to_numeric(emissions_df[pollutant], errors='coerce').dropna()
+            
+            # Use fillna(0) if requested by parent (chk_nan0)
+            fill_nan = False
+            if parent and hasattr(parent, 'chk_nan0'):
+                 fill_nan = parent.chk_nan0.isChecked()
+
+            if fill_nan:
+                 vals = pd.to_numeric(emissions_df[pollutant], errors='coerce').fillna(0)
+            else:
+                 vals = pd.to_numeric(emissions_df[pollutant], errors='coerce').dropna()
+
             if not vals.empty:
                 combined = {
                     'source': 'TOTAL (Combined)',
@@ -1616,6 +1626,7 @@ class NativeEmissionGUI(QMainWindow):
         
         self.chk_nan0 = QCheckBox("Fill NaN values with 0")
         self.chk_nan0.setToolTip("Fill NaN values with 0.0. This affects both the map visualization and the calculated statistics (Sum, Mean).")
+        self.chk_nan0.stateChanged.connect(lambda: QTimer.singleShot(50, self.update_plot))
         
         self.chk_rev_cmap = QCheckBox("Reverse CMap")
         self.chk_rev_cmap.setToolTip("Invert the colormap colors")
@@ -3424,7 +3435,16 @@ class NativeEmissionGUI(QMainWindow):
                                     filtered = vals
                 # Calculate Stats
                 filtered_arr = np.asanyarray(filtered)
-                clean = filtered_arr[~np.isnan(filtered_arr)] if filtered_arr.size > 0 else np.array([])
+                
+                # Check for fill_nan state
+                should_fill = False
+                if hasattr(self, 'chk_nan0'):
+                     should_fill = self.chk_nan0.isChecked()
+                
+                if should_fill:
+                     clean = np.nan_to_num(filtered_arr, nan=0.0) if filtered_arr.size > 0 else np.array([])
+                else:
+                     clean = filtered_arr[~np.isnan(filtered_arr)] if filtered_arr.size > 0 else np.array([])
                 
                 # 4. Construct Multi-line Title (Mirroring gui_qt.py style)
                 title_lines = []
@@ -3549,9 +3569,25 @@ class NativeEmissionGUI(QMainWindow):
             plot_by_mode = self.cmb_pltyp.currentText().lower()
             scc_selection = self.cmb_scc.currentText()
             scc_code_map = self._scc_display_to_code.copy() if self._scc_display_to_code else {}
-            
+
             # Determine plotting CRS
             plot_crs_info = self._plot_crs()
+            
+            # --- FF10 Mapping & Consistency Checks ---
+            # Ensure FF10 point data is mapped to grid if in grid mode
+            if plot_by_mode == 'grid':
+                 self._ensure_ff10_grid_mapping(notify_success=False)
+
+            # NEW: Align with batch.py - apply fill_nan to the main DF so stats windows see it
+            # Moved AFTER FF10 mapping to ensure it isn't overwritten by fresh copies
+            if self.chk_nan0.isChecked():
+                try:
+                    num_cols = self.emissions_df.select_dtypes(include=[np.number]).columns
+                    if not num_cols.empty:
+                        self.emissions_df[num_cols] = self.emissions_df[num_cols].fillna(0.0)
+                        logging.info("GUI: Applied global NaN-to-zero fill for numeric columns.")
+                except Exception as e:
+                    logging.warning(f"Global fill-nan failed: {e}")
 
             # NEW: Capture Plot Meta on Main Thread (Thread Safety)
             def safe_float(txt):
