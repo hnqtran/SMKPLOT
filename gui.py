@@ -5895,13 +5895,16 @@ class NativeEmissionGUI(QMainWindow):
         cols_out = [c for c in cols_out if c in g.columns]
         g = g[cols_out]
         
-        # Fill NaNs in key columns for display
+        # Fill NaNs in key columns for display (Safely handle Categorical types to prevent TypeError crash)
         for col in group_cols:
              if g[col].isna().any():
+                 if isinstance(g[col].dtype, pd.CategoricalDtype): g[col] = g[col].astype(object)
                  g[col] = g[col].fillna("Unmapped")
         if 'COUNTY_NAME' in g.columns:
-             g['COUNTY_NAME'] = g['COUNTY_NAME'].fillna("Outside Domain")
+             if isinstance(g['COUNTY_NAME'].dtype, pd.CategoricalDtype): g['COUNTY_NAME'] = g['COUNTY_NAME'].astype(object)
+             g['COUNTY_NAME'] = g['COUNTY_NAME'].fillna("Unknown")
         if 'STATE_NAME' in g.columns:
+             if isinstance(g['STATE_NAME'].dtype, pd.CategoricalDtype): g['STATE_NAME'] = g['STATE_NAME'].astype(object)
              g['STATE_NAME'] = g['STATE_NAME'].fillna("Unknown")
 
         return g.sort_values(pols[0], ascending=False)

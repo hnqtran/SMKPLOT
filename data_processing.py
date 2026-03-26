@@ -1791,24 +1791,48 @@ def read_smkreport(
     if 'fips' not in lower_map and 'region_cd' not in lower_map:
         county_col = lower_map.get('county') or lower_map.get('# county') or lower_map.get('#county')
         if county_col:
-            # Check if it looks like a composite column (e.g. "2022001 01001 Alabama Autauga Co")
-            # Heuristic: must have at least 4 tokens and one should look like a 5-7 digit FIPS
+            # Check if it looks like a composite column (e.g. "2022001 01001 Alabama Autauga Co", or 12-digit Long FIPS)
+            # Heuristic: must have at least 2 tokens and one should look like a FIPS code
             sample = df[county_col].astype(str).iloc[0] if not df.empty else ''
             tokens = sample.split()
-            if len(tokens) >= 4:
-                try:
-                    # Look for 5-7 digit numeric token
-                    f_token = None
-                    for t in tokens:
-                        t_clean = re.sub(r'\D', '', t)
-                        if 5 <= len(t_clean) <= 7:
-                            f_token = t_clean
-                            break
+            if len(tokens) >= 2:
+                def extract_fips(s_val):
+                    s = str(s_val).strip()
+                    row_tokens = s.split()
+                    if len(row_tokens) < 2:
+                        return None
                     
-                    if f_token:
-                        df['FIPS'] = f_token.zfill(6)
-                    else:
+                    # 1. Try to find a 9-12 digit token first (long FIPS format used by SMOKE)
+                    for t in row_tokens:
+                        t_clean = re.sub(r'\D', '', t)
+                        if 9 <= len(t_clean) <= 12:
+                            fips = t_clean[-6:]
+                            return fips.zfill(6) if len(fips) < 6 else fips
+                            
+                    # 2. Fallback: look for generic 4-7 digit token (standard format)
+                    candidates = []
+                    for t in row_tokens:
+                        t_clean = re.sub(r'\D', '', t)
+                        if 4 <= len(t_clean) <= 7:
+                            candidates.append(t_clean)
+                    if candidates:
+                        first = candidates[0]
+                        # Avoid incorrectly parsing 7-digit Julian dates (e.g. 2022001) as the FIPS
+                        if (first.startswith('19') or first.startswith('20')) and len(first) == 7:
+                            if len(candidates) > 1:
+                                return candidates[1].zfill(6)
+                        return first.zfill(6)
+                    return None
+                
+                try:
+                    df['FIPS'] = df[county_col].apply(extract_fips)
+                    # Safety check: if fallback extracted absolutely nothing across all rows, drop it
+                    if df['FIPS'].isna().all():
                         logging.debug(f"Skipping composite County fix: no FIPS-like token found in '{sample}'")
+                        df = df.drop(columns=['FIPS'], errors='ignore')
+                    else:
+                        # Scrub leading numeric blocks from the County text for pristine UI table summaries
+                        df[county_col] = df[county_col].astype(str).apply(lambda x: re.sub(r'^(?:\S*\d+\S*\s+)+', '', x).strip())
                 except Exception:
                     pass
 
@@ -1818,7 +1842,8 @@ def read_smkreport(
         df['COL'] = df[lower_map['x cell']].astype(int)
         df['ROW'] = df[lower_map['y cell']].astype(int)
         df['GRID_RC'] = df['ROW'].astype(str) + '_' + df['COL'].astype(str)
-    elif 'FIPS' not in df.columns or df['FIPS'].isna().all():
+    
+    if not df.empty and ('FIPS' not in df.columns or df['FIPS'].isna().all()):
         raise ValueError("Report must contain FIPS (or derivable Region/County) or X/Y columns.")
 
     # Identify numeric pollutant columns (exclude obvious ID columns)
