@@ -870,6 +870,10 @@ def read_inputfile(
         
         # Restore attributes to the combined dataframe
         combined_df.attrs = saved_attrs
+
+        # Ensure sector name is used if provided
+        if sector:
+            combined_df.attrs['source_name'] = sector
         
         if not return_raw:
             return combined_df, None
@@ -999,6 +1003,7 @@ def read_inputfile(
             _emit_user_message(notify, 'INFO', "Could not determine file format. Reading as SMKREPORT format...")
         result = read_smkreport(
             fpath=fpath,
+            src_name=sector,
             delim=delim,
             skiprows=skiprows,
             comment=comment,
@@ -1545,6 +1550,7 @@ def read_listfile(
 
 def read_smkreport(
     fpath: str,
+    src_name: Optional[str] = None,
     delim: Optional[str] = ",",
     skiprows: Optional[int] = None, 
     comment: Optional[str] = None,
@@ -1886,10 +1892,11 @@ def read_smkreport(
             wide.attrs['units_map'] = {k: v for k, v in units_map.items() if k in pollutant_cols}
         except Exception:
             pass
-    # Attach source name if detected
-    if source_name:
+    # Attach source name (prefer src_name if provided, fallback to detected source_name)
+    final_src_name = src_name or source_name
+    if final_src_name:
         try:
-            wide.attrs['source_name'] = source_name
+            wide.attrs['source_name'] = final_src_name
         except Exception:
             pass
 
