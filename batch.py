@@ -213,7 +213,22 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         pol_unit = None
 
     bins = None
-    if args.bins:
+    # 1. Resolve bins - Hierarchy: bins_map[pollutant] > global bins
+    bins_map = getattr(args, 'bins_map', None)
+    if isinstance(bins_map, dict):
+        pol_bins = bins_map.get(pol)
+        if pol_bins:
+            try:
+                if isinstance(pol_bins, str):
+                    parts = [p for p in pol_bins.replace(',', ' ').split() if p]
+                    bins = sorted(set(float(p) for p in parts))
+                elif isinstance(pol_bins, (list, tuple)):
+                    bins = sorted(set(float(p) for p in pol_bins))
+            except Exception:
+                logging.warning("Failed to parse bins_map entry for %s: %s", pol, pol_bins)
+                bins = None
+
+    if bins is None and args.bins:
         try:
             parts = [p for p in args.bins.replace(',', ' ').split() if p]
             bins = sorted(set(float(p) for p in parts))
