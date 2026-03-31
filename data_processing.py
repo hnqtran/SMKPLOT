@@ -722,7 +722,7 @@ def read_inputfile(
     return_raw: bool = True,
     ncf_params: Optional[Dict[str, Any]] = None,
     lazy: bool = False,
-    workers: int = 0,
+    workers: int = 0
 ):
     """Check file format identifier to select appropriate parser.
     Rules:
@@ -1012,7 +1012,7 @@ def read_inputfile(
             flter_col=flter_col,
             flter_start=flter_start,
             flter_end=flter_end,
-            flter_val=flter_val,
+            flter_val=flter_val
         )
     
     if not return_raw:
@@ -1551,7 +1551,7 @@ def read_listfile(
 def read_smkreport(
     fpath: str,
     src_name: Optional[str] = None,
-    delim: Optional[str] = None,
+    delim: Optional[str] = ",",
     skiprows: Optional[int] = None, 
     comment: Optional[str] = None,
     encoding: Optional[str] = None, 
@@ -1559,7 +1559,7 @@ def read_smkreport(
     flter_col: Optional[str] = None,
     flter_start: Optional[str] = None,
     flter_end: Optional[str] = None,
-    flter_val: Optional[Sequence[str]] = None,
+    flter_val: Optional[Sequence[str]] = None
 ) -> pd.DataFrame:
     """Parse an emissions report using a '#Label' or '# County' header line."""
     # Optimization: Scan file instead of reading all into memory
@@ -1579,7 +1579,7 @@ def read_smkreport(
                 # Extract potential header content
                 header_can = sline.lstrip('#').strip()
                 # Detection keywords for standard and gridded SMOKE report headers
-                keywords = ('Label', 'County', 'X cell', 'Y cell', 'Region', 'State', 'SCC', 'Facility', 'Source', 'Point', 'Area')
+                keywords = ('Label', 'County', 'State', 'X cell', 'Y cell', 'Region', 'SCC', 'Facility')
                 if any(header_can.startswith(k) for k in keywords):
                     header_idx = i
                     header_line = header_can
@@ -1643,32 +1643,11 @@ def read_smkreport(
             best = max(scores.items(), key=lambda kv: kv[1])
             if best[1] > 0:
                 sep = best[0]
-                print(f"DEBUG: Sniffer chose sep='{sep}' with score {best[1]}")
-            else:
-                print(f"DEBUG: Sniffer failed to find separator, scores: {scores}")
 
     # Parse header columns
     splitter = sep if sep is not None else (';' if ';' in header_line else ('|' if '|' in header_line else ','))
     print(f"DEBUG: Final splitter used: '{splitter}'")
     col_names = [t.strip() for t in header_line.split(splitter)]
-
-    # Sanitize col_names for duplicates (Pandas 1.0+ requirement for 'names' argument)
-    # This prevents Crash: "ValueError: Duplicate names are not allowed."
-    seen_names = {}
-    sanitized_names = []
-    for name in col_names:
-        if name in seen_names:
-            seen_names[name] += 1
-            sanitized_names.append(f"{name}_{seen_names[name]}")
-        else:
-            seen_names[name] = 0
-            sanitized_names.append(name)
-    col_names = sanitized_names
-    print(f"DEBUG: Initial col_names count: {len(col_names)}")
-    print(f"DEBUG: Sanitized col_names[:15]: {col_names[:15]}")
-    dupes = [k for k, v in seen_names.items() if v > 0]
-    if dupes:
-        print(f"DEBUG: Found and handled {len(dupes)} duplicate columns: {dupes[:5]}...")
 
     # Enforce identifier columns as strings to avoid numeric artifacts
     from config import (
@@ -1736,14 +1715,6 @@ def read_smkreport(
             'encoding': encoding
         }
         df = _read_and_process_chunks(pd.read_csv, fallback_kwargs, _process_rpt_chunk)
-
-    # Synthesize GRID_RC if X cell/Y cell columns exist (standard SMOKE gridded report format)
-    # This allows direct plotting of gridded repoorts that lack a pre-built GRID_RC column.
-    if 'X cell' in df.columns and 'Y cell' in df.columns and 'GRID_RC' not in df.columns:
-        # Standardize for SMKPLOT grid merging (Format: ROW_COL)
-        # We ensure they are strings then concatenate.
-        df['GRID_RC'] = df['Y cell'].astype(str).str.split('.').str[0] + "_" + df['X cell'].astype(str).str.split('.').str[0]
-        logging.info("Synthesized GRID_RC column from X cell and Y cell.")
 
     # Attempt to capture units from the line ABOVE the header (if present)
     units_map: Dict[str, str] = {}
@@ -1879,14 +1850,16 @@ def read_smkreport(
                 except Exception:
                     pass
 
+    ## Get FIPS code
     df = get_emis_fips(df)
     
-    if 'x cell' in lower_map and 'y cell' in lower_map:
-        df['COL'] = df[lower_map['x cell']].astype(int)
-        df['ROW'] = df[lower_map['y cell']].astype(int)
-        df['GRID_RC'] = df['ROW'].astype(str) + '_' + df['COL'].astype(str)
+    ## Get GRID_RC    
+    x_cell_col = lower_map.get('x cell')
+    y_cell_col = lower_map.get('y cell')
+    if x_cell_col in df.columns and y_cell_col in df.columns and 'GRID_RC' not in df.columns:
+        df['GRID_RC'] = df[y_cell_col].astype(str).str.split('.').str[0] + "_" + df[x_cell_col].astype(str).str.split('.').str[0]
     
-    if not df.empty and ('FIPS' not in df.columns or df['FIPS'].isna().all()):
+    if not df.empty and ('FIPS' not in df.columns or df['FIPS'].isna().all()) and ('GRID_RC' not in df.columns or df['GRID_RC'].isna().all()):
         raise ValueError("Report must contain FIPS (or derivable Region/County) or X/Y columns.")
 
     # Identify numeric pollutant columns (exclude obvious ID columns)
@@ -1908,26 +1881,10 @@ def read_smkreport(
     _categorize_columns(df, ['scc', 'poll', 'country_cd', 'tribal_code', 'FIPS', 'region_cd', 'GRID_RC', 'state', 'county'])
 
     # Preserve a copy of the parsed raw dataset (pre-filter, pre-aggregation) for QA preview
-    try:
-        # Keep a reference to avoid duplicating memory
-        raw_df_for_preview = df
-    except Exception:
-        raw_df_for_preview = df
+    raw_df = df.copy()
     
-    group_keys = []
-    if 'GRID_RC' in df.columns:
-        group_keys.append('GRID_RC')
-    if 'FIPS' in df.columns:
-        group_keys.append('FIPS')
+    wide = df.copy()
     
-    if not group_keys:
-        # This case should not be reached due to earlier checks
-        raise ValueError("Dataframe has neither FIPS nor GRID_RC for grouping.")
-
-    # Prioritize primary group key for backward compatibility in some logic
-    group_key = group_keys[0]
-    
-    wide = df[group_keys + pollutant_cols].groupby(group_keys, as_index=False, sort=False, observed=False).sum()
     if units_map:
         try:
             # Keep only entries for pollutant columns
@@ -1950,7 +1907,7 @@ def read_smkreport(
 
     # Attach raw dataframe for preview
     try:
-        wide.attrs['raw_df'] = raw_df_for_preview
+        wide.attrs['raw_df'] = raw_df
     except Exception:
         pass
     # Attach original input column names so Preview can hide derived columns
@@ -1959,7 +1916,8 @@ def read_smkreport(
     except Exception:
         pass
     _categorize_columns(wide, ['FIPS', 'region_cd', 'GRID_RC'])
-    return wide
+    
+    return wide, raw_df
 
 
 @_memoize(maxsize=6)
