@@ -1850,10 +1850,13 @@ def read_smkreport(
                 except Exception:
                     pass
 
-    ## Get FIPS code
-    df = get_emis_fips(df)
+    ## Get FIPS code if there is one
+    try:
+        df = get_emis_fips(df)
+    except Exception:
+        pass
     
-    ## Get GRID_RC    
+    ## Get GRID_RC from X cell and Y cell columns if there are ones
     x_cell_col = lower_map.get('x cell')
     y_cell_col = lower_map.get('y cell')
     if x_cell_col in df.columns and y_cell_col in df.columns and 'GRID_RC' not in df.columns:
