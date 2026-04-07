@@ -683,6 +683,14 @@ def _batch_mode(args):
             if _pol_names:
                 _usecols = _pol_names  # identifier columns always kept inside read_smkreport
 
+        # Detect NetCDF input: Use signature check + fallback to extension
+        is_ncf_input = False
+        if resolved_files:
+            if is_netcdf_file(resolved_files[0]):
+                is_ncf_input = True
+            elif resolved_files[0].lower().endswith(('.nc', '.ncf')):
+                is_ncf_input = True
+
         # read_inputfile handles list of paths
         emis_df, raw_df = read_inputfile(
             fpath=resolved_files,
@@ -718,15 +726,16 @@ def _batch_mode(args):
         logging.error("No emissions data available for processing.")
         return 1
 
-    # Build FIPS column
-    try:
-        emis_df = get_emis_fips(emis_df)
-    except ValueError as e:
-        if "No valid FIPS code columns found" in str(e):
-            logging.error("Input file is not supported: No valid FIPS/Region columns found.")
+    # Build FIPS column (skip for NetCDF files which use grid indices)
+    if not is_ncf_input:
+        try:
+            emis_df = get_emis_fips(emis_df)
+        except ValueError as e:
+            if "No valid FIPS code columns found" in str(e):
+                logging.error("Input file is not supported: No valid FIPS/Region columns found.")
+                return 1
+            logging.exception("Error building FIPS columns")
             return 1
-        logging.exception("Error building FIPS columns")
-        return 1
 
     # Apply units_map from JSON payload if available (overrides input data)
     # Must be done after get_emis_fips because pd.concat in get_emis_fips may drop attrs
@@ -788,13 +797,8 @@ def _batch_mode(args):
     input_basename = start_sector or json_sector or (os.path.basename(resolved_files[0]) if resolved_files else 'output')
     input_basename_var = input_basename  # Assign to nonlocal variable for _finish closure
 
-    # Detect NetCDF input: Use signature check + fallback to extension
-    is_ncf_input = False
-    if resolved_files:
-        if is_netcdf_file(resolved_files[0]):
-            is_ncf_input = True
-        elif resolved_files[0].lower().endswith(('.nc', '.ncf')):
-            is_ncf_input = True
+    # input_basename already set via sector or resolved_files
+    pass
 
     # Validate inputs based on plot type
     
