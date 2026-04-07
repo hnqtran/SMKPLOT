@@ -54,6 +54,71 @@ SMKPLOT_VERSION = "1.0"
 
 _POLLUTANT_SPLIT_RE = re.compile(r'[\s,]+')
 
+# [POLLUTANT-AGGREGATION 2026-04-06] Matches one item in a pollutant list that may be either:
+#   - a plain column name:     "NOX"
+#   - a derived formula:       "NOX = S-NO + S-NO2"
+# [POLLUTANT-AGGREGATION-OPS 2026-04-06] RHS now accepts +, -, x, / between tokens.
+# Operators MUST be surrounded by spaces so that '-' inside column names (e.g. S-NO)
+# is not mis-parsed as subtraction.  Scalars (numeric literals) are allowed as operands.
+# Groups: (1) derived_name, (2) rhs_of_equals  OR  (3) plain_name
+_TOKEN_RE = r'[A-Za-z0-9_.\-]+'
+_OP_RE = r'\s+[+\-x/]\s+'
+_FORMULA_ITEM_RE = re.compile(
+    r'^\s*(' + _TOKEN_RE + r')\s*=\s*(' + _TOKEN_RE + r'(?:' + _OP_RE + _TOKEN_RE + r')*)\s*$'
+    r'|^\s*(' + _TOKEN_RE + r')\s*$'
+)
+# Tokeniser for RHS evaluation: splits on spaced operators, preserving operator symbol.
+_RHS_TOKEN_RE = re.compile(r'\s+([+\-x/])\s+')
+
+
+def _parse_pollutant_with_formulas(raw) -> tuple:
+    """[POLLUTANT-AGGREGATION 2026-04-06]
+    Parse a pollutant string (or list) that may contain inline arithmetic formulas:
+        NAME = COL1 + COL2 - COL3 x SCALAR / COL4
+    Supported operators (must be surrounded by spaces):
+        +  addition
+        -  subtraction
+        x  multiplication
+        /  division
+    Returns:
+        pollutant_list : list[str]   - ordered list of output column names to plot
+        col_formulas   : dict        - {derived_name: rhs_string} for formula entries only
+    Plain column names pass through unchanged and do NOT appear in col_formulas.
+    Example input:  "S-CH4, NOX = S-NO + S-NO2, PM2_5 = S-PAL + S-PCA, RATIO = A / B"
+    Example output: (['S-CH4','NOX','PM2_5','RATIO'],
+                     {'NOX':'S-NO + S-NO2', 'PM2_5':'S-PAL + S-PCA', 'RATIO':'A / B'})
+    """
+    # Normalise input to a single string for consistent splitting
+    if isinstance(raw, (list, tuple)):
+        combined = ','.join(str(x) for x in raw if x is not None)
+    elif raw is None:
+        return [], {}
+    else:
+        combined = str(raw)
+
+    # Split on commas only (spaces are part of formula tokens, e.g. "S-NO + S-NO2")
+    items = [tok.strip() for tok in combined.split(',') if tok.strip()]
+
+    pollutant_list = []
+    col_formulas = {}
+    seen = set()
+
+    for item in items:
+        m = _FORMULA_ITEM_RE.match(item)
+        if not m:
+            continue
+        if m.group(1):  # formula: name = rhs
+            name = m.group(1).strip()
+            col_formulas[name] = m.group(2).strip()  # store raw RHS string
+        else:           # plain column name
+            name = m.group(3).strip()
+
+        if name and name not in seen:
+            seen.add(name)
+            pollutant_list.append(name)
+
+    return pollutant_list, col_formulas
+
 
 def _normalize_list_arg(primary, secondary=None) -> List[str]:
     """
@@ -174,6 +239,7 @@ def parse_args():
     ap.add_argument('--zoom-to-data', action='store_true', help='In batch mode, limit map extent to data (non-zero pollutant cells) with small padding.')
     ap.add_argument('--zoom-pad', type=float, default=0.02, help='Padding fraction to apply around data extent when using --zoom-to-data (default 0.02 = 2%%).')
     ap.add_argument('--bins', help='Custom colorbar ticks (comma or space separated). Plots remain continuous (linear/log).') # Custom bins for colorbar ticks (batch mode)
+    ap.add_argument('--bins-map', dest='bins_map', default=None, help='Per-pollutant bins dict (YAML/JSON only). Key=pollutant name, value=list of bin edges. Takes precedence over --bins.')
     ap.add_argument('--cmap', default='jet', help='Matplotlib colormap name (e.g., viridis, plasma, turbo, Reds).')
     ap.add_argument('--workers', type=int, default=0, help='Number of parallel workers for batch plotting (0=auto).')
     ap.add_argument('--outdir', default='outputs', help='Output directory for batch mode (default to outputs).')
@@ -256,8 +322,12 @@ def parse_args():
         getattr(args, 'filter_values', None)
     )
 
-    # Normalize --pollutant argument into a list for batch processing
-    args.pollutant_list = _normalize_list_arg(getattr(args, 'pollutant', None))
+    # [POLLUTANT-AGGREGATION 2026-04-06] Normalize --pollutant argument.
+    # If any entry contains '=' it is treated as a sum-formula (e.g. NOX = S-NO + S-NO2).
+    # col_formulas maps derived column names to the list of source columns to sum.
+    args.pollutant_list, args.col_formulas = _parse_pollutant_with_formulas(
+        getattr(args, 'pollutant', None)
+    )
     args.pollutant_first = args.pollutant_list[0] if args.pollutant_list else None
     return args
 

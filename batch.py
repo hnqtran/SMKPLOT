@@ -73,6 +73,7 @@ from data_processing import (
     apply_spatial_filter
 )
 from utils import safe_sector_slug, serialize_attrs, normalize_delim, coerce_merge_key, is_netcdf_file
+import re as _re
 
 from plotting import _draw_graticule, create_map_plot
 
@@ -659,6 +660,29 @@ def _batch_mode(args):
 
     try:
         norm_delim = normalize_delim(args.delim)
+
+        # Build usecols: only load columns actually needed (id cols + requested pollutants + formula operands).
+        # This skips unused species columns in wide SMKREPORT files (e.g. 27 GB onroad file).
+        # usecols=None means "load all columns" — used for non-SMKREPORT formats and as fallback.
+        _usecols = None
+        _first_file = resolved_files[0] if isinstance(resolved_files, list) else resolved_files
+        if not is_netcdf_file(_first_file):
+            _pol_names = set(getattr(args, 'pollutant_list', None) or [])
+            if args.pollutant:
+                _pol_names.add(args.pollutant)
+            # Add formula operands (tokens that are not operators or numeric literals)
+            _rhs_tok = _re.compile(r'\s+[+\-x/]\s+')
+            for _rhs in (getattr(args, 'col_formulas', None) or {}).values():
+                for _tok in _rhs_tok.split(_rhs):
+                    _tok = _tok.strip()
+                    if _tok and not _tok.replace('.', '', 1).lstrip('-').isdigit():
+                        _pol_names.add(_tok)
+            # Add filter column if set
+            if args.filter_col:
+                _pol_names.add(args.filter_col)
+            if _pol_names:
+                _usecols = _pol_names  # identifier columns always kept inside read_smkreport
+
         # read_inputfile handles list of paths
         emis_df, raw_df = read_inputfile(
             fpath=resolved_files,
@@ -674,7 +698,8 @@ def _batch_mode(args):
             return_raw=False,
             ncf_params=ncf_params,
             notify=batch_notify,
-            workers=getattr(args, 'workers', 0)
+            workers=getattr(args, 'workers', 0),
+            usecols=_usecols
         )
 
     except Exception as e:
@@ -927,6 +952,92 @@ def _batch_mode(args):
                 # overlay_geom is a single GeoDataFrame (shouldn't happen with current logic, but handle it)
                 overlay_geom = [overlay_geom] + loaded_filter_parts
 
+    # [POLLUTANT-AGGREGATION 2026-04-06] Apply arithmetic formulas defined in the YAML
+    # pollutant field before pollutant detection so derived columns exist for
+    # detect_pollutants() and the subsequent groupby/sum.
+    # [POLLUTANT-AGGREGATION-OPS 2026-04-06] Supports +, -, x, / operators.
+    # Operators must be surrounded by spaces so '-' inside column names is not
+    # misread as subtraction (e.g. 'S-NO' is a column name, 'A - B' is subtraction).
+    col_formulas = getattr(args, 'col_formulas', {})
+    if col_formulas:
+        # Tokeniser: split 'A + B - C x 2.0 / D'  into  [('A',), ('+','B'), ('-','C'), ('x','2.0'), ('/','D')]
+        _rhs_split = _re.compile(r'\s+([+\-x/])\s+')
+
+        def _resolve_operand(token, df):
+            """Return a Series if token is a column name, else a scalar float."""
+            if token in df.columns:
+                return df[token].fillna(0)
+            try:
+                return float(token)
+            except ValueError:
+                raise KeyError(token)
+
+        def _eval_formula_expr(rhs, df, derived_name):
+            """[POLLUTANT-AGGREGATION-OPS 2026-04-06]
+            Evaluate an arithmetic RHS expression left-to-right against DataFrame df.
+            Operators (+  -  x  /) must be surrounded by spaces.
+            Raises KeyError if any operand column is not found in df.
+            Returns a pandas Series.
+            """
+            parts = _rhs_split.split(rhs)  # ['A', '+', 'B', '-', 'C', ...]
+            # parts[0] is first operand; subsequent pairs are (op, operand)
+            result = _resolve_operand(parts[0].strip(), df)
+
+            i = 1
+            while i + 1 <= len(parts) - 1:
+                op = parts[i]
+                tok = parts[i + 1].strip()
+                operand = _resolve_operand(tok, df)
+                if op == '+':
+                    result = result + operand
+                elif op == '-':
+                    result = result - operand
+                elif op == 'x':
+                    result = result * operand
+                elif op == '/':
+                    result = result / operand
+                i += 2
+            return result
+
+        _new_cols = {}
+        for derived_name, rhs in col_formulas.items():
+            try:
+                _new_cols[derived_name] = _eval_formula_expr(rhs, emis_df, derived_name)
+                logging.info(
+                    "[col_formulas] Created derived column '%s' = %s",
+                    derived_name, rhs
+                )
+            except KeyError as _fe:
+                available = sorted(emis_df.columns.tolist())
+                logging.error(
+                    "[col_formulas] Column '%s' not found while computing '%s' = %s.\n"
+                    "  Available columns: %s",
+                    _fe.args[0], derived_name, rhs, available
+                )
+                raise SystemExit(1)
+            except Exception as _fe:
+                logging.error(
+                    "[col_formulas] Failed to compute '%s' = %s : %s",
+                    derived_name, rhs, _fe
+                )
+                raise
+        if _new_cols:
+            _saved_attrs = emis_df.attrs.copy()
+            # Drop any columns that formulas will overwrite to prevent duplicate column names.
+            # Duplicate columns cause pd.api.types.is_numeric_dtype(df[col]) to return False
+            # (it receives a DataFrame instead of a Series), breaking detect_pollutants.
+            _overwrite = [c for c in _new_cols if c in emis_df.columns]
+            if _overwrite:
+                logging.warning(
+                    "[col_formulas] Dropping existing column(s) %s before applying formula — "
+                    "formula result will replace the original value.",
+                    _overwrite
+                )
+                emis_df = emis_df.drop(columns=_overwrite)
+            emis_df = pd.concat([emis_df, pd.DataFrame(_new_cols, index=emis_df.index)], axis=1)
+            _saved_attrs.pop('_detected_pollutants', None)
+            emis_df.attrs.update(_saved_attrs)
+
     # Detect pollutants
     pollutants = detect_pollutants(emis_df)
 
@@ -1143,11 +1254,9 @@ def _batch_mode(args):
                 # Note: pollutants list was detected earlier
                 cols_to_keep = set(key_cols)
 
-                # If user requested specific pollutants, limit export to those ONLY IF reading pre-processed CSV.
-                # If reading RAW files (FF10/List), user wants to keep ALL pollutants in the export.
-                is_reused = emis_df.attrs.get('is_preprocessed', False)
-                 
-                if requested and is_reused:
+                # If user requested specific pollutants, limit export to those only.
+                # Otherwise include all detected pollutants.
+                if requested:
                         cols_to_keep.update([p for p in requested if p in export_df.columns])
                 else:
                         cols_to_keep.update(pollutants)

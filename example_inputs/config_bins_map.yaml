@@ -1,0 +1,30 @@
+# Example: Per-Pollutant Colorbar Bins (bins_map)
+#
+# bins_map lets you assign independent colorbar bin edges to each pollutant
+# in a single batch run. Pollutants not listed fall back to the global `bins`
+# value, or auto-scale if `bins` is also absent.
+#
+# Precedence: bins_map[pollutant] > bins (global) > auto-scale
+#
+# Run from the smkplot root directory:
+#   ./smkplot.py -f example_inputs/config_bins_map.yaml
+
+arguments:
+  filepath: ./example_inputs/example_ff10.csv
+  sector: test_bins_map
+  county_shapefile: https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_500k.zip
+  griddesc: ./example_inputs/example_griddesc.txt
+  gridname: 12LISTOS
+  pltyp: county
+  pollutant: NOX, VOC
+  zoom_to_data: true
+  cmap: viridis
+  outdir: ./test_outputs/bins_map
+  export_csv: true
+  run_mode: batch
+
+  # Per-pollutant bin edges — NOX and VOC span very different ranges.
+  # bins_map values can be a YAML list or a space/comma-separated string.
+  bins_map:
+    NOX: [0, 5, 10, 25, 50, 100]
+    VOC: [0, 1, 2, 5, 10, 20]

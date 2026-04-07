@@ -722,7 +722,8 @@ def read_inputfile(
     return_raw: bool = True,
     ncf_params: Optional[Dict[str, Any]] = None,
     lazy: bool = False,
-    workers: int = 0
+    workers: int = 0,
+    usecols=None
 ):
     """Check file format identifier to select appropriate parser.
     Rules:
@@ -804,7 +805,8 @@ def read_inputfile(
                         return_raw=return_raw,
                         ncf_params=ncf_params,
                         lazy=lazy,
-                        workers=workers
+                        workers=workers,
+                        usecols=usecols
                     )
                     if d is not None:
                         dfs.append(d)
@@ -1012,7 +1014,8 @@ def read_inputfile(
             flter_col=flter_col,
             flter_start=flter_start,
             flter_end=flter_end,
-            flter_val=flter_val
+            flter_val=flter_val,
+            usecols=usecols
         )
     
     if not return_raw:
@@ -1559,7 +1562,8 @@ def read_smkreport(
     flter_col: Optional[str] = None,
     flter_start: Optional[str] = None,
     flter_end: Optional[str] = None,
-    flter_val: Optional[Sequence[str]] = None
+    flter_val: Optional[Sequence[str]] = None,
+    usecols=None
 ) -> pd.DataFrame:
     """Parse an emissions report using a '#Label' or '# County' header line."""
     # Optimization: Scan file instead of reading all into memory
@@ -1637,7 +1641,7 @@ def read_smkreport(
             variance = sum((x - mean_cnt)**2 for x in nonzero) / len(nonzero)
             stability = 1.0 / (1.0 + variance)
             # Higher penalty for space as it often appears in description text
-            penalty = 0.4 if c == ' ' else 1.0
+            penalty = 0.001 if c == ' ' else 1.0
             scores[c] = coverage * stability * mean_cnt * penalty
         if scores:
             best = max(scores.items(), key=lambda kv: kv[1])
@@ -1647,7 +1651,10 @@ def read_smkreport(
     # Parse header columns
     splitter = sep if sep is not None else (';' if ';' in header_line else ('|' if '|' in header_line else ','))
     print(f"DEBUG: Final splitter used: '{splitter}'")
-    col_names = [t.strip() for t in header_line.split(splitter)]
+    if splitter == ' ':
+        col_names = [t for t in header_line.split() if t.strip()]
+    else:
+        col_names = [t.strip() for t in header_line.split(splitter)]
 
     # Enforce identifier columns as strings to avoid numeric artifacts
     from config import (
@@ -1678,8 +1685,8 @@ def read_smkreport(
     }
 
     if sep == ' ':
-        # Use delim_whitespace=True to allow C engine for space separated files
-        read_kwargs['delim_whitespace'] = True
+        # Use sep=r'\s+' to allow C engine for space separated files
+        read_kwargs['sep'] = r'\s+'
         read_kwargs['engine'] = 'c'
         read_kwargs['low_memory'] = False
     elif sep:
@@ -1689,7 +1696,24 @@ def read_smkreport(
     else:
         read_kwargs['sep'] = None
         read_kwargs['engine'] = 'python'
-    
+
+    # If caller supplied a usecols set, restrict to those + always-needed id columns.
+    # This avoids parsing unused species columns in wide SMKREPORT files.
+    if usecols is not None:
+        _id_cols_lower = {
+            'x cell', 'y cell', 'row', 'col', 'region', 'state', 'county',
+            '#county', '# county', 'scc', 'fips', 'label', '#label',
+            'facility id', 'fac name', 'region_cd', 'grid_rc'
+        }
+        _usecols_lower = {c.lower() for c in usecols}
+        _keep_indices = [
+            i for i, c in enumerate(col_names)
+            if c.lower() in _id_cols_lower or c.lower() in _usecols_lower or c in usecols
+        ]
+        if _keep_indices:
+            read_kwargs['usecols'] = _keep_indices
+            read_kwargs['names'] = [col_names[i] for i in _keep_indices]
+
     def _process_rpt_chunk(chunk):
         if flter_col:
             chunk = filter_dataframe_by_values(chunk, flter_col, flter_val)
@@ -1839,6 +1863,7 @@ def read_smkreport(
                     return None
                 
                 try:
+                    df = df.copy()
                     df['FIPS'] = df[county_col].apply(extract_fips)
                     # Safety check: if fallback extracted absolutely nothing across all rows, drop it
                     if df['FIPS'].isna().all():

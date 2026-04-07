@@ -1,0 +1,45 @@
+# Example: Pollutant Aggregation — Derived Columns (col_formulas)
+#
+# The `pollutant` field accepts inline arithmetic formulas to create new
+# derived output columns on-the-fly. Formulas use the syntax:
+#
+#   DERIVED_NAME = COL1 <op> COL2 <op> ...
+#
+# Operators (must be surrounded by spaces): + - x (multiply) / (divide)
+# Scalar literals are supported as operands (e.g. "x 1.1").
+# Plain column names (no =) are plotted unchanged.
+#
+# Supported in both batch and GUI modes. Derived columns are treated as
+# regular pollutants for plotting, statistics, and CSV export.
+#
+# Run from the smkplot root directory:
+#   ./smkplot.py -f example_inputs/config_pollutant_agg.yaml
+
+arguments:
+  filepath: ./example_inputs/example_ff10.csv
+  sector: test_pollutant_agg
+  county_shapefile: https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_500k.zip
+  griddesc: ./example_inputs/example_griddesc.txt
+  gridname: 12LISTOS
+  pltyp: county
+  zoom_to_data: true
+  cmap: plasma
+  outdir: ./test_outputs/pollutant_agg
+  export_csv: true
+  run_mode: batch
+
+  # Pollutant list with formulas:
+  #   NOX           — plot original NOX column unchanged
+  #   VOC           — plot original VOC column unchanged
+  #   NOX_PLUS_VOC  — new column: sum of NOX and VOC
+  #   NOX_ADJ       — new column: NOX scaled up by 10% (scalar operand)
+  #   RATIO         — new column: VOC divided by NOX cell-by-cell
+  pollutant: "NOX, VOC, NOX_PLUS_VOC = NOX + VOC, NOX_ADJ = NOX x 1.1, RATIO = VOC / NOX"
+
+  # Each derived column gets its own bins for a meaningful colorbar.
+  bins_map:
+    NOX:          [0, 5, 10, 25, 50, 100]
+    VOC:          [0, 1, 2, 5, 10, 20]
+    NOX_PLUS_VOC: [0, 5, 15, 30, 60, 120]
+    NOX_ADJ:      [0, 5, 11, 27, 55, 110]
+    RATIO:        [0, 0.1, 0.25, 0.5, 1.0, 2.0]

@@ -26,6 +26,7 @@ sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
 
 import copy
 import logging
+import re as _re
 import threading
 import traceback
 import multiprocessing
@@ -295,10 +296,10 @@ def _get_adaptive_window_size(preferred_w, preferred_h, min_w=800, min_h=600, sc
             scaled_w = int(avail_w * scale_factor)
             scaled_h = int(avail_h * scale_factor)
             
-            # Respect minimums
-            final_w = max(min_w, min(scaled_w, preferred_w))
-            final_h = max(min_h, min(scaled_h, preferred_h))
-            return final_w, final_h
+            # Respect minimums, but never exceed available screen size
+            final_w = max(min(min_w, avail_w - 20), min(scaled_w, preferred_w))
+            final_h = max(min(min_h, avail_h - 40), min(scaled_h, preferred_h))
+            return min(final_w, avail_w - 20), min(final_h, avail_h - 40)
     except Exception:
         pass
     
@@ -732,64 +733,43 @@ class MultiSelectionDialog(QDialog):
         self._sync_selected()
         return self.selected
 
-class PlotWindow(QMainWindow):
-    """Pop-out window for a specific plot."""
-    def __init__(self, gdf, column, meta, parent=None):
+class _PlotTabWidget(QWidget):
+    """One plot tab: holds its own figure/canvas/toolbar/controls."""
+    def __init__(self, pollutant, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Plot: {column}")
-        w, h = _get_adaptive_window_size(1000, 800, min_w=800, min_h=600)
-        self.resize(w, h)
-        
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        
+        self.pollutant = pollutant
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
         self.figure = Figure(figsize=(10, 8), dpi=100)
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar(self.canvas, self)
-        
+
         layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
+        layout.addWidget(self.canvas, 1)
+
+        self.plot_controls_frame = QFrame()
+        self.plot_controls_frame.setVisible(False)
+        self.plot_controls_frame.setFrameShape(QFrame.StyledPanel)
+        self.plot_controls_frame.setMinimumHeight(36)
+        self.pc_layout = QHBoxLayout(self.plot_controls_frame)
+        self.pc_layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self.plot_controls_frame)
+        self.lbl_anim_status = None
+        self._t_data_cache = None
+        self._t_idx = 0
+        self._is_showing_agg = False
+        self._merged_gdf = None
         
-        from plotting import create_map_plot, _label_colorbar
-        ax = self.figure.add_subplot(111)
-        # Aspect ratio is handled by Figure size and create_map_plot management
-        
-        # Plotting parameters
-        cmap = meta.get('cmap', 'viridis')
-        use_log = meta.get('use_log', True)
-        bins = meta.get('bins', [])
-        unit = meta.get('unit', '')
-        vmin = meta.get('vmin')
-        vmax = meta.get('vmax')
-        
-        # Render the map
-        create_map_plot(
-            gdf=gdf,
-            column=column,
-            title=f"{column} Emissions",
-            ax=ax,
-            cmap_name=cmap,
-            bins=bins,
-            log_scale=use_log,
-            unit_label=unit,
-            crs_proj=gdf.crs,
-            vmin=vmin,
-            vmax=vmax
-        )
-        _label_colorbar(ax, unit)
-        
-        # Calculate stats for the title
-        try:
-            vals = pd.to_numeric(gdf[column], errors='coerce').dropna()
-            if not vals.empty:
-                s_min, s_max = vals.min(), vals.max()
-                s_mean, s_sum = vals.mean(), vals.sum()
-                stats_str = f"Min: {s_min:.4g}  Mean: {s_mean:.4g}  Max: {s_max:.4g}  Sum: {s_sum:.4g} {unit}"
-                ax.set_title(f"{column} Emissions\n{stats_str}", fontsize=12)
-        except: pass
-            
-        self.canvas.draw()
+        # Session Metadata for Full Context Isolation
+        self.input_file = None
+        self.is_ncf = False
+        self.ncf_layer_idx = 0
+        self.ncf_time_idx = 0
+        self.plot_by_mode = 'grid'
+
 
 class NativeEmissionGUI(QMainWindow):
     """
@@ -885,6 +865,7 @@ class NativeEmissionGUI(QMainWindow):
         self._ff10_grid_ready = False
         self._merged_cache = {}
         self._plot_windows = []
+        self._plot_tab_map = {}    # pollutant -> _PlotTabWidget
         self._zoom_press = None
         self._zoom_cids = []
         self._base_view = None
@@ -949,7 +930,7 @@ class NativeEmissionGUI(QMainWindow):
         self.stop_progress_signal.connect(self._stop_progress)
         
         # --- Auto-Load if arguments present ---
-        QTimer.singleShot(100, self._startup_load)
+        QTimer.singleShot(200, self._startup_load) # Increased delay for window mapping sync
 
         # Debug: Log initialization
         if hasattr(self.cli_args, 'debug') and getattr(self.cli_args, 'debug', False):
@@ -1106,7 +1087,8 @@ class NativeEmissionGUI(QMainWindow):
         
         # --- Left Control Panel ---
         left_panel = QWidget()
-        left_panel.setMinimumWidth(400)
+        left_panel.setMinimumWidth(360)
+        left_panel.setMaximumWidth(500)
         left_layout = QVBoxLayout(left_panel)
         self.control_layout = left_layout 
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1114,7 +1096,16 @@ class NativeEmissionGUI(QMainWindow):
         
         # Tabbed config
         self.tabs = QTabWidget()
-        
+
+        # Helper: wrap a page widget in a QScrollArea so content never collapses on maximize
+        def _make_scroll_tab(inner_widget):
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setWidget(inner_widget)
+            sa.setFrameShape(QFrame.NoFrame)
+            sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            return sa
+
         # Page 1: Data Source & View Settings
         page_source = QWidget(); l_source = QVBoxLayout(page_source)
         l_source.setContentsMargins(6, 6, 6, 6)
@@ -1127,26 +1118,23 @@ class NativeEmissionGUI(QMainWindow):
         # View / Plot Settings (Moved from separate tab)
         self._init_plot_settings_section(l_source)
         
-
-
-        
         l_source.addStretch()
-        self.tabs.addTab(page_source, "Source & View")
+        self.tabs.addTab(_make_scroll_tab(page_source), "Source & View")
         
         # Page 2: Filtering
         page_filter = QWidget(); l_filter = QVBoxLayout(page_filter)
         l_filter.setContentsMargins(6, 6, 6, 6)
         self._init_filter_section(l_filter)
         l_filter.addStretch()
-        self.tabs.addTab(page_filter, "Filter")
+        self.tabs.addTab(_make_scroll_tab(page_filter), "Filter")
         
-        # Page 3: Analysis (Stats)
-        page_stats = QWidget(); l_stats = QVBoxLayout(page_stats)
-        l_stats.setContentsMargins(6, 6, 6, 6)
-        self._init_summary_section(l_stats)
-        self._init_stats_panel(l_stats)
-        l_stats.addStretch()
-        self.tabs.addTab(page_stats, "Stats")
+        # Page 3: Analysis (Stats) - REMOVED per user request
+        # page_stats = QWidget(); l_stats = QVBoxLayout(page_stats)
+        # l_stats.setContentsMargins(6, 6, 6, 6)
+        # self._init_summary_section(l_stats)
+        # self._init_stats_panel(l_stats)
+        # l_stats.addStretch()
+        # self.tabs.addTab(_make_scroll_tab(page_stats), "Stats")
 
         left_layout.addWidget(self.tabs)
         
@@ -1175,28 +1163,29 @@ class NativeEmissionGUI(QMainWindow):
         
         self.main_splitter.addWidget(left_panel)
 
-        # --- Right Panel (Plot + Logs) ---
+        # --- Right Panel (Plot tabs + Logs) ---
         right_splitter = QSplitter(Qt.Vertical)
-        
-        plot_container = QWidget()
-        plot_layout = QVBoxLayout(plot_container)
-        plot_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.figure = Figure(figsize=(10, 8), dpi=100)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, plot_container)
-        
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas)
-        
-        self.plot_controls_frame = QFrame()
-        self.plot_controls_frame.setVisible(False)
-        self.plot_controls_frame.setFrameShape(QFrame.StyledPanel)
-        self.pc_layout = QHBoxLayout(self.plot_controls_frame)
-        self.pc_layout.setContentsMargins(2, 2, 2, 2)
-        plot_layout.addWidget(self.plot_controls_frame)
 
-        right_splitter.addWidget(plot_container)
+        # Tab widget: one tab per pollutant, closable, pop-out button per tab
+        self.plot_tab_widget = QTabWidget()
+        self.plot_tab_widget.setTabsClosable(True)
+        self.plot_tab_widget.setMovable(True)
+        self.plot_tab_widget.tabCloseRequested.connect(self._on_plot_tab_closed)
+        self.plot_tab_widget.currentChanged.connect(self._on_plot_tab_changed)
+
+        # Create the initial empty tab so self.figure/canvas/toolbar etc. are valid from startup
+        _initial_tab = _PlotTabWidget("(empty)")
+        self.plot_tab_widget.addTab(_initial_tab, "(no plot yet)")
+        self._plot_tab_map["(empty)"] = _initial_tab
+
+        # Alias attributes so all 500+ lines of existing render code work unchanged
+        self.figure = _initial_tab.figure
+        self.canvas = _initial_tab.canvas
+        self.toolbar = _initial_tab.toolbar
+        self.plot_controls_frame = _initial_tab.plot_controls_frame
+        self.pc_layout = _initial_tab.pc_layout
+
+        right_splitter.addWidget(self.plot_tab_widget)
         
         log_group = QGroupBox("Activity Log")
         log_layout = QVBoxLayout(log_group)
@@ -1219,7 +1208,13 @@ class NativeEmissionGUI(QMainWindow):
         self.main_splitter.addWidget(right_splitter)
         self.main_splitter.setStretchFactor(0, 2)
         self.main_splitter.setStretchFactor(1, 5)
-        self.main_splitter.setSizes([550, 1050])
+        
+        # Determine robust initial panel split (min 300px, max 420px, or 28% of width)
+        _left_w = min(420, max(300, int(self.width() * 0.28)))
+        if self.width() > 1000:
+             self.main_splitter.setSizes([_left_w, self.width() - _left_w])
+        else:
+             self.main_splitter.setSizes([320, 680]) # Fallback for small init sizes
         
         main_layout.addWidget(self.main_splitter)
 
@@ -1334,14 +1329,17 @@ class NativeEmissionGUI(QMainWindow):
         row_tools = QHBoxLayout()
         self.btn_load_data = QPushButton("Load Data")
         self.btn_load_data.setObjectName("primaryBtn")
+        self.btn_load_data.setMinimumHeight(28)
         self.btn_load_data.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         self.btn_load_data.clicked.connect(lambda: self.load_input_file(self.txt_input.text()))
         
         self.btn_preview = QPushButton("View Table")
+        self.btn_preview.setMinimumHeight(28)
         self.btn_preview.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         self.btn_preview.clicked.connect(self.preview_data)
         
         self.btn_metadata = QPushButton("Metadata")
+        self.btn_metadata.setMinimumHeight(28)
         self.btn_metadata.setIcon(self.style().standardIcon(QStyle.SP_MessageBoxInformation))
         self.btn_metadata.clicked.connect(self.show_metadata)
         
@@ -1370,11 +1368,11 @@ class NativeEmissionGUI(QMainWindow):
         d_box.addWidget(self.cmb_delim); d_box.addWidget(self.txt_custom_delim)
         l_form.addLayout(d_box, 0, 1)
         
-        l_form.addWidget(QLabel("# Row Skip:"), 0, 2)
+        l_form.addWidget(QLabel("Skip:"), 0, 2)
         self.spin_skip = QSpinBox(); self.spin_skip.setRange(0, 100); self.spin_skip.setFixedWidth(60)
         l_form.addWidget(self.spin_skip, 0, 3)
 
-        l_form.addWidget(QLabel("Comment:"), 0, 4)
+        l_form.addWidget(QLabel("Cmnt:"), 0, 4)
         self.txt_comment = QLineEdit("#"); self.txt_comment.setFixedWidth(40); self.txt_comment.setAlignment(Qt.AlignCenter)
         l_form.addWidget(self.txt_comment, 0, 5)
         
@@ -1504,7 +1502,6 @@ class NativeEmissionGUI(QMainWindow):
 
         layout.addRow("SCC:", scc_layout)
         
-        if parent_layout: parent_layout.addWidget(group)
         if parent_layout: parent_layout.addWidget(group)
         else: self.control_layout.addWidget(group)
 
@@ -2279,6 +2276,8 @@ class NativeEmissionGUI(QMainWindow):
         params = {}
         # Layer
         lay_txt = self.cmb_ncf_layer.currentText().lower()
+        if not lay_txt and hasattr(self, '_last_cfg_zdim'):
+            lay_txt = str(self._last_cfg_zdim).lower()
         if 'sum' in lay_txt: params['layer_op'] = 'sum'; params['layer_idx'] = None
         elif 'avg' in lay_txt or 'mean' in lay_txt: params['layer_op'] = 'mean'; params['layer_idx'] = None
         elif 'lay' in lay_txt:
@@ -2292,6 +2291,8 @@ class NativeEmissionGUI(QMainWindow):
 
         # Time
         ts_txt = self.cmb_ncf_time.currentText().lower()
+        if not ts_txt and hasattr(self, '_last_cfg_tdim'):
+            ts_txt = str(self._last_cfg_tdim).lower()
         if 'sum' in ts_txt: params['tstep_op'] = 'sum'; params['tstep_idx'] = None
         elif 'avg' in ts_txt or 'mean' in ts_txt: params['tstep_op'] = 'mean'; params['tstep_idx'] = None
         elif 'max' in ts_txt: params['tstep_op'] = 'max'; params['tstep_idx'] = None
@@ -2384,6 +2385,52 @@ class NativeEmissionGUI(QMainWindow):
                         df._smk_is_native = True
                         df.attrs['_smk_is_native'] = True
                 except Exception: pass
+
+                # [POLLUTANT-AGGREGATION 2026-04-06] Apply arithmetic formulas from col_formulas
+                # (defined via 'NAME = COL1 + COL2 ...' entries in the YAML pollutant field).
+                # Must run before stats re-calc and detect_pollutants so derived columns exist.
+                _col_formulas = getattr(self.cli_args, 'col_formulas', None) or {}
+                if _col_formulas:
+                    _rhs_split_gui = _re.compile(r'\s+([+\-x/])\s+')
+
+                    def _resolve_gui(token, _df):
+                        if token in _df.columns:
+                            return _df[token].fillna(0)
+                        try:
+                            return float(token)
+                        except ValueError:
+                            raise KeyError(token)
+
+                    def _eval_gui(rhs, _df, dname):
+                        parts = _rhs_split_gui.split(rhs)
+                        result = _resolve_gui(parts[0].strip(), _df)
+                        i = 1
+                        while i + 1 <= len(parts) - 1:
+                            op = parts[i]
+                            tok = parts[i + 1].strip()
+                            operand = _resolve_gui(tok, _df)
+                            if op == '+':
+                                result = result + operand
+                            elif op == '-':
+                                result = result - operand
+                            elif op == 'x':
+                                result = result * operand
+                            elif op == '/':
+                                result = result / operand
+                            i += 2
+                        return result
+
+                    for _dname, _rhs in _col_formulas.items():
+                        try:
+                            df[_dname] = _eval_gui(_rhs, df, _dname)
+                            worker_notify("INFO", f"[col_formulas] Created derived column '{_dname}' = {_rhs}")
+                        except KeyError as _fe:
+                            _available = sorted(df.columns.tolist())
+                            worker_notify("ERROR", f"[col_formulas] Column '{_fe.args[0]}' not found while computing '{_dname}' = {_rhs}.\n  Available columns: {_available}")
+                            raise
+                        except Exception as _fe:
+                            worker_notify("ERROR", f"[col_formulas] Failed to compute '{_dname}' = {_rhs}: {_fe}")
+                            raise
 
                 # Re-calculate lost stats for UI
                 try:
@@ -2925,10 +2972,15 @@ class NativeEmissionGUI(QMainWindow):
             self.notify_signal.emit("WARNING", f"Shapefile load error: {e}")
 
     def _clear_anim_cache(self):
-        """Reset the animation data cache and index."""
+        """Reset the animation data cache and index for the active tab only."""
         self._t_data_cache = None
         self._t_idx = 0
         self._is_showing_agg = False
+        _cur = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+        if isinstance(_cur, _PlotTabWidget):
+            _cur._t_data_cache = None
+            _cur._t_idx = 0
+            _cur._is_showing_agg = False
 
     def _trigger_ncf_refresh(self):
         """Trigger a background reload and visual refresh when NCF dimensions change."""
@@ -2949,8 +3001,15 @@ class NativeEmissionGUI(QMainWindow):
                   unit = vmeta[pol].get('units', "-")
         
         self.lbl_units.setText(f"Unit: {unit}")
-        # Invalidate animation cache if pollutant changed
-        self._clear_anim_cache()
+        # Invalidate animation cache only for the active tab whose pollutant matches
+        _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+        if isinstance(_cur_tab, _PlotTabWidget) and getattr(_cur_tab, 'pollutant', None) == pol:
+            _cur_tab._t_data_cache = None
+            _cur_tab._t_idx = 0
+            _cur_tab._is_showing_agg = False
+            self._t_data_cache = None
+            self._t_idx = 0
+            self._is_showing_agg = False
         
         # Keep plot_controls_frame visible if NCF data is loaded
         # Trigger background load of time series to get global min/max for scaling
@@ -2984,8 +3043,8 @@ class NativeEmissionGUI(QMainWindow):
             lay_txt = self.cmb_ncf_layer.currentText()
             if "Sum" in lay_txt: l_op = 'sum'
             elif "Avg" in lay_txt: l_op = 'mean'
-            elif "Layer" in lay_txt:
-                try: l_idx = int(lay_txt.split()[-1]) - 1
+            elif "LAY" in lay_txt:
+                try: l_idx = int(lay_txt.split()[-1])
                 except: pass
                 
             effective_path = ""
@@ -3027,7 +3086,13 @@ class NativeEmissionGUI(QMainWindow):
                 
                 self._t_data_cache = res
                 self._t_idx = 0
-                self._is_showing_agg = False
+                self._is_showing_agg = True  # fresh load implies current view is still aggregate
+                _cur_tab = self.plot_tab_widget.currentWidget()
+                # Only store into the tab that actually owns this pollutant
+                if isinstance(_cur_tab, _PlotTabWidget) and getattr(_cur_tab, 'pollutant', None) == pol:
+                    _cur_tab._t_data_cache = res
+                    _cur_tab._t_idx = 0
+                    _cur_tab._is_showing_agg = True
                 self.notify_signal.emit("INFO", "Animation data loaded.")
                 return True
         except Exception as e:
@@ -3056,20 +3121,33 @@ class NativeEmissionGUI(QMainWindow):
             self._t_idx = (self._t_idx + delta) % n_steps
             
         self._is_showing_agg = False
+        # Write state back to the active tab
+        _cur_tab = self.plot_tab_widget.currentWidget()
+        if isinstance(_cur_tab, _PlotTabWidget):
+            _cur_tab._t_idx = self._t_idx
+            _cur_tab._is_showing_agg = False
         self._update_view(cache['values'][self._t_idx], cache['times'][self._t_idx])
 
     def _show_agg(self, mode):
         if not self._ensure_time_data(): return
         cache = self._t_data_cache
         self._is_showing_agg = True
+        # Write state back to the active tab
+        _cur_tab = self.plot_tab_widget.currentWidget()
+        if isinstance(_cur_tab, _PlotTabWidget):
+            _cur_tab._is_showing_agg = True
         if mode == 'total':
-            self._update_view(cache['tot_val'], "Total (Sum)")
+            v = cache['tot_val']
+            self._update_view(v, "Total (Sum)", vmin=float(np.nanmin(v)), vmax=float(np.nanmax(v)))
         elif mode == 'avg':
-            self._update_view(cache['avg_val'], "Average (Mean)")
+            v = cache['avg_val']
+            self._update_view(v, "Average (Mean)", vmin=float(np.nanmin(v)), vmax=float(np.nanmax(v)))
         elif mode == 'max':
-            self._update_view(cache['mx_val'], "Max All Time")
+            v = cache['mx_val']
+            self._update_view(v, "Max All Time", vmin=float(np.nanmin(v)), vmax=float(np.nanmax(v)))
         elif mode == 'min':
-            self._update_view(cache['mn_val'], "Min All Time")
+            v = cache['mn_val']
+            self._update_view(v, "Min All Time", vmin=float(np.nanmin(v)), vmax=float(np.nanmax(v)))
 
     def _on_ts_view_click(self, op_mode):
         """Extract time series for all cells in current view."""
@@ -3157,8 +3235,8 @@ class NativeEmissionGUI(QMainWindow):
             lay_txt = self.cmb_ncf_layer.currentText()
             if "Sum" in lay_txt: l_op = 'sum'
             elif "Avg" in lay_txt: l_op = 'mean'
-            elif "Layer" in lay_txt:
-                 try: l_idx = int(lay_txt.split()[-1]) - 1
+            elif "LAY" in lay_txt:
+                 try: l_idx = int(lay_txt.split()[-1])
                  except: pass
 
             QTimer.singleShot(0, lambda: self._exec_ts_view(rows, cols, l_idx, l_op, op_mode))
@@ -3168,8 +3246,9 @@ class NativeEmissionGUI(QMainWindow):
 
     def _exec_ts_view(self, rows, cols, l_idx, l_op, agg_op):
          try:
-             # Run extraction
-             effective_path = self.input_files_list[0]
+             # Run extraction - prioritize tab-specific file for multi-file isolation
+             _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+             effective_path = getattr(_cur_tab, 'input_file', self.input_files_list[0]) if (hasattr(self, 'input_files_list') and self.input_files_list) else None
              stack_groups_path = None
              if self.emissions_df is not None:
                  attrs = getattr(self.emissions_df, 'attrs', {})
@@ -3178,23 +3257,26 @@ class NativeEmissionGUI(QMainWindow):
                  stack_groups_path = attrs.get('stack_groups_path')
 
              from ncf_processing import get_ncf_timeseries
+             _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+             pol = getattr(_cur_tab, 'pollutant', self.cmb_pollutant.currentText())
+
              res = get_ncf_timeseries(
                 effective_path,
-                self.cmb_pollutant.currentText(),
+                pol,
                 (rows-1).tolist(), (cols-1).tolist(),
                 layer_idx=l_idx, layer_op=l_op, op=agg_op,
                 stack_groups_path=stack_groups_path
              )
              
              if res:
-                 self._show_ts_window(res, f"View ({len(rows)} cells) - {agg_op.upper()}")
+                 self._show_ts_window(res, f"View ({len(rows)} cells) - {agg_op.upper()}", pollutant=pol)
                  self.notify_signal.emit("INFO", "Time Series Plotted.")
              else:
                  self.notify_signal.emit("WARNING", "No data found.")
          except Exception as e:
              self.notify_signal.emit("ERROR", f"TS Extraction failed: {e}")
 
-    def _update_view(self, new_vals, time_lbl):
+    def _update_view(self, new_vals, time_lbl, vmin=None, vmax=None):
         """Update the plot for a new time step or aggregate."""
         try:
              if not self.figure.axes: return
@@ -3208,15 +3290,21 @@ class NativeEmissionGUI(QMainWindow):
                      break
              
              if coll:
-                  # 1. Handle Limits (Especially for LogNorm safety)
-                  if self._t_data_cache:
+                  # 1. Handle Limits
+                  # Use caller-supplied vmin/vmax (per-aggregate range) if provided;
+                  # otherwise fall back to the global temporal range from cache.
+                  if vmin is not None and vmax is not None:
+                      c_vmin, c_vmax = vmin, vmax
+                  elif self._t_data_cache:
                       c_vmin = self._t_data_cache.get('vmin', 1e-20)
                       c_vmax = self._t_data_cache.get('vmax', 1.0)
+                  else:
+                      c_vmin, c_vmax = None, None
+
+                  if c_vmin is not None and c_vmax is not None:
                       if isinstance(coll.norm, LogNorm):
                           if c_vmin <= 0: c_vmin = 1e-20
                           if c_vmax <= c_vmin: c_vmax = c_vmin * 10.0
-                      
-                      # Set vmin/vmax on norm for ALL normalization types
                       if hasattr(coll.norm, 'vmin'):
                           coll.norm.vmin = c_vmin
                       if hasattr(coll.norm, 'vmax'):
@@ -3225,7 +3313,36 @@ class NativeEmissionGUI(QMainWindow):
 
                   # 2. Set Data
                   final_vals = new_vals
-                  
+
+                  # --- QuadMesh reorder: draw_quickmesh stores values in raster order
+                  # (row-major C[ny, nx] flattened), but get_ncf_animation_data returns
+                  # values in DataFrame row order.  Remap here so every cell gets the
+                  # correct value.
+                  from matplotlib.collections import QuadMesh
+                  is_quadmesh = isinstance(coll, QuadMesh)
+                  if is_quadmesh and self._merged_gdf is not None:
+                      try:
+                          gdf = self._merged_gdf
+                          info = gdf.attrs.get('_smk_grid_info')
+                          if info:
+                              nx = int(info['ncols'])
+                              ny = int(info['nrows'])
+                              r_col = next((c for c in gdf.columns if c.startswith('ROW')), 'ROW')
+                              c_col = next((c for c in gdf.columns if c.startswith('COL')), 'COL')
+                              # new_vals is aligned with gdf (DataFrame) rows.
+                              # Build raster array C[ny, nx] then flatten (row-major)
+                              # to match what pcolormesh expects.
+                              C = np.full(ny * nx, np.nan, dtype=np.float32)
+                              r_idx = gdf[r_col].values.astype(int) - 1  # 0-based
+                              c_idx = gdf[c_col].values.astype(int) - 1
+                              valid = (r_idx >= 0) & (r_idx < ny) & (c_idx >= 0) & (c_idx < nx)
+                              flat_idx = r_idx[valid] * nx + c_idx[valid]
+                              C[flat_idx] = np.asarray(new_vals)[valid]
+                              final_vals = C
+                      except Exception as _qe:
+                          logging.debug(f"QuadMesh remap failed: {_qe}")
+                  # ----------------------------------------
+
                   # --- County Aggregation for Animation ---
                   is_county_plot = False
                   try:
@@ -3234,46 +3351,24 @@ class NativeEmissionGUI(QMainWindow):
                   
                   if is_county_plot and hasattr(self, '_grid_to_county_map') and self._grid_to_county_map is not None:
                       try:
-                          # We have grid-level values (new_vals) corresponding to self.emissions_df rows(? not guaranteed)
-                          # Actually, get_ncf_animation_data returns values for rows/cols passed to it.
-                          # _ensure_time_data passed rows/cols from self.emissions_df.
-                          # So new_vals is aligned with self.emissions_df rows.
-                          
-                          # We need to map self.emissions_df indices to FIPS, then sum by FIPS.
-                          # self._grid_to_county_map links (ROW, COL) -> FIPS.
-                          # Efficient approach:
-                          # merge new_vals with map.
-                          
-                          # But new_vals is a numpy array.
-                          # Create a temp dataframe.
-                          # This is slightly slow per frame but robust.
-                          
-                          # Check if emissions_df has ROW/COL
                           if 'ROW' in self.emissions_df.columns and 'COL' in self.emissions_df.columns:
                               tmp = pd.DataFrame({
                                   'ROW': self.emissions_df['ROW'],
                                   'COL': self.emissions_df['COL'],
                                   'val': new_vals
                               })
-                              # Merge with map
                               merged_tmp = tmp.merge(self._grid_to_county_map, on=['ROW', 'COL'], how='inner')
                               k_col = self._grid_to_county_key
-                              
-                              # Sum by FIPS
                               agg = merged_tmp.groupby(k_col)['val'].sum()
-                              
-                              # Use current plot order (self._merged_gdf)
                               if self._merged_gdf is not None:
-                                   # The plot collection aligns with _merged_gdf
-                                   # We need to map 'agg' to _merged_gdf[k_col]
                                    final_vals = self._merged_gdf[k_col].map(agg).fillna(0.0).values
                       except Exception as e:
                            logging.debug(f"County anim aggregation failed: {e}")
-                           # fallback to raw, though it will likely throw size error
                   # ----------------------------------------
 
                   coll.set_array(final_vals)
-                  ax._smk_current_vals = final_vals
+                  # Keep GDF-order (new_vals) for stats; final_vals may be raster-reordered
+                  ax._smk_current_vals = np.asarray(new_vals)
                   
                   # 3. Update Colorbar
                   if hasattr(coll, 'colorbar') and coll.colorbar:
@@ -3307,16 +3402,17 @@ class NativeEmissionGUI(QMainWindow):
 
     def _update_plot_title(self, ax, immediate=False):
         """Update the plot title with dynamic statistics. Debounced by default for responsiveness."""
-        self._current_ax_for_title = ax
         if immediate:
-            self._exec_title_update()
+            self._exec_title_update(ax)
         else:
+            self._current_ax_for_title = ax
             # Start/Restart the timer to debounce rapid view changes (pan/zoom)
             self._title_timer.start(300)
 
-    def _exec_title_update(self):
+    def _exec_title_update(self, ax=None):
         """Perform the actual title update and statistics calculation."""
-        ax = self._current_ax_for_title
+        if ax is None:
+            ax = self._current_ax_for_title
         if ax is None or not hasattr(ax, 'figure'):
             return
             
@@ -3370,8 +3466,16 @@ class NativeEmissionGUI(QMainWindow):
                     else:
                         view_box = box(x0, y0, x1, y1)
                         filtered = vals
-                        if hasattr(self, '_merged_gdf') and self._merged_gdf is not None:
-                            gdf = self._merged_gdf
+                        _ax_tab_gdf = None
+                        if hasattr(self, '_plot_tab_map'):
+                            for _t in self._plot_tab_map.values():
+                                if isinstance(_t, _PlotTabWidget) and _t.figure is ax.figure:
+                                    _ax_tab_gdf = _t._merged_gdf
+                                    break
+                        if _ax_tab_gdf is None:
+                            _ax_tab_gdf = getattr(self, '_merged_gdf', None)
+                        if _ax_tab_gdf is not None:
+                            gdf = _ax_tab_gdf
                             # A. Grid Optimization 
                             info = gdf.attrs.get('_smk_grid_info')
                             proj_sel = self.cmb_proj.currentText().lower()
@@ -4281,12 +4385,125 @@ class NativeEmissionGUI(QMainWindow):
             logging.info("DEBUG: [PlotWorker] Finished. Stopping progress.")
             self.stop_progress_signal.emit()
 
+    def _get_or_create_plot_tab(self, column):
+        """Return the _PlotTabWidget for *column*, creating one if needed.
+        Also updates self.figure/canvas/toolbar aliases to point at that tab."""
+        if column in self._plot_tab_map:
+            tab = self._plot_tab_map[column]
+            idx = self.plot_tab_widget.indexOf(tab)
+            if idx >= 0:
+                self.plot_tab_widget.setCurrentIndex(idx)
+        else:
+            # Reuse the initial placeholder tab if it has never been rendered
+            initial = self._plot_tab_map.get('(empty)')
+            if initial is not None and not initial.figure.axes:
+                tab = initial
+                del self._plot_tab_map['(empty)']
+                tab.pollutant = column
+                # Rename placeholder tab
+                idx = self.plot_tab_widget.indexOf(tab)
+                if idx >= 0:
+                    self.plot_tab_widget.setTabText(idx, column)
+            else:
+                tab = _PlotTabWidget(column)
+                # Ensure the tab knows its pollutant context for extraction later
+                tab.pollutant = column
+                self.plot_tab_widget.addTab(tab, column)
+                idx = self.plot_tab_widget.indexOf(tab)
+                self.plot_tab_widget.setCurrentIndex(idx)
+            self._plot_tab_map[column] = tab
+        # Update aliases
+        self.figure = tab.figure
+        self.canvas = tab.canvas
+        self.toolbar = tab.toolbar
+        self.plot_controls_frame = tab.plot_controls_frame
+        self.pc_layout = tab.pc_layout
+        self.lbl_anim_status = tab.lbl_anim_status
+        self._t_data_cache = tab._t_data_cache
+        self._t_idx = tab._t_idx
+        self._is_showing_agg = tab._is_showing_agg
+        self._merged_gdf = tab._merged_gdf
+        return tab
+
+    def _on_plot_tab_changed(self, index):
+        """Update self.figure/canvas aliases when the user switches tabs."""
+        tab = self.plot_tab_widget.widget(index)
+        if isinstance(tab, _PlotTabWidget):
+            self.figure = tab.figure
+            self.canvas = tab.canvas
+            self.toolbar = tab.toolbar
+            self.plot_controls_frame = tab.plot_controls_frame
+            self.pc_layout = tab.pc_layout
+            self.lbl_anim_status = tab.lbl_anim_status
+            self._t_data_cache = tab._t_data_cache
+            self._t_idx = tab._t_idx
+            self._is_showing_agg = tab._is_showing_agg
+            self._merged_gdf = tab._merged_gdf
+            
+            # --- Sidebar UI Synchronization ---
+            # Update the sidebar pollutant dropdown and unit label to match the active tab
+            if hasattr(self, 'cmb_pollutant'):
+                self.cmb_pollutant.blockSignals(True)
+                self.cmb_pollutant.setCurrentText(tab.pollutant)
+                self.cmb_pollutant.blockSignals(False)
+                
+                # Sync unit label manually since we blocked signals
+                pol = tab.pollutant
+                unit = self.units_map.get(pol, "-")
+                if (unit == "-" or not unit) and hasattr(self, 'emissions_df') and self.emissions_df is not None:
+                     vmeta = getattr(self.emissions_df, 'attrs', {}).get('variable_metadata', {})
+                     if isinstance(vmeta, dict) and pol in vmeta:
+                          unit = vmeta[pol].get('units', "-")
+                self.lbl_units.setText(f"Unit: {unit}")
+
+            # Sync Statistics Panel for the current tab's data
+            if tab._merged_gdf is not None:
+                self._update_stats_panel(tab._merged_gdf, tab.pollutant)
+            
+            # If minimized, showing a new tab should hint at maximization
+            if self.isMinimized():
+                self.showNormal()
+
+            # --- Extended Session Sync: NetCDF Section visibility ---
+            if hasattr(self, 'ncf_frame'):
+                is_tab_ncf = getattr(tab, 'is_ncf', False)
+                self.ncf_frame.setVisible(is_tab_ncf)
+                # Note: self.plot_controls_frame is already aliased and handled per-tab
+                
+            # If the tab is NetCDF, try to sync the Time/Layer combo boxes to the tab's state
+            if getattr(tab, 'is_ncf', False) and hasattr(self, 'cmb_ncf_time'):
+                self.cmb_ncf_time.blockSignals(True)
+                if tab._t_idx is not None and tab._t_idx < self.cmb_ncf_time.count():
+                     self.cmb_ncf_time.setCurrentIndex(tab._t_idx)
+                self.cmb_ncf_time.blockSignals(False)
+
+    def _on_plot_tab_closed(self, index):
+        """Remove a tab and clean up the map entry."""
+        tab = self.plot_tab_widget.widget(index)
+        if isinstance(tab, _PlotTabWidget):
+            self._plot_tab_map.pop(tab.pollutant, None)
+        self.plot_tab_widget.removeTab(index)
+        # Re-alias to whatever tab is now active
+        cur = self.plot_tab_widget.currentWidget()
+        if isinstance(cur, _PlotTabWidget):
+            self.figure = cur.figure
+            self.canvas = cur.canvas
+            self.toolbar = cur.toolbar
+            self.plot_controls_frame = cur.plot_controls_frame
+            self.pc_layout = cur.pc_layout
+            self.lbl_anim_status = cur.lbl_anim_status
+            self._t_data_cache = cur._t_data_cache
+            self._t_idx = cur._t_idx
+            self._is_showing_agg = cur._is_showing_agg
+            self._merged_gdf = cur._merged_gdf
+
     @Slot(object, str, dict)
     def _render_plot_on_main(self, gdf, column, meta):
         """Main thread slot to update the matplotlib figure."""
         if getattr(self, '_smk_rendering', False): 
             return
         self._smk_rendering = True
+        _tab = self._get_or_create_plot_tab(column)
         try:
             # Memory Safety: Detach hover handlers from all axes before clearing
             # This prevents 'zombie' closures from trying to access GC-locked geometries.
@@ -4305,13 +4522,6 @@ class NativeEmissionGUI(QMainWindow):
             # 1. Clear and setup figure
             self.figure.clear()
             
-            # --- Dynamic Controls Update (Mirroring gui_qt.py) ---
-            # Clear existing items
-            while self.pc_layout.count():
-                item = self.pc_layout.takeAt(0)
-                widget = item.widget()
-                if widget: widget.deleteLater()
-            
             # Detect NCF Source
             is_ncf = False
             try:
@@ -4327,12 +4537,19 @@ class NativeEmissionGUI(QMainWindow):
             except: pass
             
             self.plot_controls_frame.setVisible(is_ncf)
-            
-            if is_ncf:
-                 # Populate Layout
+            # Store session metadata on the tab for multi-file isolation
+            _tab.is_ncf = is_ncf
+            _tab.input_file = self.input_files_list[0] if (hasattr(self, 'input_files_list') and self.input_files_list) else None
+            _tab.plot_by_mode = self.cmb_pltyp.currentText().lower() if hasattr(self, 'cmb_pltyp') else 'grid'
+
+            # --- Dynamic Controls Update ---
+            # Only (re)build the controls row the first time for this NCF file
+            # to avoid layout-resize events that shift the canvas on every render.
+            if is_ncf and self.pc_layout.count() == 0:
                  self.pc_layout.addWidget(QLabel("Time:"))
                  self.lbl_anim_status = QLabel("-")
                  self.pc_layout.addWidget(self.lbl_anim_status)
+                 _tab.lbl_anim_status = self.lbl_anim_status
                  
                  btn_prev = QPushButton("< Prev")
                  btn_prev.clicked.connect(lambda: self._step_time(-1))
@@ -4379,7 +4596,7 @@ class NativeEmissionGUI(QMainWindow):
                      self.cmb_cursor_mode.setCurrentIndex(1)
                  
                  self.pc_layout.addWidget(self.cmb_cursor_mode)
-                     
+                 _tab.cmb_cursor_mode = self.cmb_cursor_mode
                  self.pc_layout.addStretch()
             # -----------------------------------------------------
 
@@ -4414,6 +4631,7 @@ class NativeEmissionGUI(QMainWindow):
             
             # 6. Render main plot
             self._merged_gdf = gdf
+            _tab._merged_gdf = gdf
             
             # Defensive Column Resolution: Try strict, then flexible, then recovery
             actual_col = None
@@ -4451,7 +4669,7 @@ class NativeEmissionGUI(QMainWindow):
                 raise KeyError(f"Pollutant '{column}' not found in dataset. Available columns: {list(gdf.columns)}")
 
             ax._smk_current_vals = gdf[actual_col].values
-            ax._smk_pollutant = actual_col 
+            ax._smk_pollutant = actual_col
             ax._smk_time_lbl = None
             
             p_lw = 0.05
@@ -4810,12 +5028,11 @@ class NativeEmissionGUI(QMainWindow):
  
             self.notify_signal.emit("INFO", f"Plotted {actual_col}")
             self._update_stats_panel(gdf, actual_col)
-            self.canvas.draw_idle()
             
             # Memory Cleanup: explicitly trigger GC after successfully rendering everything
             import gc
             self._smk_rendering = False
-            self.canvas.draw()
+            self.canvas.draw_idle()
             gc.collect()
             
         except Exception as e:
@@ -4871,7 +5088,8 @@ class NativeEmissionGUI(QMainWindow):
                       if mask.any():
                            # Get first match
                            rec = self.emissions_df[mask].iloc[0]
-                           pol = self.cmb_pollutant.currentText()
+                           _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+                           pol = getattr(_cur_tab, 'pollutant', self.cmb_pollutant.currentText())
                            if pol in rec:
                                 t_val = rec[pol]
                  
@@ -4902,8 +5120,11 @@ class NativeEmissionGUI(QMainWindow):
     def _exec_ts_plot(self, r, c, l_idx, l_op):
          try:
              cursor_mode = "by-TSTEP"
-             if hasattr(self, 'cmb_cursor_mode'):
-                 cursor_mode = self.cmb_cursor_mode.currentText()
+             _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+             target_pol = getattr(_cur_tab, 'pollutant', self.cmb_pollutant.currentText())
+             _cmb = getattr(_cur_tab, 'cmb_cursor_mode', None) or getattr(self, 'cmb_cursor_mode', None)
+             if _cmb is not None:
+                 cursor_mode = _cmb.currentText()
                  
              if cursor_mode == "by-TSTEP":
                  from ncf_processing import get_ncf_timeseries
@@ -4911,15 +5132,15 @@ class NativeEmissionGUI(QMainWindow):
                  sg_path = getattr(self.emissions_df, 'attrs', {}).get('stack_groups_path')
                  
                  res = get_ncf_timeseries(
-                    self.input_files_list[0],
-                    self.cmb_pollutant.currentText(),
+                    getattr(_cur_tab, 'input_file', self.input_files_list[0]),
+                    target_pol,
                     [r-1], [c-1],
                     layer_idx=l_idx, layer_op=l_op, op='mean',
                     stack_groups_path=sg_path
                  )
                  
                  if res:
-                     self._show_ts_window(res, f"Time Series @ Cell ({r}, {c})")
+                     self._show_ts_window(res, f"Time Series @ Cell ({r}, {c})", pollutant=target_pol)
                      self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c}) Time Series")
                  else:
                      self.notify_signal.emit("WARNING", "No data found for cell.")
@@ -4936,15 +5157,15 @@ class NativeEmissionGUI(QMainWindow):
                      elif "Avg" in self.cmb_ncf_time.currentText(): t_op = 'mean'
                  
                  res = get_ncf_profile(
-                     self.input_files_list[0],
-                     self.cmb_pollutant.currentText(),
+                     getattr(_cur_tab, 'input_file', self.input_files_list[0]),
+                     target_pol,
                      [r-1], [c-1],
                      time_idx=t_idx, time_op=t_op, op='mean',
                      stack_groups_path=None # Inline not supported for by-LAY currently
                  )
                  
                  if res:
-                     self._show_ts_window(res, f"Vertical Profile @ Cell ({r}, {c})")
+                     self._show_ts_window(res, f"Vertical Profile @ Cell ({r}, {c})", pollutant=target_pol)
                      self.notify_signal.emit("INFO", f"Plotted Cell ({r}, {c}) Profile")
                  else:
                      self.notify_signal.emit("WARNING", "No vertical profile data found.")
@@ -4952,9 +5173,13 @@ class NativeEmissionGUI(QMainWindow):
          except Exception as e:
              self.notify_signal.emit("ERROR", f"Extraction failed: {e}")
 
-    def _show_ts_window(self, data, title):
+    def _show_ts_window(self, data, title, pollutant=None):
         try:
-             win = TimeSeriesPlotWindow(data, title, self.cmb_pollutant.currentText(), self.units_map.get(self.cmb_pollutant.currentText(), ""), self)
+             if pollutant is None:
+                 pollutant = self.cmb_pollutant.currentText()
+                 
+             unit = self.units_map.get(pollutant, "")
+             win = TimeSeriesPlotWindow(data, title, pollutant, unit, self)
              # Adjust X-ax label if it's a layer profile
              if "Profile" in title and hasattr(win, 'ax'):
                  win.ax.set_xlabel("Layer", fontsize=10, fontweight='bold')
@@ -5144,11 +5369,15 @@ class NativeEmissionGUI(QMainWindow):
 
     def _install_box_zoom(self, ax: plt.Axes):
         """Install interactive box zoom handles with proper connection management."""
-        # 1. Cleanup old connections to prevent accumulation/interference
-        if hasattr(self, '_zoom_cids'):
-            for cid in self._zoom_cids:
-                self.canvas.mpl_disconnect(cid)
-        self._zoom_cids = []
+        # 1. Cleanup old connections on THIS canvas to prevent accumulation/interference
+        _canvas = self.canvas
+        if hasattr(_canvas, '_smk_zoom_cids'):
+            for cid in _canvas._smk_zoom_cids:
+                try:
+                    _canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+        _canvas._smk_zoom_cids = []
         
         self._zoom_press = None
         self._zoom_rect = mpatches.Rectangle((0, 0), 0, 0, fill=False, ec='red', lw=1.2, zorder=9999)
@@ -5239,27 +5468,15 @@ class NativeEmissionGUI(QMainWindow):
                 elif hasattr(self.toolbar, 'update'):
                     self.toolbar.update()
 
-        # Connect and store CIDs for future cleanup
-        self._zoom_cids.append(self.canvas.mpl_connect('button_press_event', on_press))
-        self._zoom_cids.append(self.canvas.mpl_connect('motion_notify_event', on_motion))
-        self._zoom_cids.append(self.canvas.mpl_connect('button_release_event', on_release))
-        self._zoom_cids.append(self.canvas.mpl_connect('motion_notify_event', self._on_canvas_motion))
+        # Connect and store CIDs on the canvas itself so each tab manages its own set
+        _canvas._smk_zoom_cids.append(_canvas.mpl_connect('button_press_event', on_press))
+        _canvas._smk_zoom_cids.append(_canvas.mpl_connect('motion_notify_event', on_motion))
+        _canvas._smk_zoom_cids.append(_canvas.mpl_connect('button_release_event', on_release))
+        _canvas._smk_zoom_cids.append(_canvas.mpl_connect('motion_notify_event', self._on_canvas_motion))
 
     def _update_stats_panel(self, gdf, col):
-        """Update the side-panel stats after plotting."""
-        try:
-            vals = pd.to_numeric(gdf[col], errors='coerce').dropna()
-            if not vals.empty:
-                self.lbl_stats_sum.setText(f"{vals.sum():.4g}")
-                self.lbl_stats_max.setText(f"{vals.max():.4g}")
-                self.lbl_stats_mean.setText(f"{vals.mean():.4g}")
-                self.lbl_stats_count.setText(str(len(vals)))
-            else:
-                for w in [self.lbl_stats_sum, self.lbl_stats_max, self.lbl_stats_mean, self.lbl_stats_count]:
-                    w.setText("-")
-        except:
-            for w in [self.lbl_stats_sum, self.lbl_stats_max, self.lbl_stats_mean, self.lbl_stats_count]:
-                w.setText("Error")
+        """No-op as Stats tab has been removed."""
+        pass
 
     def show_metadata(self):
         """Show raw metadata popup."""
@@ -5272,8 +5489,11 @@ class NativeEmissionGUI(QMainWindow):
         if not pol:
             QMessageBox.warning(self, "No Pollutant", "Please select a pollutant first.")
             return
-        if self.emissions_df is not None:
-             DetailedStatsWindow(self.emissions_df, pol, self).exec()
+        # Prioritize tab's data for multi-file and filter consistency
+        _cur_tab = self.plot_tab_widget.currentWidget() if hasattr(self, 'plot_tab_widget') else None
+        gdf = getattr(_cur_tab, '_merged_gdf', self.emissions_df)
+        if gdf is not None:
+             DetailedStatsWindow(gdf, pol, self).exec()
 
 
 

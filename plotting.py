@@ -366,15 +366,13 @@ def create_map_plot(
                 collection = ax.collections[-1]
         elif plot_kwargs.get('legend'):
             # Manual colorbar for QuadMesh optimization
+            # Use figure.colorbar with fraction/pad instead of make_axes_locatable
+            # to avoid per-draw AxesDivider resize callbacks that shift the axes.
             try:
-                from mpl_toolkits.axes_grid1 import make_axes_locatable
-                divider = make_axes_locatable(ax)
-                cax = divider.append_axes("right", size="2%", pad=0.1)
-                
-                # Apply legend/colorbar keywords (formatters, ticks, etc.) to manual colorbar
                 cb_kw = plot_kwargs.get('legend_kwds', {}).copy()
-                plt.colorbar(collection, cax=cax, **cb_kw)
-                cax.set_label('<colorbar>')
+                cb_kw.pop('cax', None)  # fraction/pad approach doesn't use cax
+                cbar = ax.figure.colorbar(collection, ax=ax, fraction=0.02, pad=0.02, **cb_kw)
+                cbar.ax.set_label('<colorbar>')
             except Exception as e:
                 logging.debug("Failed to add manual colorbar: %s", e)
     except Exception as e:
