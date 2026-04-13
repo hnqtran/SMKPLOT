@@ -216,6 +216,15 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     bins = None
     # 1. Resolve bins - Hierarchy: bins_map[pollutant] > global bins
     bins_map = getattr(args, 'bins_map', None)
+    
+    # If bins_map is a list (e.g. from YAML safe_load of a list of dicts), flatten to a single dict
+    if isinstance(bins_map, list):
+        flat_bins_map = {}
+        for item in bins_map:
+            if isinstance(item, dict):
+                flat_bins_map.update(item)
+        bins_map = flat_bins_map
+
     if isinstance(bins_map, dict):
         pol_bins = bins_map.get(pol)
         if pol_bins:
@@ -246,10 +255,17 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
         logging.info("Auto-enabling zoom_to_data because spatial filtering is active.")
 
     # Use shared plotting function
+    # [BATCH-TITLE-FIX 2026-04-10] Include units in the main title if available.
+    main_title = f"{pol}"
+    if pol_unit:
+        main_title += f" ({pol_unit})"
+    if batch_src:
+        main_title = f"{batch_src} - {main_title}"
+
     create_map_plot(
         gdf=merged_plot,
         column=pol,
-        title=f"{pol} Emissions" if not batch_src else f"{batch_src} - {pol}",
+        title=main_title,
         ax=ax,
         cmap_name=args.cmap or 'jet',
         bins=bins,
@@ -333,9 +349,9 @@ def _render_single_pollutant(pol: str, ctx: Dict[str, Any]) -> Tuple[str, str]:
     if pol_unit:
         stats_str += f" ({pol_unit})"
     if batch_src:
-        title = f"{pol} emissions from {batch_src}"
+        title = f"{pol} from {batch_src}"
     else:
-        title = f"{pol} emission"
+        title = f"{pol}"
     if pol_unit:
         title = f"{title} [{pol_unit}]"
 
@@ -644,19 +660,17 @@ def _batch_mode(args):
             ncf_params['layer_idx'] = 0
             ncf_params['layer_op'] = 'select'
 
-    # Define notify callback for batch mode to display INFO messages to screen
+    # Define notify callback for batch mode. In Batch, we rely on the 
+    # global logger configured in smkplot.py. We only use this bridge 
+    # to确保 high-level messages from workers reach the log.
     def batch_notify(level, message):
-        """Display loader notifications to screen in batch mode."""
+        """Bridge loader notifications to the logging system without redundancy."""
         lvl = (level or 'INFO').upper()
-        msg = str(message).strip()
-        if lvl == 'INFO':
-            print(f"INFO: {msg}")
-        elif lvl == 'WARNING':
-            print(f"WARNING: {msg}")
-        elif lvl == 'ERROR':
-            print(f"ERROR: {msg}")
-        # Also log it
-        getattr(logging, lvl.lower(), logging.info)(msg)
+        # Most library-level progress (INFO) is already logged by the library itself.
+        # We only log here if it's a WARNING or ERROR, or for specific overrides.
+        if lvl in ('WARNING', 'ERROR'):
+            msg = str(message).strip()
+            getattr(logging, lvl.lower(), logging.info)(msg)
 
     try:
         norm_delim = normalize_delim(args.delim)
@@ -726,8 +740,15 @@ def _batch_mode(args):
         logging.error("No emissions data available for processing.")
         return 1
 
-    # Build FIPS column (skip for NetCDF files which use grid indices)
-    if not is_ncf_input:
+    # Build FIPS column (skip for NetCDF files or pure grid CSVs which use grid indices)
+    # [GRID-MODE-BYPASS 2026-04-10] If pltyp=grid and we have GRID_RC, we don't need FIPS.
+    is_pure_grid_csv = (
+        not is_ncf_input and 
+        getattr(args, 'pltyp', 'county') == 'grid' and 
+        'GRID_RC' in emis_df.columns
+    )
+
+    if not is_ncf_input and not is_pure_grid_csv:
         try:
             emis_df = get_emis_fips(emis_df)
         except ValueError as e:
@@ -831,9 +852,11 @@ def _batch_mode(args):
         try:
             from ncf_processing import create_ncf_domain_gdf
             # Use the proxy file for geometry if available (ensures correct 2D grid for Inline sources)
-            geom_source_path = emis_df.attrs.get('proxy_ncf_path', args.filepath)
+            # Ensure we pass a single string path, not a list, to the NetCDF geometry functions
+            first_ncf = resolved_files[0] if isinstance(resolved_files, list) else resolved_files
+            geom_source_path = emis_df.attrs.get('proxy_ncf_path', first_ncf)
              
-            logging.info("Generating grid geometry from NetCDF file parameters (%s)...", "proxy" if geom_source_path != args.filepath else "original")
+            logging.info("Generating grid geometry from NetCDF file parameters (%s)...", "proxy" if geom_source_path != first_ncf else "original")
             base_geom = create_ncf_domain_gdf(geom_source_path)
             merge_on = 'GRID_RC'
         except Exception:
@@ -1343,6 +1366,14 @@ def _batch_mode(args):
 
     # Determine projection (only use LCC when grid + GRIDDESC provided, unless --force-lcc)
     crs_proj = None; tf_fwd = None; tf_inv = None
+    
+    # Priority for projection:
+    # 1. Explicit WGS84
+    # 2. NetCDF Grid (if available)
+    # 3. Explicit LCC with GRIDDESC
+    # 4. Explicit --force-lcc (Legacy CONUS)
+    # 5. Default "auto" logic (GRIDDESC > else geographic)
+
     if args.projection == 'wgs84':
         crs_proj = None  # keep geographic
     elif is_ncf_input and args.projection != 'wgs84':
@@ -1358,9 +1389,34 @@ def _batch_mode(args):
                 tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
         except Exception:
             crs_proj = None; tf_fwd = None; tf_inv = None
-    elif args.projection == 'lcc':
-        # attempt grid-specific if possible, else default CONUS
-        if args.griddesc and args.gridname:
+    
+    # If not already projected by NCF, check other LCC flags
+    if crs_proj is None:
+        if args.projection == 'lcc':
+            # attempt grid-specific if possible, else default CONUS
+            if args.griddesc and args.gridname:
+                try:
+                    from data_processing import extract_grid
+                    coord_params, _ = extract_grid(args.griddesc, args.gridname)
+                    _, p_alpha, p_beta, _p_gamma, x_cent, y_cent = coord_params
+                    a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
+                    proj4 = f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} +lon_0={x_cent} {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
+                    crs_proj = pyproj.CRS.from_proj4(proj4)
+                    tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_proj, always_xy=True)
+                    tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
+                except Exception:
+                    crs_proj = None; tf_fwd = None; tf_inv = None
+            if crs_proj is None:
+                try:
+                    a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
+                    proj4 = f"+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-96 {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
+                    crs_proj = pyproj.CRS.from_proj4(proj4)
+                    tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_proj, always_xy=True)
+                    tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
+                except Exception:
+                    crs_proj = None; tf_fwd = None; tf_inv = None
+        elif args.griddesc and args.gridname and args.pltyp != 'county':
+            # For auto mode: if gridname provided, use grid projection (unless county plot)
             try:
                 from data_processing import extract_grid
                 coord_params, _ = extract_grid(args.griddesc, args.gridname)
@@ -1372,7 +1428,7 @@ def _batch_mode(args):
                 tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
             except Exception:
                 crs_proj = None; tf_fwd = None; tf_inv = None
-        if crs_proj is None:
+        elif args.force_lcc:
             try:
                 a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
                 proj4 = f"+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-96 {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
@@ -1381,28 +1437,6 @@ def _batch_mode(args):
                 tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
             except Exception:
                 crs_proj = None; tf_fwd = None; tf_inv = None
-    elif args.griddesc and args.gridname and args.pltyp != 'county':
-        # For auto mode: if gridname provided, use grid projection (unless county plot)
-        try:
-            from data_processing import extract_grid
-            coord_params, _ = extract_grid(args.griddesc, args.gridname)
-            _, p_alpha, p_beta, _p_gamma, x_cent, y_cent = coord_params
-            a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
-            proj4 = f"+proj=lcc +lat_1={p_alpha} +lat_2={p_beta} +lat_0={y_cent} +lon_0={x_cent} {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
-            crs_proj = pyproj.CRS.from_proj4(proj4)
-            tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_proj, always_xy=True)
-            tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
-        except Exception:
-            crs_proj = None; tf_fwd = None; tf_inv = None
-    elif args.force_lcc:
-        try:
-            a_b = "+a=6370000.0 +b=6370000.0" if USE_SPHERICAL_EARTH else "+ellps=WGS84 +datum=WGS84"
-            proj4 = f"+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-96 {a_b} +x_0=0 +y_0=0 +units=m +no_defs"
-            crs_proj = pyproj.CRS.from_proj4(proj4)
-            tf_fwd = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs_proj, always_xy=True)
-            tf_inv = pyproj.Transformer.from_crs(crs_proj, pyproj.CRS.from_epsg(4326), always_xy=True)
-        except Exception:
-            crs_proj = None; tf_fwd = None; tf_inv = None
     
     # If crs_proj is None we stay in geographic (EPSG:4326) space
     # but we initialize identity transformers to allow graticule drawing via _draw_graticule

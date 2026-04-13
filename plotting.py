@@ -68,6 +68,25 @@ def _resolve_cmap_and_theme(cmap_input: Any) -> Tuple[Any, Dict[str, Any]]:
     return cmap, theme
 
 
+def _fmt_human_readable(x, pos=None):
+    """Format numeric labels without scientific notation where possible."""
+    if x == 0:
+        return "0"
+    if x < 0:
+        # Handle negative values if they ever occur
+        abs_x = abs(x)
+        if 1e-4 <= abs_x <= 1e11:
+            s = f"{x:f}".rstrip('0').rstrip('.')
+            return s if s else "0"
+        return f"{x:g}"
+        
+    # Prioritize plain decimal/integer formatting for common emission ranges
+    if 1e-4 <= x <= 1e11:
+        s = f"{x:f}".rstrip('0').rstrip('.')
+        return s if s else "0"
+    return f"{x:g}"
+
+
 def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Dict[str, Any]:
     """Construct argument dictionary for geopandas plot function."""
     kwargs = dict(
@@ -94,11 +113,7 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
             kwargs['cmap'] = cmap
             kwargs['norm'] = BoundaryNorm(bins, ncolors=cmap.N, clip=False, extend='neither')
             
-            # Use non-scientific formatter for discrete bins
-            formatter = ScalarFormatter()
-            formatter.set_scientific(False)
-            formatter.set_useOffset(False)
-            kwargs['legend_kwds'] = {'ticks': bins, 'format': formatter} 
+            kwargs['legend_kwds'] = {'ticks': bins, 'format': FuncFormatter(_fmt_human_readable)} 
         except (ValueError, AttributeError) as e:
             logging.warning("Failed to configure custom bins/norm: %s", e)
     else:
@@ -122,33 +137,19 @@ def _get_plot_kwargs(gdf, column, cmap, bins, log_scale, user_kwargs=None) -> Di
                 if high <= low: high = low * 10.0
                 kwargs['norm'] = LogNorm(vmin=low, vmax=high)
 
-                # Enforce human-readable log labels without scientific notation
-                def _fmt_log_readable(x, pos=None):
-                    if x <= 0: return ""
-                    # Prioritize plain decimal/integer formatting up to 10^10
-                    if 1e-4 <= x <= 1e10:
-                        s = f"{x:f}".rstrip('0').rstrip('.')
-                        if s: return s
-                    return f"{x:g}"
-
-                kwargs['legend_kwds'] = {'format': FuncFormatter(_fmt_log_readable)}
+                kwargs['legend_kwds'] = {'format': FuncFormatter(_fmt_human_readable)}
     
     # Ensure vmin/vmax are in kwargs for linear plots if not already handled by norm
     if 'norm' not in kwargs:
         if user_kwargs and 'vmin' in user_kwargs: kwargs['vmin'] = user_kwargs['vmin']
         if user_kwargs and 'vmax' in user_kwargs: kwargs['vmax'] = user_kwargs['vmax']
         
-        # Enforce non-scientific formatting for linear scales
-        formatter = ScalarFormatter()
-        formatter.set_scientific(False)
-        formatter.set_useOffset(False)
+        # Enforce human-readable formatting for linear scales
         if 'legend_kwds' not in kwargs:
-            kwargs['legend_kwds'] = {'format': formatter}
+            kwargs['legend_kwds'] = {'format': FuncFormatter(_fmt_human_readable)}
         else:
-            kwargs['legend_kwds']['format'] = formatter
+            kwargs['legend_kwds']['format'] = FuncFormatter(_fmt_human_readable)
 
-    return kwargs
-                
     return kwargs
 
 
@@ -358,7 +359,7 @@ def create_map_plot(
             # while keeping overlays (counties, etc.) as sharp vectors.
             if len(gdf) > 20000:
                 plot_kwargs['rasterized'] = True
-                logging.info(f"Auto-rasterizing large dataset ({len(gdf)} features) for performance.")
+                logging.debug(f"Auto-rasterizing large dataset ({len(gdf)} features) for performance.")
                 
             # Fallback to standard GeoPandas (Vector) plot
             gdf.plot(**plot_kwargs)

@@ -2388,9 +2388,9 @@ class NativeEmissionGUI(QMainWindow):
 
                 # [POLLUTANT-AGGREGATION 2026-04-06] Apply arithmetic formulas from col_formulas
                 # (defined via 'NAME = COL1 + COL2 ...' entries in the YAML pollutant field).
-                # Must run before stats re-calc and detect_pollutants so derived columns exist.
+                # For NetCDF, we defer this to the plotting phase to allow lazy-loading of operands.
                 _col_formulas = getattr(self.cli_args, 'col_formulas', None) or {}
-                if _col_formulas:
+                if _col_formulas and not is_nc_flag:
                     _rhs_split_gui = _re.compile(r'\s+([+\-x/])\s+')
 
                     def _resolve_gui(token, _df):
@@ -2725,6 +2725,14 @@ class NativeEmissionGUI(QMainWindow):
 
         # Sort pollutants alphabetically
         self.pollutants = sorted(self.pollutants, key=lambda s: s.lower())
+
+        # Include derived pollutants from formulas if not already present
+        _col_formulas = getattr(self.cli_args, 'col_formulas', None) or {}
+        if _col_formulas:
+             for f_name in _col_formulas:
+                  if f_name not in self.pollutants:
+                       self.pollutants.append(f_name)
+             self.pollutants = sorted(list(set(self.pollutants)), key=lambda s: s.lower())
 
         self.cmb_pollutant.blockSignals(True)
         self.cmb_pollutant.clear()
@@ -3070,7 +3078,8 @@ class NativeEmissionGUI(QMainWindow):
                 cols.tolist(), 
                 layer_idx=l_idx, 
                 layer_op=l_op,
-                stack_groups_path=stack_groups_path
+                stack_groups_path=stack_groups_path,
+                col_formulas=getattr(self.cli_args, 'col_formulas', None)
             )
             
             if res:
@@ -3279,6 +3288,12 @@ class NativeEmissionGUI(QMainWindow):
     def _update_view(self, new_vals, time_lbl, vmin=None, vmax=None):
         """Update the plot for a new time step or aggregate."""
         try:
+             # Sync state back to the active tab so switching tabs remembers time/agg
+             _cur_tab = self.plot_tab_widget.currentWidget()
+             if isinstance(_cur_tab, _PlotTabWidget):
+                  _cur_tab._t_idx = self._t_idx
+                  _cur_tab._is_showing_agg = self._is_showing_agg
+
              if not self.figure.axes: return
              ax = self.figure.axes[0]
              
@@ -3615,7 +3630,7 @@ class NativeEmissionGUI(QMainWindow):
                 ax.figure.canvas.draw_idle()
             except Exception as e:
                 logging.debug(f"Stats extraction failed: {e}")
-                ax.set_title(f"{pol} Emissions", fontsize=12)
+                ax.set_title(f"{pol}", fontsize=12)
         except Exception as e:
             logging.debug(f"Global title update failed: {e}")
 
@@ -3784,10 +3799,65 @@ class NativeEmissionGUI(QMainWindow):
         # Using a local variable instead of self._lazy_fetched_col for better thread safety
         current_lazy_col = None
 
-        # LAZY FETCH: Check if we need to fetch the pollutant into the main DF before proceeding
+        # LAZY FETCH & FORMULA HANDLING: Check if we need to fetch or calculate the pollutant
         if target_pol and hasattr(self.emissions_df, 'columns') and target_pol not in self.emissions_df.columns:
+            _col_formulas = getattr(self.cli_args, 'col_formulas', None) or {}
             ds = getattr(self.emissions_df, 'attrs', {}).get('_smk_xr_ds')
-            if ds is not None:
+            
+            if target_pol in _col_formulas:
+                # Formula Evaluation Path
+                rhs = _col_formulas[target_pol]
+                _rhs_split_gui = _re.compile(r'\s+([+\-x/])\s+')
+                parts = _rhs_split_gui.split(rhs)
+                operands = [p.strip() for i, p in enumerate(parts) if i % 2 == 0]
+                
+                # Fetch missing operands for formula
+                if ds is not None:
+                    # Identify which operands are missing (and aren't numbers)
+                    missing_ops = [o for o in operands if o and o not in self.emissions_df.columns and not o.replace('.','',1).isdigit()]
+                    if missing_ops:
+                        try:
+                            _do_notify('INFO', 'Fetching Data', f"Lazy-extracting operands for formula {target_pol}: {missing_ops}...")
+                            from ncf_processing import read_ncf_emissions
+                            ncf_params = self.emissions_df.attrs.get('ncf_params', {})
+                            path = self.input_files_list[0] if getattr(self, 'input_files_list', None) else None
+                            if path:
+                                new_ops_df = read_ncf_emissions(path, pollutants=missing_ops, xr_ds=ds, **ncf_params)
+                                # Attach missing operands to the main DF
+                                for mo in missing_ops:
+                                    if mo in new_ops_df.columns:
+                                        self.emissions_df[mo] = new_ops_df[mo].values
+                        except Exception as e:
+                            _do_notify('WARNING', 'Fetch Failed', f"Could not load formula operands: {e}")
+
+                # Now evaluate the formula
+                try:
+                    def _resolve_gui(token, _df):
+                        if token in _df.columns: return _df[token].fillna(0)
+                        try: return float(token)
+                        except ValueError: raise KeyError(token)
+
+                    def _eval_gui(rhs_str, _df):
+                        parts = _rhs_split_gui.split(rhs_str)
+                        res = _resolve_gui(parts[0].strip(), _df)
+                        i = 1
+                        while i + 1 <= len(parts) - 1:
+                            op, tok = parts[i], parts[i + 1].strip()
+                            operand = _resolve_gui(tok, _df)
+                            if op == '+': res = res + operand
+                            elif op == '-': res = res - operand
+                            elif op == 'x': res = res * operand
+                            elif op == '/': res = res / operand
+                            i += 2
+                        return res
+
+                    self.emissions_df[target_pol] = _eval_gui(rhs, self.emissions_df)
+                    logging.info(f"[col_formulas] Calculated '{target_pol}' = {rhs}")
+                except Exception as e:
+                    _do_notify('ERROR', 'Formula Failed', f"Failed to compute {target_pol}: {e}")
+
+            elif ds is not None:
+                # Standard Lazy Load Path
                 try:
                     _do_notify('INFO', 'Fetching Data', f"Lazy-extracting {target_pol} from NetCDF dataset...")
                     from ncf_processing import read_ncf_emissions
@@ -4435,6 +4505,10 @@ class NativeEmissionGUI(QMainWindow):
             self.plot_controls_frame = tab.plot_controls_frame
             self.pc_layout = tab.pc_layout
             self.lbl_anim_status = tab.lbl_anim_status
+            
+            # --- Tab State Synchronization ---
+            # IMPORTANT: Re-alias these so animation/aggregation tools 
+            # work on the data for THIS specific tab.
             self._t_data_cache = tab._t_data_cache
             self._t_idx = tab._t_idx
             self._is_showing_agg = tab._is_showing_agg

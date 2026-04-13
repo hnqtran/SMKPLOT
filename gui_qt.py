@@ -1494,7 +1494,8 @@ class EmissionGUI:
         # Filter by Overlay Shapefile
         self.filter_overlay_var = tk.StringVar(value=str(getattr(self, 'initial_filter_overlay', 'False')))
         ttk.Label(frm, text="Filter Operation:").grid(row=3, column=3, sticky='e', padx=(10, 2))
-        self.filter_overlay_menu = ttk.OptionMenu(frm, self.filter_overlay_var, self.filter_overlay_var.get(), "False", "clipped", "intersect", "within")
+        self.filter_overlay_menu = ttk.OptionMenu(frm, self.filter_overlay_var, self.filter_overlay_var.get(), "False", "clipped", "intersect", "within",
+                                                 command=lambda *_: self._invalidate_merge_cache())
         self.filter_overlay_menu.grid(row=3, column=4, sticky='we')
 
         # Filter Shapefile (Optional - for spatial filtering)
@@ -2639,6 +2640,8 @@ class EmissionGUI:
             
             if all_parts:
                 self.overlay_gdf = all_parts
+            
+            self._invalidate_merge_cache()
                   
         except Exception as e:
             self._notify('ERROR', 'Overlay Load Error', str(e), exc=e)

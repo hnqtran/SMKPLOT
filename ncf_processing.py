@@ -1816,16 +1816,77 @@ def get_ncf_animation_data(
     col_indices: list,
     layer_idx: int = 0,
     layer_op: str = 'select',
-    stack_groups_path: str = None
+    stack_groups_path: str = None,
+    col_formulas: dict = None
 ):
     """
     Extract data for animation: Full time series for each specified cell.
-    Returns: {
-        'times': [str], 
-        'values': np.array shape (n_times, n_cells),
-        'units': str
-    }
+    Supports arithmetic formulas (e.g. 'NOX = NO + NO2').
     """
+    logging.debug(f"Entering get_ncf_animation_data for {pollutant}")
+    
+    # --- FORMULA SUPPORT ---
+    if col_formulas and pollutant in col_formulas:
+        formula = col_formulas[pollutant]
+        import re as _re
+        _rhs_split = _re.compile(r'\s+([+\-x/])\s+')
+        parts = _rhs_split.split(formula)
+        
+        # 1. Gather all operands (skipping operators)
+        operands = [p.strip() for i, p in enumerate(parts) if i % 2 == 0]
+        
+        # 2. Extract full time series for each operand
+        op_data = {}
+        t_steps = None
+        units = ""
+        
+        for op in operands:
+            if not op: continue
+            # Handle numeric constants in formula
+            try:
+                val = float(op)
+                op_data[op] = val
+                continue
+            except ValueError:
+                pass
+                
+            # Actually extract time series for this operand
+            res = get_ncf_animation_data(
+                ncf_path, op, row_indices, col_indices, 
+                layer_idx, layer_op, stack_groups_path
+            )
+            if res is None:
+                logging.warning(f"Formula operand '{op}' could not be extracted for animation.")
+                return None
+            
+            op_data[op] = res['values']
+            if t_steps is None: t_steps = res['times']
+            if not units: units = res.get('units', "")
+
+        if t_steps is None: return None
+        
+        # 3. Perform Vectorized Arithmetic across all cells and time steps
+        try:
+            def _resolve(token):
+                if token in op_data: return op_data[token]
+                return float(token)
+
+            result_arr = _resolve(parts[0].strip())
+            i = 1
+            while i + 1 < len(parts):
+                op_char, next_tok = parts[i], parts[i+1].strip()
+                nxt = _resolve(next_tok)
+                if op_char == '+': result_arr = result_arr + nxt
+                elif op_char == '-': result_arr = result_arr - nxt
+                elif op_char == 'x': result_arr = result_arr * nxt
+                elif op_char == '/': result_arr = result_arr / nxt
+                i += 2
+                
+            return {'times': t_steps, 'values': result_arr, 'units': units}
+        except Exception as e:
+            logging.error(f"Formula evaluation failed in get_ncf_animation_data: {e}")
+            return None
+
     # --- INLINE Support ---
     if stack_groups_path and os.path.exists(stack_groups_path):
         try:
