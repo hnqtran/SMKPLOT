@@ -204,7 +204,9 @@ def _add_overlays(ax: plt.Axes, overlay_counties, overlay_shape, crs_proj, theme
         overlay_list = overlay_shape if isinstance(overlay_shape, list) else [overlay_shape]
         
         # Color cycle for multiple overlays
-        colors = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
+        colors = ['magenta', 'blue', 'red', 'orange', 'crimson', 'darkorange',
+                  'mediumseagreen', 'blueviolet', 'hotpink', 'teal', 'sienna',
+                  'navy', 'darkgreen', 'purple', 'chocolate', 'darkred']
         
         for idx, shape_gdf in enumerate(overlay_list):
             try:

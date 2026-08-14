@@ -954,8 +954,8 @@ def read_inputfile(
 
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
-    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
-        _emit_user_message(notify, 'INFO', "Detected FF10_NONPOINT format identifier in first line. Readding as FF10 format for nonpoint...")
+    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line or "#FORMAT=FF10_ONROAD" in first_line or "#FORMAT=FF10_DAILY_ONROAD" in first_line:
+        _emit_user_message(notify, 'INFO', "Detected FF10 format identifier (NONPOINT/ONROAD) in first line. Readding as FF10 format for nonpoint...")
         result = read_ff10(
             fpath=fpath,
             src_name=sector,
@@ -1116,7 +1116,7 @@ def read_ff10(
     # Examine 1st row for "#FORMAT=FF10_NONPOINT" or "#FORMAT=FF10_POINT" and dertermine src_type
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
-        if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
+        if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line or "#FORMAT=FF10_ONROAD" in first_line or "#FORMAT=FF10_DAILY_ONROAD" in first_line:
             src_type = "ff10_nonpoint"
         elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
             src_type = "ff10_point"
@@ -1375,7 +1375,7 @@ def _read_single_file_wrapper(fp, src_name, flter_col, flter_start, flter_end, f
         first_line = f.readline().strip()
     
     detected_type = None
-    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line:
+    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line or "#FORMAT=FF10_ONROAD" in first_line or "#FORMAT=FF10_DAILY_ONROAD" in first_line:
         detected_type = "ff10_nonpoint"
     elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
         detected_type = "ff10_point"

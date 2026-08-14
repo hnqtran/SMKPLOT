@@ -4819,7 +4819,9 @@ class NativeEmissionGUI(QMainWindow):
                     except: pass
                 if _shapes is not None:
                     s_list = _shapes if isinstance(_shapes, list) else [_shapes]
-                    clrs = ['cyan', 'magenta', 'yellow', 'red', 'lime', 'orange']
+                    clrs = ['magenta', 'blue', 'red', 'orange', 'crimson', 'darkorange',
+                            'mediumseagreen', 'blueviolet', 'hotpink', 'teal', 'sienna',
+                            'navy', 'darkgreen', 'purple', 'chocolate', 'darkred']
                     for idx, s_gdf in enumerate(s_list):
                         try:
                             s_out = s_gdf.to_crs(_target_crs) if _target_crs and getattr(s_gdf, 'crs', None) else s_gdf
