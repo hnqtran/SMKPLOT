@@ -709,7 +709,7 @@ def filter_dataframe_by_values(
 def read_inputfile(
     fpath: Union[str, Sequence[str]],
     sector: Optional[str] = None,
-    delim: Optional[str] = ",",
+    delim: Optional[str] = None,
     skiprows: Optional[int] = None,
     comment: Optional[str] = None,
     encoding: Optional[str] = None,
@@ -731,6 +731,116 @@ def read_inputfile(
         * If 1st line has #LIST, treat as list file of multiple FF10 files
         * else, treat as smkreport and call read_smkreport().
     """
+    # --- SQLITE DATABASE INGESTION INTEGRATION ---
+    db_path = ncf_params.get('db_path') if ncf_params else None
+    if db_path:
+        try:
+            import sqlite3
+            import re
+            
+            # Helper to extract sector name from reference file path
+            def get_sector_from_filepath(fp):
+                fn = os.path.basename(fp)
+                m = re.match(r'report_by_county_grid_scc_(.+)\.txt', fn)
+                if m:
+                    return m.group(1).replace('_12', '')
+                return None
+                
+            # Connect to sqlite
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=DELETE;")
+            conn.execute("PRAGMA cache_size=-64000000;") # 64GB
+            conn.execute("PRAGMA synchronous=OFF;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA mmap_size=107374182400;") # 100GB
+            conn.execute("PRAGMA busy_timeout=60000;")
+            
+            case_id = ncf_params.get('case', '2022he_cb6_22m')
+            
+            # Resolve sectors to query
+            sectors_to_query = []
+            if isinstance(fpath, str):
+                s_name = get_sector_from_filepath(fpath) or sector
+                if s_name: sectors_to_query.append(s_name)
+            elif isinstance(fpath, (list, tuple)):
+                for p in fpath:
+                    s_name = get_sector_from_filepath(p)
+                    if s_name:
+                        sectors_to_query.append(s_name)
+            
+            if not sectors_to_query and sector:
+                sectors_to_query = [sector] if isinstance(sector, str) else list(sector)
+                
+            # Standardize sector names to match database records
+            sectors_to_query = [s.replace('_12', '') for s in sectors_to_query]
+            
+            # Fetch available columns from database table to build safe SELECT clause
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(smkreport)")
+            db_cols = {row[1] for row in cursor.fetchall()}
+            
+            select_cols = "*"
+            if usecols:
+                meta_cols = {'case', 'sector', 'x_cell', 'y_cell', 'region_cd', 'state', 'county', 'scc'}
+                req_cols = set(usecols).union(meta_cols)
+                valid_cols = [c for c in req_cols if c in db_cols]
+                if valid_cols:
+                    select_cols = ", ".join(f'"{c}"' for c in valid_cols)
+                    
+            # Build query filters
+            where_clauses = [f'"case" = \'{case_id}\'']
+            if sectors_to_query:
+                s_list = ", ".join(f"'{s}'" for s in sectors_to_query)
+                where_clauses.append(f"sector IN ({s_list})")
+                
+            # Pushdown filter criteria (FIPS/SCC/County/State etc)
+            if flter_col and flter_col in db_cols and flter_val:
+                vals = ", ".join(f"'{v}'" for v in flter_val)
+                where_clauses.append(f'"{flter_col}" IN ({vals})')
+                
+            where_str = " AND ".join(where_clauses)
+            sql_query = f"SELECT {select_cols} FROM smkreport WHERE {where_str}"
+            import time
+            import sys
+            t0 = time.time()
+            print(f"Querying database: {sql_query}")
+            sys.stdout.flush()
+            
+            df = pd.read_sql_query(sql_query, conn)
+            t1 = time.time()
+            print(f"Query completed. Loaded {len(df)} rows in {t1 - t0:.2f} seconds.")
+            sys.stdout.flush()
+            conn.close()
+            
+            # Format outputs for smkplot compatibility
+            if 'region_cd' in df.columns:
+                df['region_cd'] = df['region_cd'].astype(str).str.zfill(12)
+            
+            try:
+                df = get_emis_fips(df, verbose=False)
+            except Exception:
+                pass
+                
+            if 'x_cell' in df.columns and 'y_cell' in df.columns:
+                # Construct GRID_RC string format 'Y_X' matching standard report parsing
+                df['GRID_RC'] = df['y_cell'].astype(str).str.split('.').str[0] + "_" + df['x_cell'].astype(str).str.split('.').str[0]
+                
+            t2 = time.time()
+            print(f"Coordinate mapping & FIPS generation completed in {t2 - t1:.2f} seconds. Total DB ingestion: {t2 - t0:.2f} seconds.")
+            sys.stdout.flush()
+            
+            df.attrs['source_type'] = 'smkreport'
+            if sectors_to_query:
+                df.attrs['source_name'] = sectors_to_query[0]
+                
+            if not return_raw:
+                return df, None
+            return df, df
+            
+        except Exception as e:
+            _emit_user_message(notify, 'ERROR', f"Failed querying database {db_path}: {e}")
+            raise e
+
     # NetCDF Support: Improved detection using magic numbers
     is_ncf = False
     if isinstance(fpath, str):
@@ -954,8 +1064,10 @@ def read_inputfile(
 
     with open(fpath, 'r', errors='ignore') as f:
         first_line = f.readline().strip()
-    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line or "#FORMAT=FF10_ONROAD" in first_line or "#FORMAT=FF10_DAILY_ONROAD" in first_line:
-        _emit_user_message(notify, 'INFO', "Detected FF10 format identifier (NONPOINT/ONROAD) in first line. Readding as FF10 format for nonpoint...")
+    # [BUGFIX: Support HOURLY FF10 Format Identifiers]
+    # Recognizes #FORMAT=FF10_HOURLY_POINT, #FORMAT=FF10_HOURLY_NONPOINT, and #FORMAT=FF10_HOURLY_ONROAD
+    if "#FORMAT=FF10_NONPOINT" in first_line or "#FORMAT=FF10_DAILY_NONPOINT" in first_line or "#FORMAT=FF10_HOURLY_NONPOINT" in first_line or "#FORMAT=FF10_ONROAD" in first_line or "#FORMAT=FF10_DAILY_ONROAD" in first_line or "#FORMAT=FF10_HOURLY_ONROAD" in first_line:
+        _emit_user_message(notify, 'INFO', "Detected FF10 format identifier (NONPOINT/ONROAD) in first line. Reading as FF10 format for nonpoint...")
         result = read_ff10(
             fpath=fpath,
             src_name=sector,
@@ -969,8 +1081,8 @@ def read_inputfile(
             encoding=encoding,
             emis_unit="tons/yr",
         )
-    elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line:
-        _emit_user_message(notify, 'INFO', "Detected FF10_POINT format identifier in first line. Readding as FF10 format for point...")
+    elif "#FORMAT=FF10_POINT" in first_line or "#FORMAT=FF10_DAILY_POINT" in first_line or "#FORMAT=FF10_HOURLY_POINT" in first_line:
+        _emit_user_message(notify, 'INFO', "Detected FF10_POINT format identifier in first line. Reading as FF10 format for point...")
         result = read_ff10(
             fpath=fpath,
             src_name=sector,
@@ -1307,11 +1419,14 @@ def read_ff10(
     try:
         df = _read_and_process_chunks(pd.read_csv, read_kwargs, _process_chunk)
     except Exception as e:
-        # Fallback to python engine if C engine fails (e.g. regex sep)
-        logging.warning(f"Fast CSV read failed ({e}), falling back to slower python engine...")
+        # [BUGFIX: Encoding & Duplicate Column Fallback]
+        # Handle Latin-1/ISO-8859-1 accented characters (e.g. Mexico CEDS inputs)
+        # and duplicate column headers (e.g. onroad monthly VMT inputs) gracefully
+        logging.warning(f"Fast CSV read failed ({e}), attempting resilient fallback with python engine and latin-1...")
         read_kwargs['engine'] = 'python'
-        # low_memory not supported in python engine
+        read_kwargs['encoding'] = 'latin-1'
         if 'low_memory' in read_kwargs: del read_kwargs['low_memory']
+        if 'usecols' in read_kwargs: del read_kwargs['usecols']
         df = _read_and_process_chunks(pd.read_csv, read_kwargs, _process_chunk)
 
     col_lst = processed_cols_ref['cols'] if processed_cols_ref['cols'] else list(df.columns)
@@ -1554,7 +1669,7 @@ def read_listfile(
 def read_smkreport(
     fpath: str,
     src_name: Optional[str] = None,
-    delim: Optional[str] = ",",
+    delim: Optional[str] = None,
     skiprows: Optional[int] = None, 
     comment: Optional[str] = None,
     encoding: Optional[str] = None, 
@@ -1583,7 +1698,7 @@ def read_smkreport(
                 # Extract potential header content
                 header_can = sline.lstrip('#').strip()
                 # Detection keywords for standard and gridded SMOKE report headers
-                keywords = ('Label', 'County', 'State', 'X cell', 'Y cell', 'Region', 'SCC', 'Facility')
+                keywords = ('Date', 'Label', 'County', 'State', 'X cell', 'Y cell', 'Region', 'SCC', 'Facility')
                 if any(header_can.startswith(k) for k in keywords):
                     header_idx = i
                     header_line = header_can
@@ -1611,45 +1726,52 @@ def read_smkreport(
     # Delimiter selection
     sep = delim
     if sep is None:
-        # Read sample lines for sniffing
-        sample_lines = []
-        with open(fpath, **open_kwargs) as f:
-            # Skip to header
-            for _ in range(header_idx + 1):
-                next(f, None)
-            for _ in range(50):
-                line = next(f, None)
-                if line:
-                    if not line.strip() or line.lstrip().startswith(comment_marker):
-                        continue
-                    sample_lines.append(line)
-                else:
-                    break
-        
-        candidates = [";", "\t", "|", ",", " "]
-        sample = [header_line] + sample_lines
-        scores: Dict[str, float] = {}
-        for c in candidates:
-            counts = [s.count(c) for s in sample if s and not s.isspace()]
-            if not counts:
-                continue
-            nonzero = [n for n in counts if n > 0]
-            if not nonzero:
-                continue
-            coverage = len(nonzero) / max(1, len(counts))
-            mean_cnt = sum(nonzero) / len(nonzero)
-            variance = sum((x - mean_cnt)**2 for x in nonzero) / len(nonzero)
-            stability = 1.0 / (1.0 + variance)
-            # Higher penalty for space as it often appears in description text
-            penalty = 0.001 if c == ' ' else 1.0
-            scores[c] = coverage * stability * mean_cnt * penalty
-        if scores:
-            best = max(scores.items(), key=lambda kv: kv[1])
-            if best[1] > 0:
-                sep = best[0]
+        if '|' in header_line:
+            sep = '|'
+        elif ';' in header_line and ',' not in header_line:
+            sep = ';'
+        elif '\t' in header_line:
+            sep = '\t'
+        else:
+            # Read sample lines for sniffing
+            sample_lines = []
+            with open(fpath, **open_kwargs) as f:
+                # Skip to header
+                for _ in range(header_idx + 1):
+                    next(f, None)
+                for _ in range(50):
+                    line = next(f, None)
+                    if line:
+                        if not line.strip() or line.lstrip().startswith(comment_marker):
+                            continue
+                        sample_lines.append(line)
+                    else:
+                        break
+            
+            candidates = ["|", ";", "\t", ",", " "]
+            sample = [header_line] + sample_lines
+            scores: Dict[str, float] = {}
+            for c in candidates:
+                counts = [s.count(c) for s in sample if s and not s.isspace()]
+                if not counts:
+                    continue
+                nonzero = [n for n in counts if n > 0]
+                if not nonzero:
+                    continue
+                coverage = len(nonzero) / max(1, len(counts))
+                mean_cnt = sum(nonzero) / len(nonzero)
+                variance = sum((x - mean_cnt)**2 for x in nonzero) / len(nonzero)
+                stability = 1.0 / (1.0 + variance)
+                # Higher penalty for space as it often appears in description text
+                penalty = 0.001 if c == ' ' else 1.0
+                scores[c] = coverage * stability * mean_cnt * penalty
+            if scores:
+                best = max(scores.items(), key=lambda kv: kv[1])
+                if best[1] > 0:
+                    sep = best[0]
 
     # Parse header columns
-    splitter = sep if sep is not None else (';' if ';' in header_line else ('|' if '|' in header_line else ','))
+    splitter = sep if sep is not None else ('|' if '|' in header_line else (';' if ';' in header_line else ','))
     print(f"DEBUG: Final splitter used: '{splitter}'")
     if splitter == ' ':
         col_names = [t for t in header_line.split() if t.strip()]

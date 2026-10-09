@@ -1747,6 +1747,82 @@ def get_ncf_profile(
     """
     Extract vertical profile (by LAY) for a specific grid cell/region.
     """
+    # --- INLINE Support ---
+    if stack_groups_path and os.path.exists(stack_groups_path):
+        try:
+            valid_indices, v_rows, v_cols, gi = _get_inline_mapping(ncf_path, stack_groups_path, None, None)
+            req_cells = set(zip(row_indices, col_indices))
+            match_mask = [((r, c) in req_cells) for r, c in zip(v_rows, v_cols)]
+            match_mask = np.array(match_mask, dtype=bool)
+            target_src_indices = valid_indices[match_mask]
+            if len(target_src_indices) == 0:
+                return None
+
+            with netCDF4.Dataset(ncf_path, 'r') as ds:
+                if pollutant not in ds.variables:
+                    return None
+                var = ds.variables[pollutant]
+                units = getattr(var, 'units', '')
+                if isinstance(units, bytes):
+                    units = units.decode('utf-8', 'ignore')
+
+                dims_list = var.dimensions
+                if 'LAY' not in dims_list:
+                    return None
+
+                slices = [slice(None)] * var.ndim
+                t_axis = dims_list.index('TSTEP') if 'TSTEP' in dims_list else -1
+                if t_axis >= 0:
+                    if time_idx is not None and time_op == 'select':
+                        slices[t_axis] = min(max(0, time_idx), ds.dimensions['TSTEP'].size - 1)
+                    elif time_op == 'select':
+                        slices[t_axis] = 0
+
+                src_dim_idx = -1
+                for i, dname in enumerate(dims_list):
+                    if dname in ['TSTEP', 'LAY', 'TFLAG', 'DATE-TIME']:
+                        continue
+                    if dname in ['ROW', 'COL', 'SRC', 'NSRC']:
+                        if ds.dimensions[dname].size > 1:
+                            src_dim_idx = i
+                            break
+                        if src_dim_idx == -1:
+                            src_dim_idx = i
+                if src_dim_idx == -1:
+                    src_dim_idx = var.ndim - 1
+
+                slices[src_dim_idx] = target_src_indices
+                data = var[tuple(slices)]
+
+                # Reduce TSTEP if aggregated
+                if t_axis >= 0 and time_op != 'select':
+                    if time_op == 'mean':
+                        data = np.mean(data, axis=t_axis)
+                    elif time_op == 'max':
+                        data = np.max(data, axis=t_axis)
+                    elif time_op == 'min':
+                        data = np.min(data, axis=t_axis)
+                    else:
+                        data = np.sum(data, axis=t_axis)
+
+                # Now data has LAY and Source dimensions
+                l_axis_now = dims_list.index('LAY') if 'LAY' in dims_list else 0
+                if t_axis >= 0 and time_op == 'select' and t_axis < l_axis_now:
+                    l_axis_now -= 1
+
+                # Sum/mean across sources for each layer
+                other_axes = tuple(ax for ax in range(data.ndim) if ax != l_axis_now)
+                if op == 'mean':
+                    series = np.mean(data, axis=other_axes)
+                else:
+                    series = np.sum(data, axis=other_axes)
+
+                layers = [f"{i+1}" for i in range(len(series))]
+                return {'times': layers, 'values': {'Total': series.tolist()}, 'units': str(units).strip()}
+        except Exception as e:
+            logging.error(f"Inline Profile failed: {e}")
+            return None
+
     with netCDF4.Dataset(ncf_path, 'r') as ds:
         if pollutant not in ds.variables:
             return None

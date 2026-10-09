@@ -2006,6 +2006,14 @@ class NativeEmissionGUI(QMainWindow):
         # NetCDF Check
         is_nc = is_netcdf_file(file_paths[0])
         ncf_params = self._get_ncf_params() if is_nc else {}
+        
+        # Ingest/Query SQLite DB Integration
+        db_path = getattr(self.cli_args, 'database', None)
+        if hasattr(self, '_json_arguments') and not db_path:
+            db_path = self._json_arguments.get('database')
+        if db_path:
+            ncf_params['db_path'] = db_path
+            ncf_params['case'] = getattr(self.cli_args, 'case', None) or self._json_arguments.get('case') or '2022he_cb6_22m'
 
         # Capture Filter Args (Priority: 1. Current UI State, 2. Initial Config)
         f_col = self.cmb_filter_col.currentText() if hasattr(self, 'cmb_filter_col') else ""

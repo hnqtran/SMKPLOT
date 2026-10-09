@@ -215,6 +215,8 @@ def parse_args():
         ),
     )
     ap.add_argument('-f', '--filepath', help='Path to smkreport or ff10 input file; emissions list file allowed')
+    ap.add_argument('--database', help='Path to SQLite database (e.g., emp.db) to query instead of text files.')
+    ap.add_argument('--case', default=None, help='Platform case identifier to query from the SQLite database.')
     ap.add_argument('--sector', default=None, help='Name of source sector; e.g., rwc, ptfire-rx, ptfire-wild, etc.')
     ap.add_argument('--filter-col', default=None, help='Name of column to filter on; e.g., release_id,scc, region_cd, etc.')
     ap.add_argument('--filter-start', default=None, help='Start value (inclusive) for filtering column.')

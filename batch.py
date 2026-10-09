@@ -546,22 +546,25 @@ def _batch_mode(args):
     # Unified File Loading Logic
     # -----------------------------------------------------
     input_path = args.filepath
-    
-    # Check JSON filepath if still None
     if not input_path and isinstance(json_payload, dict):
         input_path = json_payload.get('arguments', {}).get('filepath')
 
-    if not input_path:
-        logging.error("Batch mode requires input file(s). Use --filepath.")
+    db_path = getattr(args, 'database', None)
+    if isinstance(json_payload, dict) and not db_path:
+        db_path = json_payload.get('arguments', {}).get('database')
+
+    if not input_path and not db_path:
+        logging.error("Batch mode requires input file(s) (--filepath) or database (--database).")
         return 2
 
     # Normalize input_path to list of strings
-    if isinstance(input_path, (list, tuple)):
-        # Already a list?
-        file_list = [str(p) for p in input_path if p]
-    elif isinstance(input_path, str):
-        # Support semicolon splitting for multiple files passed as single string
-        file_list = [p.strip() for p in input_path.split(';') if p.strip()]
+    if input_path:
+        if isinstance(input_path, (list, tuple)):
+            file_list = [str(p) for p in input_path if p]
+        elif isinstance(input_path, str):
+            file_list = [p.strip() for p in input_path.split(';') if p.strip()]
+        else:
+            file_list = []
     else:
         file_list = []
     
@@ -573,16 +576,20 @@ def _batch_mode(args):
             resolved_files.append(os.path.abspath(os.path.join(json_ref_dir, f)))
         elif f:
             resolved_files.append(os.path.abspath(f))
+            
+    if db_path and not resolved_files:
+        resolved_files = [db_path]
     
     if not resolved_files:
         logging.error("No valid input files found.")
         return 2
 
-    # Verify existence
-    missing = [f for f in resolved_files if not os.path.exists(f)]
-    if missing:
-        logging.error("Input file(s) not found: %s", missing)
-        return 1
+    # Verify existence (skip if database mode is active)
+    if not db_path:
+        missing = [f for f in resolved_files if not os.path.exists(f)]
+        if missing:
+            logging.error("Input file(s) not found: %s", missing)
+            return 1
 
     msg_load = f"Loading emissions data from: {resolved_files}"
     logging.info(msg_load)
@@ -706,6 +713,14 @@ def _batch_mode(args):
                 is_ncf_input = True
 
         # read_inputfile handles list of paths
+        db_path = getattr(args, 'database', None)
+        if isinstance(json_payload, dict) and not db_path:
+            db_path = json_payload.get('arguments', {}).get('database')
+
+        if db_path:
+            ncf_params['db_path'] = db_path
+            ncf_params['case'] = getattr(args, 'case', None) or (json_payload.get('case') or json_payload.get('arguments', {}).get('case') if isinstance(json_payload, dict) else None) or '2022he_cb6_22m'
+
         emis_df, raw_df = read_inputfile(
             fpath=resolved_files,
             sector=args.sector,
@@ -979,6 +994,27 @@ def _batch_mode(args):
                 # overlay_geom is a single GeoDataFrame (shouldn't happen with current logic, but handle it)
                 overlay_geom = [overlay_geom] + loaded_filter_parts
 
+    def _get_all_available_columns():
+        cols_found = set()
+        for fp in resolved_files:
+            if not os.path.isfile(fp):
+                continue
+            try:
+                with open(fp, 'r', errors='ignore') as f:
+                    for line in f:
+                        if line.startswith('#') and '|' in line and '[' not in line:
+                            raw_c = [c.strip() for c in line.lstrip('#').split('|')]
+                            meta_c = {'x cell', 'y cell', 'region', 'state', 'county', 'scc', 'label', 'primary srg', 'fallbk srg'}
+                            cols_found.update([c for c in raw_c if c and c.lower() not in meta_c])
+                            break
+                        elif not line.startswith('#') and (',' in line or ';' in line):
+                            break
+            except Exception:
+                pass
+        if not cols_found and isinstance(emis_df, pd.DataFrame):
+            cols_found = set(emis_df.columns.tolist())
+        return sorted(list(cols_found))
+
     # [POLLUTANT-AGGREGATION 2026-04-06] Apply arithmetic formulas defined in the YAML
     # pollutant field before pollutant detection so derived columns exist for
     # detect_pollutants() and the subsequent groupby/sum.
@@ -1035,7 +1071,7 @@ def _batch_mode(args):
                     derived_name, rhs
                 )
             except KeyError as _fe:
-                available = sorted(emis_df.columns.tolist())
+                available = _get_all_available_columns()
                 logging.error(
                     "[col_formulas] Column '%s' not found while computing '%s' = %s.\n"
                     "  Available columns: %s",
@@ -1092,10 +1128,11 @@ def _batch_mode(args):
     if requested:
         missing = [p for p in requested if p not in pollutants]
         if missing:
+            all_file_pols = _get_all_available_columns() if 'col_formulas' in locals() else sorted(pollutants)
             logging.error(
                 "Requested pollutant(s) %s not found. Available: %s",
                 ', '.join(missing),
-                ', '.join(pollutants),
+                ', '.join(all_file_pols if all_file_pols else pollutants),
             )
             return 1
     os.makedirs(args.outdir, exist_ok=True)
